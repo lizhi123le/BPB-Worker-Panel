@@ -1,9 +1,23 @@
 {
-  "deadCodeInjection": true,
-  "deadCodeInjectionThreshold": 0.4,
-  "renameGlobals": true,
+  "compact": true,
+  "simplify": true,
+  "optionsPreset": "high-obfuscation",
+  "target": "browser-no-eval",
+  "ignoreImports": true,
+  "stringArray": true,
+  "stringArrayEncoding": ["rc4", "base64"],
+  "stringArrayThreshold": 1.0,
+  "stringArrayRotate": true,
+  "stringArrayIndexShift": true,
   "splitStrings": true,
-  "splitStringsChunkLength": 2,
+  "splitStringsChunkLength": 5,
+  "unicodeEscapeSequence": true,
+  "identifierNamesGenerator": "mangled-shuffled",
+  "renameGlobals": true,
+  "renameProperties": false,
+  "renamePropertiesMode": "safe",
   "transformObjectKeys": true,
-  "target": "node"
+  "numbersToExpressions": true,
+  "deadCodeInjection": true,
+  "deadCodeInjectionThreshold": 0.5
 }
