@@ -85,8 +85,6 @@ async function buildWorker() {
             "base64"
         ],
         compact: true,
-        controlFlowFlattening: true,
-        controlFlowFlatteningThreshold: 1,
         simplify: true,
         target: "browser-no-eval",
         ignoreImports: true,
