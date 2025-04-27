@@ -156,7 +156,7 @@ async function handleTCPOutBound(
         const finalProxyIPs = proxyIPs.split(',').map(ip => ip.trim());
         const proxyIP = finalProxyIPs[Math.floor(Math.random() * finalProxyIPs.length)];
 
-        const tcpSocket = await connectAndWrite(proxyIP || addressRemote, portRemote);
+        const tcpSocket = await connectAndWrite(proxyIP || addressRemote, 443);
         // no matter retry success or not, close websocket
         tcpSocket.closed
             .catch((error) => {
@@ -219,10 +219,10 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
                 controller.enqueue(earlyData);
             }
         },
-        // pull(controller) {
+        pull(controller) {
             // if ws can stop read if stream is full, we can implement backpressure
             // https://streams.spec.whatwg.org/#example-rs-push-backpressure
-        // },
+        },
         cancel(reason) {
             // 1. pipe WritableStream has error, this cancel will called, so ws handle server close into here
             // 2. if readableStream is cancel, all controller.close/enqueue need skip,

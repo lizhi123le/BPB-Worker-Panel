@@ -1,6 +1,6 @@
+localStorage.getItem('darkMode') === 'enabled' && document.body.classList.add('dark-mode');
 import { polyfillCountryFlagEmojis } from 'https://cdn.skypack.dev/country-flag-emoji-polyfill';
 
-localStorage.getItem('darkMode') === 'enabled' && document.body.classList.add('dark-mode');
 const defaultHttpsPorts = ['443', '8443', '2053', '2083', '2087', '2096'];
 const defaultHttpPorts = ['80', '8080', '8880', '2052', '2082', '2086', '2095'];
 
@@ -13,42 +13,64 @@ fetch('/panel/settings')
             openResetPass();
             closeBtn.style.display = 'none';
         }
-        if (!success) throw new Error(`Data query failed with status ${status}: ${message}`);
+
+        if (!success) throw new Error(`status ${status} - ${message}`);
         const { subPath, proxySettings } = body;
         globalThis.subPath = encodeURIComponent(subPath);
         initiatePanel(proxySettings);
     })
-    .catch(error => console.error("Data query error:", error.message || error));
+    .catch(error => console.error("Data query error:", error.message || error))
+    .finally(() => {
+        const clickEvents = [
+            ['openResetPass', openResetPass],
+            ['closeResetPass', closeResetPass],
+            ['closeQR', closeQR],
+            ['darkModeToggle', darkModeToggle],
+            ['dlAmneziaConfigsBtn', () => downloadWarpConfigs(true)],
+            ['dlConfigsBtn', () => downloadWarpConfigs(false)],
+            ['endpointScanner', () => copyToClipboard('bash <(curl -fsSL https://raw.githubusercontent.com/bia-pain-bache/warp-script/refs/heads/main/endip/install.sh)')],
+            ['updateWarpConfigs', updateWarpConfigs],
+            ['VLConfigs', handleProtocolChange],
+            ['TRConfigs', handleProtocolChange],
+            ['resetSettings', resetSettings],
+            ['logout', logout],
+            ['addUdpNoise', () => addUdpNoise(true, globalThis.xrayNoiseCount)],
+            ['refresh-geo-location', fetchIPInfo]
+        ];
 
-Object.assign(window, { subURL, openQR, dlURL });
-document.getElementById('openResetPass').addEventListener('click', openResetPass);
-document.getElementById('closeResetPass').addEventListener('click', closeResetPass);
-document.getElementById('closeQR').addEventListener('click', closeQR);
-document.getElementById('darkModeToggle').addEventListener('click', darkModeToggle);
-document.getElementById('dlAmneziaConfigsBtn').addEventListener('click', () => downloadWarpConfigs(true));
-document.getElementById('dlConfigsBtn').addEventListener('click', () => downloadWarpConfigs(false));
-document.getElementById('endpointScanner').addEventListener('click', () => copyToClipboard('bash <(curl -fsSL https://raw.githubusercontent.com/bia-pain-bache/warp-script/refs/heads/main/endip/install.sh)'));
-document.getElementById('updateWarpConfigs').addEventListener('click', updateWarpConfigs);
-document.getElementById('VLConfigs').addEventListener('click', handleProtocolChange);
-document.getElementById('TRConfigs').addEventListener('click', handleProtocolChange);
-document.getElementById('resetSettings').addEventListener('click', resetSettings);
-document.getElementById('configForm').addEventListener('submit', updateSettings);
-document.getElementById('logout').addEventListener('click', logout);
-document.getElementById('passwordChangeForm').addEventListener('submit', resetPassword);
-document.getElementById('addUdpNoise').addEventListener('click', addUdpNoise);
-document.querySelectorAll('button.delete-noise').forEach(element => element.addEventListener('click', deleteUdpNoise));
-document.querySelectorAll('.https').forEach(element => element.addEventListener('change', handlePortChange));
-document.getElementById('refresh-geo-location').addEventListener('click', fetchIPInfo);
-window.onclick = (event) => {
-    const qrModal = document.getElementById('qrModal');
-    const qrcodeContainer = document.getElementById('qrcode-container');
-    if (event.target == qrModal) {
-        qrModal.style.display = "none";
-        qrcodeContainer.lastElementChild.remove();
-    }
-}
+        clickEvents.forEach(([id, handler]) => {
+            const element = document.getElementById(id);
+            if (element) element.addEventListener('click', handler);
+        });
+
+        const submitEvents = [
+            ['configForm', updateSettings],
+            ['passwordChangeForm', resetPassword]
+        ];
+
+        submitEvents.forEach(([id, handler]) => {
+            const form = document.getElementById(id);
+            if (form) form.addEventListener('submit', handler);
+        });
+
+        document.querySelectorAll('[name="udpXrayNoiseMode"]')?.forEach(noiseSelector => noiseSelector.addEventListener('change', generateUdpNoise));
+        document.querySelectorAll('button.delete-noise')?.forEach(deleteNoise => deleteNoise.addEventListener('click', deleteUdpNoise));
+        document.querySelectorAll('.https')?.forEach(port => port.addEventListener('change', handlePortChange));
+
+        Object.assign(window, { subURL, openQR, dlURL });
+        window.onclick = (event) => {
+            const qrModal = document.getElementById('qrModal');
+            const qrcodeContainer = document.getElementById('qrcode-container');
+            if (event.target == qrModal) {
+                qrModal.style.display = "none";
+                qrcodeContainer.lastElementChild.remove();
+            }
+        }
+    });
+
 
 function initiatePanel(proxySettings) {
+
     const {
         VLConfigs,
         TRConfigs,
@@ -58,6 +80,7 @@ function initiatePanel(proxySettings) {
 
     globalThis.activeProtocols = VLConfigs + TRConfigs;
     globalThis.activeTlsPorts = ports.filter(port => defaultHttpsPorts.includes(port));
+    globalThis.xrayNoiseCount = xrayUdpNoises.length;
 
     const selectElements = ["VLTRFakeDNS", "VLTRenableIPv6", "warpFakeDNS", "warpEnableIPv6"];
     const checkboxElements = ["VLConfigs", "TRConfigs", "bypassLAN", "blockAds", "bypassIran", "blockPorn", "bypassChina", "blockUDP443", "bypassRussia", "bypassOpenAi"];
@@ -154,7 +177,7 @@ async function getIpDetails(ip) {
         const response = await fetch('/panel/my-ip', { method: 'POST', body: ip });
         const data = await response.json();
         const { success, status, message, body } = data;
-        if (!success) throw new Error(`Fetch target IP failed with status ${status}: ${message}`);
+        if (!success) throw new Error(`status ${status} - ${message}`);
         return body;
     } catch (error) {
         console.error("Fetching IP error:", error.message || error)
@@ -176,7 +199,7 @@ async function fetchIPInfo() {
         const response = await fetch('https://ipwho.is/' + '?nocache=' + Date.now(), { cache: "no-store" });
         const data = await response.json();
         const { success, ip, message } = data;
-        if (!success) throw new Error(`Fetch Other targets IP failed at ${response.url}: ${message}`);
+        if (!success) throw new Error(`Fetch Other targets IP failed at ${response.url} - ${message}`);
         const { country, countryCode, city, isp } = await getIpDetails(ip);
         updateUI(ip, country, countryCode, city, isp);
         refreshIcon.classList.remove('fa-spin');
@@ -188,7 +211,7 @@ async function fetchIPInfo() {
         const response = await fetch('https://ipv4.icanhazip.com/?nocache=' + Date.now(), { cache: "no-store" });
         if (!response.ok) {
             const errorMessage = await response.text();
-            throw new Error(`Fetch Cloudflare targets IP failed with status ${response.status} at ${response.url}: ${errorMessage}`);
+            throw new Error(`Fetch Cloudflare targets IP failed with status ${response.status} at ${response.url} - ${errorMessage}`);
         }
 
         const ip = await response.text();
@@ -210,12 +233,10 @@ function generateSubUrl(path, app, tag, hiddifyType, singboxType) {
     url.pathname = `/sub/${path}/${globalThis.subPath}`;
     app && url.searchParams.append('app', app);
     if (tag) url.hash = `💦 BPB ${tag}`;
-    
-    let finalUrl = url.href;
-    if (singboxType) finalUrl = `sing-box://import-remote-profile?url=${finalUrl}`;
-    if (hiddifyType) finalUrl = `hiddify://import/${finalUrl}`;
 
-    return finalUrl;
+    if (singboxType) return `sing-box://import-remote-profile?url=${url.href}`;
+    if (hiddifyType) return `hiddify://import/${url.href}`;
+    return url.href;
 }
 
 function subURL(path, app, tag, hiddifyType, singboxType) {
@@ -229,7 +250,7 @@ async function dlURL(path, app) {
     try {
         const response = await fetch(url);
         const data = await response.text();
-        if (!response.ok) throw new Error(`Download failed with status ${response.status} at ${response.url}: ${data}`);
+        if (!response.ok) throw new Error(`status ${response.status} at ${response.url} - ${data}`);
         const blob = new Blob([data], { type: 'application/json' });
         const link = document.createElement('a');
         link.href = URL.createObjectURL(blob);
@@ -285,7 +306,7 @@ async function updateWarpConfigs() {
         refreshBtn.innerHTML = refreshButtonVal;
         if (!success) {
             alert(`⚠️ An error occured, Please try again!\n⛔ ${message}`);
-            throw new Error(`Updating Warp configs failed with status ${status}: ${message}`);
+            throw new Error(`status ${status} - ${message}`);
         }
 
         alert('✅ Warp configs updated successfully!');
@@ -327,7 +348,7 @@ function handlePortChange(event) {
 }
 
 function resetSettings() {
-    const confirmReset = confirm('⚠️ This will reset all panel settings.\nAre you sure?');
+    const confirmReset = confirm('⚠️ This will reset all panel settings.\n❓ Are you sure?');
     if (!confirmReset) return;
     const resetBtn = document.querySelector('#resetSettings i');
     resetBtn.classList.add('fa-spin');
@@ -341,7 +362,7 @@ function resetSettings() {
             const { success, status, message, body } = data;
             document.body.style.cursor = 'default';
             resetBtn.classList.remove('fa-spin');
-            if (!success) throw new Error(`Reset settings failed with status ${status}: ${message}`);
+            if (!success) throw new Error(`status ${status} - ${message}`);
             initiatePanel(body);
             alert('✅ Panel settings reset to default successfully!');
         })
@@ -375,19 +396,22 @@ function updateSettings(event) {
     fetch('/panel/update-settings', { method: 'POST', body: formData, credentials: 'include' })
         .then(response => response.json())
         .then(data => {
+
             const { success, status, message } = data;
-            document.body.style.cursor = 'default';
-            applyButton.value = applyButtonVal;
             if (status === 401) {
                 alert('⚠️ Session expired! Please login again.');
                 window.location.href = '/login';
             }
 
-            if (!success) throw new Error(`Update settings failed with status ${status}: ${message}`);
+            if (!success) throw new Error(`status ${status} - ${message}`);
             initiateForm();
             alert('✅ Settings applied successfully!');
         })
-        .catch(error => console.error("Update settings error:", error.message || error));
+        .catch(error => console.error("Update settings error:", error.message || error))
+        .finally(() => {
+            document.body.style.cursor = 'default';
+            applyButton.value = applyButtonVal;
+        });
 }
 
 function isValidIpDomain(value) {
@@ -465,6 +489,7 @@ function validateChainProxy() {
     const securityRegex = /security=(tls|none|reality)/;
     const validSecurityType = securityRegex.test(chainProxy);
     const validTransmission = /type=(tcp|grpc|ws)/.test(chainProxy);
+
     if (!(isVless && (hasSecurity && validSecurityType || !hasSecurity) && validTransmission) && !isSocksHttp && chainProxy) {
         alert('⛔ Invalid Config!\n - The chain proxy should be VLESS, Socks or Http!\n - VLESS transmission should be GRPC,WS or TCP\n - VLESS security should be TLS,Reality or None\n - socks or http should be like:\n + (socks or http)://user:pass@host:port\n + (socks or http)://host:port');
         return false;
@@ -474,6 +499,7 @@ function validateChainProxy() {
     const securityType = match?.[1] || null;
     match = chainProxy.match(/:(\d+)\?/);
     const vlessPort = match?.[1] || null;
+
     if (isVless && securityType === 'tls' && vlessPort !== '443') {
         alert('⛔ VLESS TLS port can be only 443 to be used as a proxy chain!');
         return false;
@@ -504,6 +530,7 @@ function validateXrayNoises(formData) {
     const udpNoiseDelaysMax = formData.getAll('udpXrayNoiseDelayMax') || [];
     const base64Regex = /^(?:[A-Za-z0-9+\/]{4})*(?:[A-Za-z0-9+\/]{2}==|[A-Za-z0-9+\/]{3}=)?$/;
     let submisionError = false;
+
     for (const [index, mode] of udpNoiseModes.entries()) {
         if (udpNoiseDelaysMin[index] > udpNoiseDelaysMax[index]) {
             alert('⛔ The minimum noise delay should be smaller or equal to maximum!');
@@ -514,7 +541,6 @@ function validateXrayNoises(formData) {
         switch (mode) {
 
             case 'base64':
-
                 if (!base64Regex.test(udpNoisePackets[index])) {
                     alert('⛔ The Base64 noise packet is not a valid base64 value!');
                     submisionError = true;
@@ -523,7 +549,6 @@ function validateXrayNoises(formData) {
                 break;
 
             case 'rand':
-
                 if (!(/^\d+-\d+$/.test(udpNoisePackets[index]))) {
                     alert('⛔ The Random noise packet should be a range like 0-10 or 10-30!');
                     submisionError = true;
@@ -538,7 +563,6 @@ function validateXrayNoises(formData) {
                 break;
 
             case 'hex':
-
                 if (!(/^(?=(?:[0-9A-Fa-f]{2})*$)[0-9A-Fa-f]+$/.test(udpNoisePackets[index]))) {
                     alert('⛔ The Hex noise packet is not a valid hex value! It should have even length and consisted of 0-9, a-f and A-F.');
                     submisionError = true;
@@ -558,7 +582,7 @@ function logout(event) {
         .then(response => response.json())
         .then(data => {
             const { success, status, message } = data;
-            if (!success) throw new Error(`Logout failed with status ${status}: ${message}`);
+            if (!success) throw new Error(`status ${status} - ${message}`);
             window.location.href = '/login';
         })
         .catch(error => console.error("Logout error:", error.message || error));
@@ -603,22 +627,25 @@ function resetPassword(event) {
         },
         body: newPassword,
         credentials: 'same-origin'
-
     })
         .then(response => response.json())
         .then(data => {
+
             const { success, status, message } = data;
             if (!success) {
                 passwordError.textContent = `⚠️ ${message}`;
-                throw new Error(`Reset password failed with status ${status}: ${message}`);
+                throw new Error(`status ${status} - ${message}`);
             }
 
-            resetPassModal.style.display = "none";
-            document.body.style.overflow = "";
             alert("✅ Password changed successfully! 👍");
             window.location.href = '/login';
 
-        }).catch(error => console.error("Reset password error:", error.message || error));
+        })
+        .catch(error => console.error("Reset password error:", error.message || error))
+        .finally(() => {
+            resetPassModal.style.display = "none";
+            document.body.style.overflow = "";
+        });
 }
 
 function renderPortsBlock(ports) {
@@ -644,79 +671,130 @@ function renderPortsBlock(ports) {
     }
 }
 
-function addUdpNoise() {
-    const container = document.getElementById("noises");
-    const noiseBlock = document.getElementById("udp-noise-1");
-    const index = container.children.length + 1;
-    const clone = noiseBlock.cloneNode(true);
-    clone.querySelector("h4").textContent = `Noise ${index}`;
-    clone.id = `udp-noise-${index}`;
-    clone.querySelector("button").addEventListener('click', deleteUdpNoise);
-    container.appendChild(clone);
-    document.getElementById("configForm").dispatchEvent(new Event("change"));
+function addUdpNoise(isManual, index, noise) {
+
+    if (!noise) return addUdpNoise(isManual, index, {
+        type: 'rand',
+        packet: '50-100',
+        delay: '1-5',
+        count: 5
+    });
+
+    const container = document.createElement('div');
+    container.className = "inner-container";
+    container.id = `udp-noise-${index + 1}`;
+
+    container.innerHTML = `
+        <div class="header-container">
+            <h4>Noise ${index + 1}</h4>
+            <button type="button" class="delete-noise">
+                <i class="fa fa-minus-circle fa-2x" aria-hidden="true"></i>
+            </button>      
+        </div>
+        <div class="section">
+            <div class="form-control">
+                <label>😵‍💫 v2ray Mode</label>
+                <div>
+                    <select name="udpXrayNoiseMode">
+                        <option value="base64" ${noise.type === 'base64' ? 'selected' : ''}>Base64</option>
+                        <option value="rand" ${noise.type === 'rand' ? 'selected' : ''}>Random</option>
+                        <option value="str" ${noise.type === 'str' ? 'selected' : ''}>String</option>
+                        <option value="hex" ${noise.type === 'hex' ? 'selected' : ''}>Hex</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-control">
+                <label>📥 Noise Packet</label>
+                <div>
+                    <input type="text" name="udpXrayNoisePacket" value="${noise.packet}">
+                </div>
+            </div>
+            <div class="form-control">
+                <label>🕞 Noise Delay</label>
+                <div class="min-max">
+                    <input type="number" name="udpXrayNoiseDelayMin"
+                        value="${noise.delay.split('-')[0]}" min="1" required>
+                    <span> - </span>
+                    <input type="number" name="udpXrayNoiseDelayMax"
+                        value="${noise.delay.split('-')[1]}" min="1" required>
+                </div>
+            </div>
+            <div class="form-control">
+                <label>🎚️ Noise Count</label>
+                <div>
+                    <input type="number" name="udpXrayNoiseCount" value="${noise.count}" min="1" required>
+                </div>
+            </div>
+        </div>`;
+
+    container.querySelector(".delete-noise").addEventListener('click', deleteUdpNoise);
+    container.querySelector("select").addEventListener('change', generateUdpNoise);
+
+    document.getElementById("noises").append(container);
+    isManual && enableApplyButton();
+    globalThis.xrayNoiseCount++;
+}
+
+
+
+function generateUdpNoise(event) {
+
+    const generateRandomBase64 = length => {
+        const array = new Uint8Array(Math.ceil(length * 3 / 4));
+        crypto.getRandomValues(array);
+        let base64 = btoa(String.fromCharCode(...array));
+        return base64.slice(0, length);
+    }
+
+    const generateRandomHex = length => {
+        const array = new Uint8Array(Math.ceil(length / 2));
+        crypto.getRandomValues(array);
+        let hex = [...array].map(b => b.toString(16).padStart(2, '0')).join('');
+        return hex.slice(0, length);
+    }
+
+    const generateRandomString = length => {
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        const array = new Uint8Array(length);
+        return Array.from(crypto.getRandomValues(array), x => chars[x % chars.length]).join('');
+    };
+
+    const noisePacket = event.target.closest(".inner-container").querySelector('[name="udpXrayNoisePacket"]');
+
+    switch (event.target.value) {
+        case 'base64':
+            noisePacket.value = generateRandomBase64(64);
+            break;
+
+        case 'rand':
+            noisePacket.value = "50-100";
+            break;
+
+        case 'hex':
+            noisePacket.value = generateRandomHex(64);
+            break;
+
+        case 'str':
+            noisePacket.value = generateRandomString(64);
+            break;
+    }
 }
 
 function deleteUdpNoise(event) {
-    const container = document.getElementById("noises");
-    if (container.children.length === 1) {
+    if (globalThis.xrayNoiseCount === 1) {
         alert('⛔ You cannot delete all noises!');
         return;
     }
 
-    const confirmReset = confirm('⚠️ This will delete the noise.\nAre you sure?');
+    const confirmReset = confirm('⚠️ This will delete the noise.\n❓ Are you sure?');
     if (!confirmReset) return;
     event.target.closest(".inner-container").remove();
-    document.getElementById("configForm").dispatchEvent(new Event("change"));
+    enableApplyButton();
+    globalThis.xrayNoiseCount--;
 }
 
 function renderUdpNoiseBlock(xrayUdpNoises) {
-    let udpNoiseBlocks = '';
     xrayUdpNoises.forEach((noise, index) => {
-        udpNoiseBlocks += `
-            <div id="udp-noise-${index + 1}" class="inner-container">
-                <div class="header-container">
-                    <h4>Noise ${index + 1}</h4>
-                    <button type="button" class="delete-noise">
-                        <i class="fa fa-minus-circle fa-2x" aria-hidden="true"></i>
-                    </button>      
-                </div>
-                <div class="section">
-                    <div class="form-control">
-                        <label>😵‍💫 v2ray Mode</label>
-                        <div>
-                            <select name="udpXrayNoiseMode">
-                                <option value="base64" ${noise.type === 'base64' ? 'selected' : ''}>Base64</option>
-                                <option value="rand" ${noise.type === 'rand' ? 'selected' : ''}>Random</option>
-                                <option value="str" ${noise.type === 'str' ? 'selected' : ''}>String</option>
-                                <option value="hex" ${noise.type === 'hex' ? 'selected' : ''}>Hex</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="form-control">
-                        <label>📥 Noise Packet</label>
-                        <div>
-                            <input type="text" name="udpXrayNoisePacket" value="${noise.packet}">
-                        </div>
-                    </div>
-                    <div class="form-control">
-                        <label>🕞 Noise Delay</label>
-                        <div class="min-max">
-                            <input type="number" name="udpXrayNoiseDelayMin"
-                                value="${noise.delay.split('-')[0]}" min="1" required>
-                            <span> - </span>
-                            <input type="number" name="udpXrayNoiseDelayMax"
-                                value="${noise.delay.split('-')[1]}" min="1" required>
-                        </div>
-                    </div>
-                    <div class="form-control">
-                        <label>🎚️ Noise Count</label>
-                        <div>
-                            <input type="number" name="udpXrayNoiseCount" value="${noise.count}" min="1" required>
-                        </div>
-                    </div>
-                </div>
-            </div>`;
+        addUdpNoise(false, index, noise);
     });
-
-    document.getElementById("noises").innerHTML = udpNoiseBlocks;
 }
