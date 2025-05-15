@@ -34,7 +34,7 @@ curl -L -# -o BPB-Wizard.tar.gz https://github.com/bia-pain-bache/BPB-Wizard/rel
 
 The first question asks whether you want to create a new panel or modify existing panels in the account.
 
-Then logs into your Cloudflare account, return to the terminal and asks you a series of questions.
+Then logs into your Cloudflare account, Asks for your permission, returns to the terminal and asks you a series of questions.
 
 If you choose option 1, it will ask a series of configuration questions. You can use the default values or input your own. In the end, it opens the panel for you in your browser — that’s it.
 
@@ -43,6 +43,6 @@ If you choose option 1, it will ask a series of configuration questions. You can
 
 If you choose option 2, it lists deployed Workers and Pages projects and you can choose which one to modify.
 
-## Upgrading Panel
+## Updating Panel
 
 Just run wizard and select option 2 for the first question. It will show you a list of project names in your account — you can choose any to update or delete.
