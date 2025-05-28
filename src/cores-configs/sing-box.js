@@ -1,20 +1,21 @@
-import { getConfigAddresses, extractWireguardParams, generateRemark, randomUpperCase, getRandomPath, isIPv6, isDomain, base64ToDecimal } from './helpers';
+import { getConfigAddresses, extractWireguardParams, generateRemark, randomUpperCase, getRandomPath, isIPv6, isDomain, base64ToDecimal, getDomain } from './helpers';
 import { getDataset } from '../kv/handlers';
 
 async function buildSingBoxDNS(isWarp) {
-    const isFakeDNS = (VLTRFakeDNS && !isWarp) || (warpFakeDNS && isWarp);
     const isIPv6 = (VLTRenableIPv6 && !isWarp) || (warpEnableIPv6 && isWarp);
-    const customBypassRulesDomains = customBypassRules.filter(address => isDomain(address));
-    const geoRules = [
-        { rule: bypassIran, type: 'direct', geosite: "geosite-ir", geoip: "geoip-ir" },
-        { rule: bypassChina, type: 'direct', geosite: "geosite-cn", geoip: "geoip-cn" },
-        { rule: bypassRussia, type: 'direct', geosite: "geosite-category-ru", geoip: "geoip-ru" },
-        { rule: true, type: 'block', geosite: "geosite-malware" },
-        { rule: true, type: 'block', geosite: "geosite-phishing" },
-        { rule: true, type: 'block', geosite: "geosite-cryptominers" },
-        { rule: blockAds, type: 'block', geosite: "geosite-category-ads-all" },
-        { rule: blockPorn, type: 'block', geosite: "geosite-nsfw" }
-    ];
+    const buildDnsServer = (type, server, server_port, detour, tag, domain_resolver) => ({
+        type,
+        ...(server && { server }),
+        ...(server_port && { server_port }),
+        ...(detour && { detour }),
+        ...(domain_resolver && {
+            domain_resolver: {
+                server: domain_resolver,
+                strategy: isIPv6 ? "prefer_ipv4" : "ipv4_only"
+            }
+        }),
+        tag
+    });
 
     const servers = [
         {
@@ -26,35 +27,37 @@ async function buildSingBoxDNS(isWarp) {
         },
     ];
 
+    let localDnsServer;
     if (localDNS === 'localhost') {
-        servers.push({
-            type: "local",
-            tag: "dns-direct"
-        });
+        localDnsServer = buildDnsServer("local", null, null, null, "dns-direct");
     } else {
-        servers.push({
-            type: "udp",
-            server: localDNS,
-            server_port: 53,
-            detour: "direct",
-            tag: "dns-direct"
-        });
+        localDnsServer = buildDnsServer("udp", localDNS, 53, null, "dns-direct");
     }
 
-    bypassOpenAi && servers.push({
-        type: "udp",
-        server: "178.22.122.100",
-        server_port: 53,
-        detour: "direct",
-        tag: "dns-openai"
-    });
+    servers.push(localDnsServer);
+
+    const localDnsRuleDomains = [
+        "raw.githubusercontent.com",
+        "time.apple.com"
+    ];
+
+    const isAntiSanctionRule = bypassOpenAi || bypassGoogle || customBypassSanctionRules.length > 0;
+    if (isAntiSanctionRule) {
+        const dnsHost = getDomain(antiSanctionDNS);
+        let server = {};
+        if (dnsHost.isHostDomain) {
+            localDnsRuleDomains.push(dnsHost.host);
+            server = buildDnsServer("https", dnsHost.host, 443, null, "dns-anti-sanction", "dns-direct");
+        } else {
+            server = buildDnsServer("udp", antiSanctionDNS, 53, null, "dns-anti-sanction", null);
+        }
+
+        servers.push(server);
+    }
 
     const rules = [
         {
-            domain: [
-                "raw.githubusercontent.com",
-                "time.apple.com"
-            ],
+            domain: localDnsRuleDomains,
             server: "dns-direct"
         },
         {
@@ -87,6 +90,17 @@ async function buildSingBoxDNS(isWarp) {
         action: "reject"
     };
 
+    const geoRules = [
+        { rule: bypassIran, type: 'direct', geosite: "geosite-ir", geoip: "geoip-ir" },
+        { rule: bypassChina, type: 'direct', geosite: "geosite-cn", geoip: "geoip-cn" },
+        { rule: bypassRussia, type: 'direct', geosite: "geosite-category-ru", geoip: "geoip-ru" },
+        { rule: true, type: 'block', geosite: "geosite-malware" },
+        { rule: true, type: 'block', geosite: "geosite-phishing" },
+        { rule: true, type: 'block', geosite: "geosite-cryptominers" },
+        { rule: blockAds, type: 'block', geosite: "geosite-category-ads-all" },
+        { rule: blockPorn, type: 'block', geosite: "geosite-nsfw" }
+    ];
+
     geoRules.forEach(({ rule, type, geosite, geoip }) => {
         rule && type === 'direct' && rules.push({
             type: "logical",
@@ -108,6 +122,7 @@ async function buildSingBoxDNS(isWarp) {
     });
 
     let domainDirectRule, domainBlockRule;
+    const customBypassRulesDomains = customBypassRules.filter(address => isDomain(address));
     if (customBypassRulesDomains.length) {
         domainDirectRule = createRule("dns-direct");
         customBypassRulesDomains.forEach(domain => {
@@ -126,11 +141,32 @@ async function buildSingBoxDNS(isWarp) {
         rules.push(domainBlockRule);
     }
 
-    bypassOpenAi && rules.push({
-        rule_set: "geosite-openai",
-        server: "dns-openai"
-    });
+    const bypassSanctionRules = [
+        { rule: bypassOpenAi, geosite: "geosite-openai" },
+        { rule: bypassGoogle, geosite: "geosite-google" },
+        { rule: bypassMicrosoft, geosite: "geosite-microsoft" }
+    ];
 
+    if (isAntiSanctionRule) {
+        if (bypassOpenAi || bypassGoogle) {
+            const rule_set = bypassSanctionRules.reduce((acc, rule) => {
+                rule.rule && acc.push(rule.geosite);
+                return acc;
+            }, []);
+
+            rules.push({
+                rule_set,
+                server: "dns-anti-sanction"
+            });
+        }
+
+        customBypassSanctionRules.length && rules.push({
+            domain_suffix: customBypassSanctionRules,
+            server: "dns-anti-sanction"
+        });
+    }
+
+    const isFakeDNS = (VLTRFakeDNS && !isWarp) || (warpFakeDNS && isWarp);
     if (isFakeDNS) {
         const fakeip = {
             type: "fakeip",
@@ -225,6 +261,22 @@ function buildSingBoxRoutingRules(isWarp) {
             ruleSet: {
                 geosite: "geosite-openai",
                 geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-openai.srs"
+            }
+        },
+        {
+            rule: bypassGoogle,
+            type: 'direct',
+            ruleSet: {
+                geosite: "geosite-google",
+                geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-google.srs"
+            }
+        },
+        {
+            rule: bypassMicrosoft,
+            type: 'direct',
+            ruleSet: {
+                geosite: "geosite-microsoft",
+                geositeURL: "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-microsoft.srs"
             }
         },
         {
@@ -348,7 +400,8 @@ function buildSingBoxRoutingRules(isWarp) {
         pushRuleIfNotEmpty(ipRule, action === 'direct' ? directIPRules : blockIPRules);
     };
 
-    customBypassRules.length && processRules(customBypassRules, 'direct');
+    const totalCustomBypassDomains = [...customBypassRules, ...customBypassSanctionRules];
+    totalCustomBypassDomains.length && processRules(totalCustomBypassDomains, 'direct');
     customBlockRules.length && processRules(customBlockRules, 'reject');
     let rules = [];
 
@@ -803,10 +856,10 @@ const singboxConfigTemp = {
     outbounds: [
         {
             type: "direct",
-            domain_resolver: {
-                server: "dns-direct",
-                strategy: "ipv4_only"
-            },
+            // domain_resolver: {
+            //     server: "dns-direct",
+            //     strategy: "ipv4_only"
+            // },
             tag: "direct"
         }
     ],

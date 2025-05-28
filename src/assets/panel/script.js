@@ -83,15 +83,17 @@ function initiatePanel(proxySettings) {
     });
 
     const selectElements = ["VLTRFakeDNS", "VLTRenableIPv6", "warpFakeDNS", "warpEnableIPv6"];
-    const checkboxElements = ["VLConfigs", "TRConfigs", "bypassLAN", "blockAds", "bypassIran", "blockPorn", "bypassChina", "blockUDP443", "bypassRussia", "bypassOpenAi"];
+    const checkboxElements = [
+        "VLConfigs", "TRConfigs", "bypassLAN", "blockAds", "bypassIran", "blockPorn", "bypassChina",
+        "blockUDP443", "bypassRussia", "bypassOpenAi", "bypassGoogle", "bypassMicrosoft"];
     const inputElements = [
         "remoteDNS", "localDNS", "outProxy", "customCdnHost", "customCdnSni", "bestVLTRInterval",
         "fragmentLengthMin", "fragmentLengthMax", "fragmentIntervalMin", "fragmentIntervalMax",
         "fragmentPackets", "bestWarpInterval", "hiddifyNoiseMode", "knockerNoiseMode", "noiseCountMin",
         "noiseCountMax", "noiseSizeMin", "noiseSizeMax", "noiseDelayMin", "noiseDelayMax",
-        "amneziaNoiseCount", "amneziaNoiseSizeMin", "amneziaNoiseSizeMax",
+        "amneziaNoiseCount", "amneziaNoiseSizeMin", "amneziaNoiseSizeMax", "antiSanctionDNS"
     ];
-    const textareaElements = ["proxyIPs", "cleanIPs", "customCdnAddrs", "warpEndpoints", "customBypassRules", "customBlockRules"];
+    const textareaElements = ["proxyIPs", "cleanIPs", "customCdnAddrs", "warpEndpoints", "customBypassRules", "customBlockRules", "customBypassSanctionRules"];
 
     populatePanel(selectElements, checkboxElements, inputElements, textareaElements, proxySettings);
     renderPortsBlock(ports);
@@ -373,7 +375,7 @@ function updateSettings(event) {
     event.preventDefault();
     event.stopPropagation();
 
-    const elementsToCheck = ['cleanIPs', 'customCdnAddrs', 'customCdnSni', 'customCdnHost', 'customBypassRules', 'customBlockRules'];
+    const elementsToCheck = ['cleanIPs', 'customCdnAddrs', 'customCdnSni', 'customCdnHost', 'customBypassRules', 'customBlockRules', 'customBypassSanctionRules'];
     const configForm = document.getElementById('configForm');
     const formData = new FormData(configForm);
 
@@ -385,6 +387,7 @@ function updateSettings(event) {
         validateChainProxy(),
         validateCustomCdn(),
         validateXrayNoises(formData),
+        validateSanctionDns()
     ];
 
     if (!validations.every(Boolean)) return false;
@@ -415,6 +418,26 @@ function updateSettings(event) {
         });
 }
 
+function validateSanctionDns() {
+    const value = document.getElementById("antiSanctionDNS").value.trim();
+
+    let host;
+    try {
+        const url = new URL(value);
+        host = url.hostname;
+    } catch (_) {
+        host = value;
+    }
+
+    const isValid = isValidHostName(host, false);
+    if (!isValid) {
+        alert('⛔ Invalid IPs or Domains.\n👉' + host);
+        return false;
+    }
+
+    return true;
+}
+
 function isValidHostName(value, isHost) {
     const ipv6Regex = /^\[(?:(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,7}:|(?:[a-fA-F0-9]{1,4}:){1,6}:[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,5}(?::[a-fA-F0-9]{1,4}){1,2}|(?:[a-fA-F0-9]{1,4}:){1,4}(?::[a-fA-F0-9]{1,4}){1,3}|(?:[a-fA-F0-9]{1,4}:){1,3}(?::[a-fA-F0-9]{1,4}){1,4}|(?:[a-fA-F0-9]{1,4}:){1,2}(?::[a-fA-F0-9]{1,4}){1,5}|[a-fA-F0-9]{1,4}:(?::[a-fA-F0-9]{1,4}){1,6}|:(?::[a-fA-F0-9]{1,4}){1,7})\](?:\/(?:12[0-8]|1[01]?\d|[0-9]?\d))?/;
     const ipv4Regex = /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)(?:\/(?:\d|[12]\d|3[0-2]))?/;
@@ -428,7 +451,6 @@ function isValidHostName(value, isHost) {
 }
 
 function validateMultipleHostNames(elements) {
-
     const getValue = (id) => document.getElementById(id).value?.split('\n').filter(Boolean);
 
     const ips = [];
@@ -805,7 +827,9 @@ function deleteUdpNoise(event) {
 }
 
 function renderUdpNoiseBlock(xrayUdpNoises) {
+    document.getElementById("noises").innerHTML = '';
     xrayUdpNoises.forEach((noise, index) => {
         addUdpNoise(false, index, noise);
     });
+    globalThis.xrayNoiseCount = xrayUdpNoises.length;
 }
