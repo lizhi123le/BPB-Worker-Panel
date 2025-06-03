@@ -85,7 +85,7 @@ async function buildWorker() {
     
         console.log('✅ Worker minified successfuly!');
     
-        const obfuscationResult = obfs.obfuscate(minifiedCode.code, {
+    const obfuscationResult = obfs.obfuscate(minifiedCode.code, {
         stringArrayThreshold: 1,
         stringArrayEncoding: [
             "rc4",
@@ -109,7 +109,7 @@ async function buildWorker() {
         numbersToExpressions: true,
         deadCodeInjection: true,
         deadCodeInjectionThreshold: 0.5
-        });
+    });
     
         console.log('✅ Worker obfuscated successfuly!');
         finalCode = obfuscationResult.getObfuscatedCode();
