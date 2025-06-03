@@ -86,16 +86,29 @@ async function buildWorker() {
         console.log('✅ Worker minified successfuly!');
     
         const obfuscationResult = obfs.obfuscate(minifiedCode.code, {
-            stringArrayThreshold: 1,
-            stringArrayEncoding: [
-                "rc4"
-            ],
-            numbersToExpressions: true,
-            transformObjectKeys: true,
-            renameGlobals: true,
-            deadCodeInjection: true,
-            deadCodeInjectionThreshold: 0.2,
-            target: "browser"
+        stringArrayThreshold: 1,
+        stringArrayEncoding: [
+            "rc4",
+            "base64"
+        ],
+        compact: true,
+        simplify: true,
+        target: "browser-no-eval",
+        ignoreImports: true,
+        stringArray: true,
+        stringArrayRotate: true,
+        stringArrayIndexShift: true,
+        splitStrings: true,
+        splitStringsChunkLength: 5,
+        unicodeEscapeSequence: true,
+        identifierNamesGenerator: "hexadecimal",
+        renameGlobals: true,
+        renameProperties: false,
+        renamePropertiesMode: "safe",
+        transformObjectKeys: true,
+        numbersToExpressions: true,
+        deadCodeInjection: true,
+        deadCodeInjectionThreshold: 0.5
         });
     
         console.log('✅ Worker obfuscated successfuly!');
