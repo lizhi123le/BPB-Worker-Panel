@@ -3,8 +3,11 @@ name: Build and Release
 permissions:
   contents: write
 
-on:
-  workflow_dispatch:
+on: 
+    push:
+      paths:
+        - '/src/'
+    workflow_dispatch:
 
 jobs:
   build:
