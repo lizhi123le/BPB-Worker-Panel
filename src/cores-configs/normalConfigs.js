@@ -39,7 +39,7 @@ export async function getNormalConfigs(isFragment) {
         if (isTLS) {
             config.searchParams.append('sni', sni);
             config.searchParams.append('fp', 'randomized');
-            config.searchParams.append('alpn', 'http/1.1');
+            config.searchParams.append('alpn', 'h3,h2');
 
             if (globalThis.client === 'hiddify-frag') {
                 config.searchParams.append('fragment', `${settings.fragmentLengthMin}-${settings.fragmentLengthMax},${settings.fragmentIntervalMin}-${settings.fragmentIntervalMax},hellotls`);
