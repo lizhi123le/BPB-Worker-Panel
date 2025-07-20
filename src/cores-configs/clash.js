@@ -232,7 +232,7 @@ function buildClashTROutbound(remark, address, port, host, sni, proxyIPs, allowI
             "early-data-header-name": "Sec-WebSocket-Protocol"
         },
         "sni": sni,
-        "alpn": ["http/1.1"],
+        "alpn": ["h3,h2"],
         "client-fingerprint": "random",
         "skip-cert-verify": allowInsecure
     };
