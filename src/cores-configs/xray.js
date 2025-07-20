@@ -236,7 +236,7 @@ function buildXrayVLOutbound(tag, address, port, host, sni, proxyIPs, isFragment
         outbound.streamSettings.tlsSettings = {
             allowInsecure: allowInsecure,
             fingerprint: "randomized",
-            alpn: ["http/1.1"],
+            alpn: ["h3,h2"],
             serverName: sni
         };
     }
@@ -284,7 +284,7 @@ function buildXrayTROutbound(tag, address, port, host, sni, proxyIPs, isFragment
         outbound.streamSettings.tlsSettings = {
             allowInsecure: allowInsecure,
             fingerprint: "randomized",
-            alpn: ["http/1.1"],
+            alpn: ["h3,h2"],
             serverName: sni
         };
     }
