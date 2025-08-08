@@ -6,7 +6,7 @@ permissions:
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */1 * * *'
 
 jobs:
   build:
@@ -35,7 +35,7 @@ jobs:
         run: npm install --production
 
       - name: Build project
-        run: npm run build
+        run: NODE_ENV=mangle npm run build
 
       - name: Read release note
         id: read_release
@@ -56,5 +56,5 @@ jobs:
           release_name: Release v${{ env.RELEASE_VERSION }}
           overwrite: true
           file_glob: true
-          prerelease: true
+          prerelease: ${{ github.ref != 'refs/heads/main' }}
           body: ${{ steps.read_release.outputs.RELEASE_BODY }}
