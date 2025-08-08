@@ -136,7 +136,7 @@ async function buildWorker() {
             controlFlowFlattening: true,
             controlFlowFlatteningThreshold: 1,
             deadCodeInjection: true,
-            deadCodeInjectionThreshold: 1,
+            deadCodeInjectionThreshold: 0.5,
             identifierNamesGenerator: "hexadecimal",
             renameGlobals: true,
             stringArray: true,
