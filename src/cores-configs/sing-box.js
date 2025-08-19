@@ -322,7 +322,7 @@ function buildSingBoxVLOutbound(remark, address, port, host, sni, allowInsecure,
     };
 
     if (tls) outbound.tls = {
-        alpn: "http/1.1",
+        alpn: "h3,h2",
         enabled: true,
         insecure: allowInsecure,
         server_name: sni,
@@ -362,7 +362,7 @@ function buildSingBoxTROutbound(remark, address, port, host, sni, allowInsecure,
     }
 
     if (tls) outbound.tls = {
-        alpn: "http/1.1",
+        alpn: "h3,h2",
         enabled: true,
         insecure: allowInsecure,
         server_name: sni,
