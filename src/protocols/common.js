@@ -35,10 +35,9 @@ export async function handleTCPOutBound(
             log(`direct connection failed, trying to use Proxy IP for ${addressRemote}`);
             try {
                 let proxyIP, proxyIpPort;
-                const encodedPanelProxyIPs = globalThis.pathName.split('/')[2] || '';
-                const decodedProxyIPs = encodedPanelProxyIPs ? atob(encodedPanelProxyIPs) : globalThis.proxyIPs;
-                const proxyIpList = decodedProxyIPs.split(',').map(ip => ip.trim());
-                const selectedProxyIP = proxyIpList[Math.floor(Math.random() * proxyIpList.length)];
+                const panelProxyIPs = globalThis.panelProxyIP;
+                const finalProxyIPs = panelProxyIPs.length ? panelProxyIPs : globalThis.proxyIPs;
+                const selectedProxyIP = finalProxyIPs[Math.floor(Math.random() * finalProxyIPs.length)];
 
                 if (selectedProxyIP.includes(']:')) {
                     const match = selectedProxyIP.match(/^(\[.*?\]):(\d+)$/);
@@ -58,9 +57,10 @@ export async function handleTCPOutBound(
         } else if (mode === 'nat64') {
             log(`direct connection failed, trying to generate dynamic NAT64 IP for ${addressRemote}`);
             try {
-                const encodedNat64Prefix = globalThis.pathName.split('/')[2] || '';
-                const nat64Prefix = encodedNat64Prefix ? atob(encodedNat64Prefix) : globalThis.nat64;
-                const dynamicProxyIP = await getDynamicProxyIP(addressRemote, nat64Prefix);
+                const panelPrefixes = globalThis.panelNat64Prefixes;
+                const prefixes = panelPrefixes.length ? panelPrefixes : globalThis.nat64Prefixes;
+                const selectedPrefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+                const dynamicProxyIP = await getDynamicProxyIP(addressRemote, selectedPrefix);
                 tcpSocket = await connectAndWrite(dynamicProxyIP, portRemote);
             } catch (error) {
                 console.error('NAT64 connection failed:', error);
