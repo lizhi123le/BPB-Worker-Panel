@@ -13,7 +13,7 @@ export async function resolveDNS(domain, onlyIPv4 = false) {
 
     try {
         const ipv4 = await fetchDNSRecords(dohURLs.ipv4, 1);
-        const ipv6 = onlyIPv4 ? [] : await fetchDNSRecords(dohURLs.ipv4, 28);
+        const ipv6 = onlyIPv4 ? [] : await fetchDNSRecords(dohURLs.ipv6, 28);
         return { ipv4, ipv6 };
     } catch (error) {
         throw new Error(`Error resolving DNS for ${domain}: ${error.message}`);
@@ -36,13 +36,12 @@ async function fetchDNSRecords(url, recordType) {
 
 export async function getConfigAddresses(isFragment) {
     const { settings, hostName } = globalThis;
-    const resolved = await resolveDNS(hostName);
-    const defaultIPv6 = settings.VLTRenableIPv6 ? resolved.ipv6.map((ip) => `[${ip}]`) : [];
+    const resolved = await resolveDNS(hostName, !settings.VLTRenableIPv6);
     const addrs = [
         hostName,
         'www.speedtest.net',
         ...resolved.ipv4,
-        ...defaultIPv6,
+        ...resolved.ipv6.map((ip) => `[${ip}]`),
         ...settings.cleanIPs
     ];
 
@@ -134,3 +133,16 @@ export function getDomain(url) {
 export function base64EncodeUnicode(str) {
     return btoa(String.fromCharCode(...new TextEncoder().encode(str)));
 }
+
+export function parseHostPort(input) {
+    const regex = /^(?:\[(?<ipv6>.+?)\]|(?<host>[^:]+))(:(?<port>\d+))?$/;
+    const match = input.match(regex);
+
+    if (!match) return null;
+
+    const host = match.groups.ipv6 || match.groups.host;
+    const port = match.groups.port ? parseInt(match.groups.port, 10) : null;
+
+    return { host, port };
+}
+

@@ -30,10 +30,8 @@ async function buildXrayDNS(outboundAddrs, domainToStaticIPs, isWorkerLess, isWa
         dnsHost[domain] = ["127.0.0.1"];
     });
 
-    const staticIPs = domainToStaticIPs ? await resolveDNS(domainToStaticIPs) : undefined;
-    if (staticIPs) dnsHost[domainToStaticIPs] = settings.VLTRenableIPv6
-        ? [...staticIPs.ipv4, ...staticIPs.ipv6]
-        : staticIPs.ipv4;
+    const staticIPs = domainToStaticIPs ? await resolveDNS(domainToStaticIPs, !settings.VLTRenableIPv6) : undefined;
+    if (staticIPs) dnsHost[domainToStaticIPs] = [...staticIPs.ipv4, ...staticIPs.ipv6];
 
     const hosts = Object.keys(dnsHost).length ? { hosts: dnsHost } : {};
     const isIPv6 = (settings.VLTRenableIPv6 && !isWarp) || (settings.warpEnableIPv6 && isWarp);
@@ -52,7 +50,7 @@ async function buildXrayDNS(outboundAddrs, domainToStaticIPs, isWorkerLess, isWa
         finalRemoteDNS = `https://${customDns}/dns-query`;
         dnsObject.hosts[customDns] = customDnsHosts;
         skipFallback = false;
-        dnsObject.disableFallback = true;
+        dnsObject.disableFallbackIfMatch = true;
     }
 
     const remoteDnsServer = buildDnsServer(finalRemoteDNS, null, null, null, "remote-dns");
