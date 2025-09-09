@@ -13,24 +13,12 @@ export function init(request, env, upgradeHeader) {
             globalThis.wsProtocol = protocol;
             globalThis.proxyMode = mode;
             globalThis.panelIPs = panelIPs;
-            const proxyIPs = parseIPs(env.PROXY_IP) || [atob('YnBiLnlvdXNlZi5pc2VnYXJvLmNvbQ==')];
-            const nat64Prefixes = parseIPs(env.NAT64_PREFIX) || [
-                '[2a02:898:146:64::]',
-                '[2602:fc59:b0:64::]',
-                '[2602:fc59:11:64::]'
+            globalThis.proxyIPs = parseIPs(env.PROXY_IP) || [atob('YnBiLnlvdXNlZi5pc2VnYXJvLmNvbQ==')];
+            globalThis.prefixes = parseIPs(env.PREFIX) || [
+                atob('WzJhMDI6ODk4OjE0Njo2NDo6XQ=='),
+                atob('WzI2MDI6ZmM1OTpiMDo2NDo6XQ=='),
+                atob('WzI2MDI6ZmM1OToxMTo2NDo6XQ==')
             ];
-            
-            let ips = [];
-
-            if (mode === 'proxyip') {
-                ips = panelIPs.length ? panelIPs : proxyIPs;
-            } else if (mode === 'nat64') {
-                ips = panelIPs.length ? panelIPs : nat64Prefixes;
-            } else {
-                return new Response('Not found', { status: 404 });
-            }
-
-            globalThis.proxyIP = ips[Math.floor(Math.random() * ips.length)];
         } catch (error) {
             return new Response('Failed to parse WebSocket path config', { status: 400 });
         }

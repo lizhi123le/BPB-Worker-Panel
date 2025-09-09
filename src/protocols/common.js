@@ -31,25 +31,30 @@ export async function handleTCPOutBound(
     async function retry() {
         let tcpSocket;
         const mode = globalThis.proxyMode;
+        const getRandomValue = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
         if (mode === 'proxyip') {
             log(`direct connection failed, trying to use Proxy IP for ${addressRemote}`);
             try {
-                const { host, port } = parseHostPort(globalThis.proxyIP);
+                const ips = globalThis.panelIPs.length ? globalThis.panelIPs : globalThis.proxyIPs;
+                const proxyIP = getRandomValue(ips);
+                const { host, port } = parseHostPort(proxyIP);
                 tcpSocket = await connectAndWrite(host || addressRemote, port || portRemote);
             } catch (error) {
                 console.error('Proxy IP connection failed:', error);
                 webSocket.close(1011, 'Proxy IP connection failed: ' + error.message);
             }
 
-        } else if (mode === 'nat64') {
-            log(`direct connection failed, trying to generate dynamic NAT64 IP for ${addressRemote}`);
+        } else if (mode === 'prefix') {
+            log(`direct connection failed, trying to generate dynamic prefix for ${addressRemote}`);
             try {
-                const dynamicProxyIP = await getDynamicProxyIP(addressRemote, globalThis.proxyIP);
+                const ips = globalThis.panelIPs.length ? globalThis.panelIPs : globalThis.prefixes;
+                const prefix = getRandomValue(ips);
+                const dynamicProxyIP = await getDynamicProxyIP(addressRemote, prefix);
                 tcpSocket = await connectAndWrite(dynamicProxyIP, portRemote);
             } catch (error) {
-                console.error('NAT64 connection failed:', error);
-                webSocket.close(1011, 'NAT64 connection failed: ' + error.message);
+                console.error('Prefix connection failed:', error);
+                webSocket.close(1011, 'Prefix connection failed: ' + error.message);
             }
         }
 
@@ -201,7 +206,7 @@ export function safeCloseWebSocket(socket) {
     }
 }
 
-async function getDynamicProxyIP(address, nat64Prefix) {
+async function getDynamicProxyIP(address, prefix) {
     let finalAddress = address;
     if (!isIPv4(address)) {
         const { ipv4 } = await resolveDNS(address, true);
@@ -212,10 +217,10 @@ async function getDynamicProxyIP(address, nat64Prefix) {
         }
     }
 
-    return convertToNAT64IPv6(finalAddress, nat64Prefix);
+    return convertToNAT64IPv6(finalAddress, prefix);
 }
 
-function convertToNAT64IPv6(ipv4Address, nat64Prefix) {
+function convertToNAT64IPv6(ipv4Address, prefix) {
     const parts = ipv4Address.split('.');
     if (parts.length !== 4) {
         throw new Error('Invalid IPv4 address');
@@ -229,7 +234,7 @@ function convertToNAT64IPv6(ipv4Address, nat64Prefix) {
         return num.toString(16).padStart(2, '0');
     });
 
-    const match = nat64Prefix.match(/^\[([0-9A-Fa-f:]+)\]$/);
+    const match = prefix.match(/^\[([0-9A-Fa-f:]+)\]$/);
     if (match) {
         return `[${match[1]}${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
     }
