@@ -14,7 +14,7 @@ jobs:
   build:
     if: |
       github.event_name == 'workflow_dispatch' || 
-      (github.event_name == 'schedule' && github.ref == 'refs/heads/main')
+      (github.event_name == 'schedule' && github.ref == 'refs/heads/dev')
     runs-on: ubuntu-latest
 
     steps:
