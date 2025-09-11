@@ -58,6 +58,6 @@ jobs:
           release_name: Release v${{ env.RELEASE_VERSION }}
           overwrite: true
           file_glob: true
-          prerelease: ${{ github.ref != 'refs/heads/main' }}
-          promote: ${{ github.ref == 'refs/heads/main' }}
+          prerelease: false
+          promote: ${{ github.ref == 'refs/heads/dev' }}
           body: ${{ steps.read_release.outputs.RELEASE_BODY }}
