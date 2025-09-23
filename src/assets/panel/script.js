@@ -199,19 +199,19 @@ function downloadWarpConfigs(isAmnezia) {
     window.location.href = "/panel/get-warp-configs" + client;
 }
 
-function generateSubUrl(path, app, tag, hiddifyType, singboxType) {
+function generateSubUrl(path, app, tag, singboxType) {
     const url = new URL(window.location.href);
     url.pathname = `/sub/${path}/${globalThis.subPath}`;
     app && url.searchParams.append('app', app);
     if (tag) url.hash = `💦 ${atob('QlBC')} ${tag}`;
 
-    if (singboxType) return `sing-box://import-remote-profile?url=${url.href}`;
-    if (hiddifyType) return `hiddify://import/${url.href}`;
-    return url.href;
+    return singboxType
+        ? `sing-box://import-remote-profile?url=${url.href}`
+        : url.href;
 }
 
-function subURL(path, app, tag, hiddifyType, singboxType) {
-    const url = generateSubUrl(path, app, tag, hiddifyType, singboxType);
+function subURL(path, app, tag, singboxType) {
+    const url = generateSubUrl(path, app, tag, singboxType);
     copyToClipboard(url);
 }
 
@@ -266,10 +266,10 @@ async function uploadSettings(event) {
     }
 }
 
-function openQR(path, app, tag, title, singboxType, hiddifyType) {
+function openQR(path, app, tag, title, singboxType) {
     const qrModal = document.getElementById('qrModal');
     const qrcodeContainer = document.getElementById('qrcode-container');
-    const url = generateSubUrl(path, app, tag, hiddifyType, singboxType);
+    const url = generateSubUrl(path, app, tag, singboxType);
     let qrcodeTitle = document.getElementById("qrcodeTitle");
     qrcodeTitle.textContent = title;
     qrModal.style.display = "block";
@@ -895,12 +895,12 @@ function addUdpNoise(isManual, noiseIndex, udpNoise) {
         <div class="header-container">
             <h4>Noise ${index + 1}</h4>
             <button type="button" class="delete-noise">
-                <i class="fa fa-minus-circle fa-2x" aria-hidden="true"></i>
+                <span class="material-symbols-rounded">delete</span>
             </button>      
         </div>
         <div class="section">
             <div class="form-control">
-                <label>😵‍💫 v2ray Mode</label>
+                <label>😵‍💫 Mode</label>
                 <div>
                     <select name="udpXrayNoiseMode">
                         <option value="base64" ${noise.type === 'base64' ? 'selected' : ''}>Base64</option>
@@ -911,25 +911,25 @@ function addUdpNoise(isManual, noiseIndex, udpNoise) {
                 </div>
             </div>
             <div class="form-control">
-                <label>📥 Noise Packet</label>
+                <label>📥 Packet</label>
                 <div>
                     <input type="text" name="udpXrayNoisePacket" value="${noise.packet}">
                 </div>
             </div>
             <div class="form-control">
-                <label>🕞 Noise Delay</label>
+                <label>🎚️ Count</label>
+                <div>
+                    <input type="number" name="udpXrayNoiseCount" value="${noise.count}" min="1" required>
+                </div>
+            </div>
+            <div class="form-control">
+                <label>🕞 Delay</label>
                 <div class="min-max">
                     <input type="number" name="udpXrayNoiseDelayMin"
                         value="${noise.delay.split('-')[0]}" min="1" required>
                     <span> - </span>
                     <input type="number" name="udpXrayNoiseDelayMax"
                         value="${noise.delay.split('-')[1]}" min="1" required>
-                </div>
-            </div>
-            <div class="form-control">
-                <label>🎚️ Noise Count</label>
-                <div>
-                    <input type="number" name="udpXrayNoiseCount" value="${noise.count}" min="1" required>
                 </div>
             </div>
         </div>`;
