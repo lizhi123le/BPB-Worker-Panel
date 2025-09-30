@@ -30,6 +30,7 @@ export async function updateDataset(request, env) {
     let newSettings = request.method === 'POST' ? await request.json() : null;
     const isReset = newSettings?.resetSettings;
     let currentSettings;
+
     if (!isReset) {
         try {
             currentSettings = await env.kv.get("proxySettings", { type: 'json' });
@@ -41,8 +42,13 @@ export async function updateDataset(request, env) {
 
     const populateField = (field, defaultValue, callback) => {
         if (isReset) return defaultValue;
-        if (!newSettings) return currentSettings?.[field] ?? defaultValue;
+        
+        if (!newSettings) {
+            return currentSettings?.[field] ?? defaultValue;
+        }
+
         const value = newSettings[field];
+
         return typeof callback === 'function' ? callback(value) : value;
     }
 
@@ -84,6 +90,7 @@ export async function updateDataset(request, env) {
         TRConfigs: populateField('TRConfigs', true),
         ports: populateField('ports', [443]),
         fingerprint: populateField('fingerprint', 'chrome'),
+        fragmentMode: populateField('fragmentMode', 'custom'),
         fragmentLengthMin: populateField('fragmentLengthMin', 100),
         fragmentLengthMax: populateField('fragmentLengthMax', 200),
         fragmentIntervalMin: populateField('fragmentIntervalMin', 1),
@@ -123,7 +130,6 @@ export async function updateDataset(request, env) {
                 count: 5
             }
         ]),
-        hiddifyNoiseMode: populateField('hiddifyNoiseMode', 'm4'),
         knockerNoiseMode: populateField('knockerNoiseMode', 'quic'),
         noiseCountMin: populateField('noiseCountMin', 10),
         noiseCountMax: populateField('noiseCountMax', 15),
@@ -150,8 +156,10 @@ export async function updateDataset(request, env) {
 function extractChainProxyParams(chainProxy) {
     let configParams = {};
     if (!chainProxy) return {};
+
     const url = new URL(chainProxy);
     const protocol = url.protocol.slice(0, -1);
+
     if (protocol === atob('dmxlc3M=')) {
         const params = new URLSearchParams(url.search);
         configParams = {
