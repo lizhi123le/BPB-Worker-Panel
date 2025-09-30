@@ -403,7 +403,7 @@ function resetSettings() {
             }
 
             initiatePanel(body);
-            alert('✅ Panel settings reset to default successfully!');
+            alert('✅ Panel settings reset to default successfully!\n💡 Please update your subscriptions.');
         })
         .catch(error => console.error("Reseting settings error:", error.message || error));
 }
@@ -804,14 +804,13 @@ function validateXrayNoises(fields) {
     let submisionError = false;
 
     modes.forEach((mode, index) => {
-        if (delaysMin[index] > delaysMax[index]) {
+        if (Number(delaysMin[index]) > Number(delaysMax[index])) {
             alert('⛔ The minimum noise delay should be smaller or equal to maximum!');
             submisionError = true;
             return;
         }
 
         switch (mode) {
-
             case 'base64': {
                 if (!base64Regex.test(packets[index])) {
                     alert('⛔ The Base64 noise packet is not a valid base64 value!');
