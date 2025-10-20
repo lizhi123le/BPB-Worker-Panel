@@ -1,9 +1,11 @@
-import { randomBytes, scalarMult } from 'tweetnacl';
-
 export async function fetchWarpConfigs(env) {
-    let warpConfigs = [];
+    const warpConfigs = [];
     const apiBaseUrl = 'https://api.cloudflareclient.com/v0a4005/reg';
-    const warpKeys = [generateKeyPair(), generateKeyPair()];
+    const warpKeys = [
+        await generateKeyPair(), 
+        await generateKeyPair()
+    ];
+
     const commonPayload = {
         install_id: "",
         fcm_token: "",
@@ -24,6 +26,7 @@ export async function fetchWarpConfigs(env) {
                 },
                 body: JSON.stringify({ ...commonPayload, key: key.publicKey })
             });
+            
             return await response.json();
         } catch (error) {
             throw new Error("Failed to get warp configs.", error);
@@ -40,17 +43,28 @@ export async function fetchWarpConfigs(env) {
 
     const configs = JSON.stringify(warpConfigs)
     await env.kv.put('warpConfigs', configs);
+    
     return configs;
 }
 
-const generateKeyPair = () => {
-    const base64Encode = (array) => btoa(String.fromCharCode.apply(null, array));
-    let privateKey = randomBytes(32);
-    privateKey[0] &= 248;
-    privateKey[31] &= 127;
-    privateKey[31] |= 64;
-    let publicKey = scalarMult.base(privateKey);
-    const publicKeyBase64 = base64Encode(publicKey);
-    const privateKeyBase64 = base64Encode(privateKey);
-    return { publicKey: publicKeyBase64, privateKey: privateKeyBase64 };
-};
+async function generateKeyPair() {
+    const keyPair = await crypto.subtle.generateKey(
+        { name: "X25519", namedCurve: "X25519" },
+        true,
+        ["deriveBits"]
+    );
+
+    const pkcs8 = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
+    const privateKeyRaw = new Uint8Array(pkcs8).slice(-32);
+
+    const publicKeyRaw = new Uint8Array(
+        await crypto.subtle.exportKey("raw", keyPair.publicKey)
+    );
+
+    const base64Encode = (arr) => btoa(String.fromCharCode(...arr));
+
+    return { 
+        publicKey: base64Encode(publicKeyRaw), 
+        privateKey: base64Encode(privateKeyRaw) 
+    };
+}

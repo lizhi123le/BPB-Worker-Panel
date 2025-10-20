@@ -5,13 +5,12 @@ import { build } from 'esbuild';
 import { globSync } from 'glob';
 import { minify as jsMinify } from 'terser';
 import { minify as htmlMinify } from 'html-minifier';
-import { execSync } from 'child_process';
 import JSZip from "jszip";
 import obfs from 'javascript-obfuscator';
 import pkg from '../package.json' with { type: 'json' };
 
-const env = process.env.NODE_ENV || 'obfuscate';
-const mangleMode = env !== 'obfuscate';
+const env = process.env.NODE_ENV || 'mangle';
+const mangleMode = env === 'mangle';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = pathDirname(__filename);
@@ -37,14 +36,16 @@ async function processHtmlPages() {
         const base = (file) => join(ASSET_PATH, dir, file);
 
         const indexHtml = readFileSync(base('index.html'), 'utf8');
-        const styleCode = readFileSync(base('style.css'), 'utf8');
-        const scriptCode = readFileSync(base('script.js'), 'utf8');
+        let finalHtml = indexHtml.replaceAll('__VERSION__', version);
 
-        const finalScriptCode = await jsMinify(scriptCode);
-        const finalHtml = indexHtml
-            .replaceAll('__STYLE__', `<style>${styleCode}</style>`)
-            .replaceAll('__SCRIPT__', finalScriptCode.code)
-            .replaceAll('__PANEL_VERSION__', version);
+        if (dir !== 'error') {
+            const styleCode = readFileSync(base('style.css'), 'utf8');
+            const scriptCode = readFileSync(base('script.js'), 'utf8');
+            const finalScriptCode = await jsMinify(scriptCode);
+            finalHtml = finalHtml
+                .replaceAll('__STYLE__', `<style>${styleCode}</style>`)
+                .replaceAll('__SCRIPT__', finalScriptCode.code);
+        }
 
         const minifiedHtml = htmlMinify(finalHtml, {
             collapseWhitespace: true,
@@ -52,7 +53,8 @@ async function processHtmlPages() {
             minifyCSS: true
         });
 
-        const encodedHtml = Buffer.from(minifiedHtml, 'utf8').toString('base64');
+        // const encodedHtml = Buffer.from(minifiedHtml, 'utf8').toString('base64');
+        const encodedHtml = stringToHex(minifiedHtml);
         result[dir] = JSON.stringify(encodedHtml);
     }
 
@@ -78,7 +80,7 @@ function generateJunkCode() {
         return `function ${funcName}() { return ${Math.floor(Math.random() * 1000)}; }`;
     }).join('\n');
 
-    return `// Junk code injection\n${junkVars}\n${junkFuncs}\n`;
+    return `${junkVars}\n${junkFuncs}\n`;
 }
 
 async function buildWorker() {
@@ -101,7 +103,7 @@ async function buildWorker() {
             __ERROR_HTML_CONTENT__: htmls['error'] ?? '""',
             __SECRETS_HTML_CONTENT__: htmls['secrets'] ?? '""',
             __ICON__: JSON.stringify(faviconBase64),
-            __PANEL_VERSION__: JSON.stringify(version)
+            __VERSION__: JSON.stringify(version)
         }
     });
 
@@ -162,14 +164,7 @@ async function buildWorker() {
     }
 
     const buildTimestamp = new Date().toISOString();
-    let gitHash = '';
-    try {
-        gitHash = execSync('git rev-parse --short HEAD').toString().trim();
-    } catch (e) {
-        gitHash = 'unknown';
-    }
-
-    const buildInfo = `// Build: ${buildTimestamp} | Commit: ${gitHash} | Version: ${version}\n`;
+    const buildInfo = `// Build: ${buildTimestamp}\n`;
     const worker = `${buildInfo}// @ts-nocheck\n${finalCode}`;
     mkdirSync(DIST_PATH, { recursive: true });
     writeFileSync('./dist/worker.js', worker, 'utf8');
@@ -188,3 +183,10 @@ buildWorker().catch(err => {
     console.error(`${failure} Build failed:`, err);
     process.exit(1);
 });
+
+function stringToHex(str) {
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(str);
+    return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+}
+
