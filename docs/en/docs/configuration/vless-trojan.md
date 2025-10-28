@@ -25,29 +25,15 @@ https://8.8.8.8/dns-query
     tls://dns.google
     ```
 
-## Local DNS
-
-By default, the local DNS server is Google DNS.
-
-```title="Default Local DNS"
-8.8.8.8
-```
-
-Many DNS servers are available to use as Local DNS in shape of IP, however you can use **localhost** which uses your ISP DNS server which is fine for routing purposes.
-
-## Fake DNS
-
-You may enable Fake DNS to reduce DNS query latency, but use caution—it may be incompatible with some applications or interfere with system DNS. If you're unsure about its functionality, avoid enabling it.
-
 ## Chain Proxy
 
-As noted, a Proxy IP fixes the IP for Cloudflare target addresses, but node IPs may differ for other targets. A **Chain Proxy** ensures a consistent IP for all targets. You can use a free **VLESS**, **Trojan**, **Shadowsocks**, **Socks**, or **HTTP** config here, even if it’s blocked by your ISP, to permanently fix your IP to the Chain Proxy IP.
+As noted, a Proxy IP fixes the IP for Cloudflare target addresses, but node IPs may differ for other targets. A **Chain Proxy** ensures a consistent IP for all targets. You can use a free **VLESS**, **VMess**, **Trojan**, **Shadowsocks**, **Socks**, or **HTTP** config here, even if it’s blocked by your ISP, to permanently fix your IP to the Chain Proxy IP.
 
 !!! note
     The Chain Proxy config must not be a worker itself, or the final IP will still change.
 
 !!! note
-    VLESS and Trojan configs support:  
+    VLESS, VMess and Trojan configs support:  
 
     - WS
     - WS TLS
@@ -120,6 +106,10 @@ Here you can select TLS fingerprint, default to randomized.
 ## Best Interval
 
 By default, **Best** configs test every 30 seconds to identify the optimal config or Fragment value. For low-speed networks during activities like video streaming or gaming, this may cause lag. Adjust the interval between 10 and 90 seconds as needed.
+
+## TCP Fast Open
+
+If your device supports TCP Fast Open and your ISP does not interfere with TFO, you can enable the feature to enhance your connections. Please note that Linux users have to enable TFO before activating this feature.
 
 ## Proxy IP
 

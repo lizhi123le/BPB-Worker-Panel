@@ -23,8 +23,7 @@ const ipv6Regex = /^\[(?:(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]
 
 fetch('/panel/settings')
     .then(async response => response.json())
-    .then(data => {
-        const { success, status, message, body } = data;
+    .then(({ success, status, message, body }) => {
 
         if (status === 401 && !body.isPassSet) {
             const closeBtn = document.querySelector(".close");
@@ -77,7 +76,7 @@ function initiatePanel(proxySettings) {
 function populatePanel(proxySettings) {
     selectElements.forEach(elm => elm.value = proxySettings[elm.id]);
     checkboxElements.forEach(elm => elm.checked = proxySettings[elm.id]);
-    inputElements.forEach(elm => elm.value = proxySettings[elm.id]);
+    inputElements.forEach(elm => elm.value = proxySettings[elm.id] || "");
     textareaElements.forEach(elm => {
         const key = elm.id;
         const element = document.getElementById(key);
@@ -445,7 +444,8 @@ function validateSettings() {
         'udpXrayNoisePacket',
         'udpXrayNoiseDelayMin',
         'udpXrayNoiseDelayMax',
-        'udpXrayNoiseCount'
+        'udpXrayNoiseCount',
+        'applyTo'
     ].map(field => formData.getAll(field));
 
     const validations = [
@@ -469,13 +469,14 @@ function validateSettings() {
     }
 
     const form = Object.fromEntries(formData.entries());
-    const [modes, packets, delaysMin, delaysMax, counts] = fields;
+    const [modes, packets, delaysMin, delaysMax, counts, applyTo] = fields;
 
     modes.forEach((mode, index) => {
         xrayUdpNoises.push({
             type: mode,
             packet: packets[index],
             delay: `${delaysMin[index]}-${delaysMax[index]}`,
+            applyTo: applyTo[index],
             count: counts[index]
         });
     });
@@ -535,7 +536,7 @@ function updateSettings(event, data) {
     applyButton.value = '⌛ Loading...';
 
     fetch('/panel/update-settings', {
-        method: 'POST',
+        method: 'PUT',
         body: JSON.stringify(form),
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' }
@@ -747,13 +748,14 @@ function validateMinMax() {
     const [
         fragmentLengthMin, fragmentLengthMax,
         fragmentIntervalMin, fragmentIntervalMax,
+        fragmentMaxSplitMin, fragmentMaxSplitMax,
         noiseCountMin, noiseCountMax,
         noiseSizeMin, noiseSizeMax,
-        noiseDelayMin, noiseDelayMax,
-
+        noiseDelayMin, noiseDelayMax
     ] = [
         'fragmentLengthMin', 'fragmentLengthMax',
         'fragmentIntervalMin', 'fragmentIntervalMax',
+        'fragmentMaxSplitMin', 'fragmentMaxSplitMax',
         'noiseCountMin', 'noiseCountMax',
         'noiseSizeMin', 'noiseSizeMax',
         'noiseDelayMin', 'noiseDelayMax'
@@ -761,6 +763,7 @@ function validateMinMax() {
 
     if (fragmentLengthMin >= fragmentLengthMax ||
         fragmentIntervalMin > fragmentIntervalMax ||
+        fragmentMaxSplitMin > fragmentMaxSplitMax ||
         noiseCountMin > noiseCountMax ||
         noiseSizeMin > noiseSizeMax ||
         noiseDelayMin > noiseDelayMax
@@ -776,7 +779,7 @@ function validateChainProxy() {
     const chainProxy = getElmValue('outProxy');
     if (!chainProxy) return true;
     const isSocksHttp = /(http|socks):\/\/(?:([^:@]+):([^:@]+)@)?([^:@]+):(\d+)$/.test(chainProxy);
-    const isOthers = /(vless|trojan|ss):\/\/[^\s@]+@[^\s:]+:[^\s]+/.test(chainProxy);
+    const isOthers = /(vless|vmess|trojan|ss):\/\/[^\s@]+@[^\s:]+:[^\s]+/.test(chainProxy);
 
     if (!isSocksHttp && !isOthers) {
         alert('⛔ Invalid Config!\n💡 Standard formats are:\n + (socks or http)://user:pass@host:port\n + (socks or http)://host:port\n + vless://uuid@server:port...\n + trojan://password@server:port...\n + ss://password@server:port...');
@@ -796,17 +799,17 @@ function validateChainProxy() {
         }
 
         if (security && !['tls', 'none', 'reality'].includes(security)) {
-            alert('⛔ Invalid Config!\n💡 VLESS or Trojan security can be TLS, Reality or None.');
+            alert('⛔ Invalid Config!\n💡 VLESS, VMess or Trojan security can be TLS, Reality or None.');
             return false;
         }
 
         if (!['tcp', 'raw', 'ws', 'grpc', 'httpupgrade'].includes(type)) {
-            alert('⛔ Invalid Config!\n💡 VLESS or Trojan transmission can be tcp, ws, grpc or httpupgrade.');
+            alert('⛔ Invalid Config!\n💡 VLESS, VMess or Trojan transmission can be tcp, ws, grpc or httpupgrade.');
             return false;
         }
 
         if (security === 'tls' && port !== '443') {
-            alert('⛔ Invalid Config!\n💡 VLESS or Trojan TLS port can be only 443.');
+            alert('⛔ Invalid Config!\n💡 VLESS, VMess or Trojan TLS port can be only 443.');
             return false;
         }
     }
@@ -1003,6 +1006,7 @@ function addUdpNoise(isManual, noiseIndex, udpNoise) {
         type: 'rand',
         packet: '50-100',
         delay: '1-5',
+        applyTo: 'ip',
         count: 5
     };
 
@@ -1030,7 +1034,7 @@ function addUdpNoise(isManual, noiseIndex, udpNoise) {
                 </div>
             </div>
             <div class="form-control">
-                <label>📥 Packet</label>
+                <label>📦 Packet</label>
                 <div>
                     <input type="text" name="udpXrayNoisePacket" value="${noise.packet}">
                 </div>
@@ -1049,6 +1053,16 @@ function addUdpNoise(isManual, noiseIndex, udpNoise) {
                     <span> - </span>
                     <input type="number" name="udpXrayNoiseDelayMax"
                         value="${noise.delay.split('-')[1]}" min="1" required>
+                </div>
+            </div>
+            <div class="form-control">
+                <label>⚙️ Applies to</label>
+                <div>
+                    <select name="applyTo">
+                        <option value="ip" ${!noise.applyTo || noise.applyTo === 'ip' ? 'selected' : ''}>IP</option>
+                        <option value="ipv4" ${noise.applyTo === 'ipv4' ? 'selected' : ''}>IPv4</option>
+                        <option value="ipv6" ${noise.applyTo === 'ipv6' ? 'selected' : ''}>IPv6</option>
+                    </select>
                 </div>
             </div>
         </div>`;
