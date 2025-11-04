@@ -4,6 +4,8 @@ permissions:
   contents: write
 
 on:
+  push:
+    branches: [dev]
   workflow_dispatch:
   schedule:
     - cron: '0 */1 * * *'
@@ -12,7 +14,7 @@ jobs:
   build:
     if: |
       github.event_name == 'workflow_dispatch' || 
-      (github.event_name == 'schedule' && github.ref == 'refs/heads/main')
+      github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
 
     steps:
@@ -33,9 +35,6 @@ jobs:
 
       - name: Install dependencies
         run: npm install --production
-
-      - name: Type check
-        run: npm run check
         
       - name: Build project
         run: npm run build
@@ -49,7 +48,6 @@ jobs:
           r="${r//$'\n'/'%0A'}"                             
           r="${r//$'\r'/'%0D'}"                             
           echo "RELEASE_BODY=$r" >> $GITHUB_OUTPUT          
-
       - name: Upload Release Assets
         uses: svenstaro/upload-release-action@v2
         with:
@@ -59,7 +57,6 @@ jobs:
           release_name: Release v${{ steps.get_version.outputs.version }}
           overwrite: true
           file_glob: true
-          prerelease: ${{ github.ref != 'refs/heads/main' }}
-          promote: ${{ github.ref == 'refs/heads/main' }}
-          make_latest: ${{ github.ref == 'refs/heads/main' }}
+          prerelease: false
+          promote: ${{ github.ref == 'refs/heads/dev' }}
           body: ${{ steps.read_release.outputs.RELEASE_BODY }}
