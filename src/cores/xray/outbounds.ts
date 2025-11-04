@@ -139,7 +139,7 @@ export function buildWebsocketOutbound(
         network: "ws",
         ...buildTransport("ws", "none", `${generateWsPath(protocol)}?ed=2560`, host),
         security: isTLS ? "tls" : "none",
-        tlsSettings: isTLS ? buildTlsSettings(sni, fingerprint, "http/1.1", allowInsecure) : undefined,
+        tlsSettings: isTLS ? buildTlsSettings(sni, fingerprint, "h3,h2", allowInsecure) : undefined,
         sockopt: isFragment
             ? buildSockopt(false, false, undefined, "fragment")
             : buildSockopt(true, enableTFO, "UseIP"),
