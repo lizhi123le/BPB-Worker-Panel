@@ -136,7 +136,7 @@ export function buildWebsocketOutbound(
     const tlsSettings = isTLS ? buildTlsSettings(
             sni,
             fingerprint,
-            "http/1.1",
+            "h3",
             allowInsecure,
             enableECH && !isFragment ? echConfig : undefined
         ) : undefined;
