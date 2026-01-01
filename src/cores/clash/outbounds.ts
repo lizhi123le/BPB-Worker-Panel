@@ -61,7 +61,7 @@ export function buildWebsocketOutbound(
     if (protocol === _TR_ && !isTLS) return null;
     const { host, sni, allowInsecure } = selectSniHost(address);
 
-    const tls = isTLS ? buildTLS(protocol, "tls", allowInsecure, sni, enableECH ? echConfig : undefined, "http/1.1", fingerprint) : {};
+    const tls = isTLS ? buildTLS(protocol, "tls", allowInsecure, sni, enableECH ? echConfig : undefined, "h3", fingerprint) : {};
     const transport = buildTransport("ws", undefined, generateWsPath(protocol), host, undefined, 2560);
 
     if (protocol === _VL_) return buildOutbound<VlessOutbound>(remark, protocol, address, port, enableIPv6, enableTFO, tls, transport, {
