@@ -71,7 +71,7 @@ export function buildWebsocketOutbound(
             allowInsecure,
             sni,
             enableECH && !isFragment ? echConfig : undefined,
-            "http/1.1",
+            "h3",
             fingerprint
         ) : undefined;
 
