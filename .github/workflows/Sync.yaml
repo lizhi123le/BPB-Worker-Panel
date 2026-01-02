@@ -25,27 +25,8 @@ jobs:
         with:
           fetch-depth: 1
           ref: dev
-          
-      # Step 2: 删除旧上游
-      - name: Remove old upstream if exists
-        run: git remote remove upstream || true
 
-      # Step 3: 检查是否有新提交
-      - name: Check for upstream changes
-        id: check
-        run: |
-          git remote add upstream https://github.com/bia-pain-bache/BPB-Worker-Panel.git || true
-          git fetch upstream dev
-          if git log HEAD..upstream/dev --oneline | grep .; then
-            echo "has_new_commits=true" >> $GITHUB_ENV
-            echo "New commits found, will sync."
-          else
-            echo "has_new_commits=false" >> $GITHUB_ENV
-            echo "Already up to date, skipping sync."
-            exit 0
-          fi
-
-      # Step 4: 仅在有新提交时才运行同步
+      # Step 2: 仅在有新提交时才运行同步
       - name: Sync upstream changes
         if: env.has_new_commits == 'true'
         uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
@@ -62,7 +43,7 @@ jobs:
           host_domain: github.com
           shallow_since: null
           
-      # Step 5: 如果失败，提示手动同步
+      # Step 3: 如果失败，提示手动同步
       - name: Sync check
         if: failure()
         run: |
