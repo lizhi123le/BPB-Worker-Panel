@@ -1,0 +1,52 @@
+name: Upstream Sync
+
+permissions:
+  contents: write
+
+on: 
+  schedule: 
+    - cron: "0 */12 * * *"  
+  workflow_dispatch: 
+  push: 
+    branches: 
+      - dev 
+    paths-ignore:
+      - '.github/**/*.yml'
+
+jobs:
+  sync_latest_from_upstream:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
+
+    steps:
+      # Step 1: checkout fork 仓库，完整历史
+      - name: Checkout target repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          ref: dev
+          
+      # Step 2: 仅在有新提交时才运行同步
+      - name: Sync upstream changes
+        if: env.has_new_commits == 'true'
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          upstream_sync_repo: bia-pain-bache/BPB-Worker-Panel
+          upstream_sync_branch: dev
+          target_sync_branch: dev
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          test_mode: false
+          git_log_format_args: --pretty=oneline
+          git_config_user: GH Action - Upstream Sync
+          git_config_email: action@github.com
+          git_config_pull_rebase: false
+          host_domain: github.com
+          shallow_since: null
+          
+      # Step 3: 如果失败，提示手动同步
+      - name: Sync check
+        if: failure()
+        run: |
+          echo "[Error] 上游仓库 workflow 文件变更，GitHub 自动暂停了本次自动更新。"
+          echo "[Error] 请手动 Sync Fork 一次，详细教程请查看项目 README.md。"
+          exit 0
