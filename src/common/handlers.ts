@@ -599,7 +599,7 @@ export async function getURLConfigs() {
         if (isTLS) {
             config.searchParams.append('sni', sni);
             config.searchParams.append('fp', fingerprint);
-            config.searchParams.append('alpn', 'http/1.1');
+            config.searchParams.append('alpn', 'http/1.2');
         }
 
         return config.href;
