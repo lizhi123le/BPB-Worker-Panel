@@ -139,7 +139,7 @@ export interface TcpHeader {
         };
         method: "GET";
         path: string[];
-        version: "1.2";
+        version: "1.1";
     };
 }
 
