@@ -1,5 +1,6 @@
 {
     "include": ["src"],
+    "exclude": ["dist", "node_modules"],
     "compilerOptions": {
         "target": "esnext",
         "module": "esnext",
