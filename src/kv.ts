@@ -82,8 +82,6 @@ export async function updateDataset(request: Request, env: Env): Promise<Setting
             ["outProxyParams", "outProxy", extractProxyParams],
             ["cleanIPs"],
             ["customCdnAddrs"],
-            ["customCdnHost"],
-            ["customCdnSni"],
             ["bestVLTRInterval"],
             ["VLConfigs"],
             ["TRConfigs"],
@@ -272,33 +270,10 @@ function extractUpstreamParams(upstreamProxy: string): UpstreamProxy {
     return { upstreamServer, upstreamPort };
 }
 
-// async function extractEchConfig(enableECH: boolean): Promise<string> {
-//     if (!enableECH) return "";
-    
-//     const { httpConfig: { hostName }} = globalThis;
-//     const url = new URL("https://dns.google/resolve");
-//     url.searchParams.set("name", hostName);
-//     url.searchParams.set("type", "HTTPS");
-
-//     const res = await fetch(url.toString(), {
-//         headers: { accept: "application/dns-json" },
-//     });
-
-//     const dns = await res.json() as {
-//         Answer: Array<{ data: string }>;
-//     };
-
-//     for (const ans of dns.Answer) {
-//         const ech = ans.data.match(/ech=([^ ]+)/)?.[1];
-//         if (ech) return ech;
-//     }
-
-//     throw new Error("ECH record not found");
-// }
 
 function normalizeEchNames(val: unknown): string[] {
     if (!val) return [];
     if (Array.isArray(val)) return val;
-    if (typeof val === 'string') return val ? [val] : [];
+    if (typeof val === 'string') return [val];
     return [];
 }

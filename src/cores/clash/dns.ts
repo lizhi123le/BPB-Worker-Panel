@@ -18,8 +18,8 @@ export async function buildDNS(isChain: boolean, isWarp: boolean, isPro: boolean
     const finalLocalDNS = localDNS === 'localhost' ? 'system' : `${localDNS}#DIRECT`;
     const proSign = isPro ? "Pro " : "";
     const remoteDnsDetour = isWarp
-        ? `💦 Warp ${proSign}- Best Ping 🚀`
-        : isChain ? "💦 Best Ping 🚀" : "✅ Selector";
+        ? `Warp ${proSign}- 最佳延迟 🚀`
+        : isChain ? "🔗 最佳延迟 🚀" : "✅ Selector";
 
     const finalRemoteDNS = `${isWarp ? warpRemoteDNS : remoteDNS}#${remoteDnsDetour}`;
     const hosts: DnsHosts = {};

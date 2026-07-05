@@ -153,7 +153,7 @@ export async function handleSubscriptions(request: Request, env: Env): Promise<R
                     return await getClNormalConfig();
 
                 default:
-                    break;
+                    return await fallback(request);
             }
 
         case `/sub/raw/${subPath}`:
@@ -163,7 +163,7 @@ export async function handleSubscriptions(request: Request, env: Env): Promise<R
                     return await getURLConfigs();
 
                 default:
-                    break;
+                    return await fallback(request);
             }
 
         case `/sub/fragment/${subPath}`:
@@ -175,7 +175,7 @@ export async function handleSubscriptions(request: Request, env: Env): Promise<R
                     return await getSbCustomConfig(true);
 
                 default:
-                    break;
+                    return await fallback(request);
             }
 
         case `/sub/warp/${subPath}`:
@@ -190,7 +190,7 @@ export async function handleSubscriptions(request: Request, env: Env): Promise<R
                     return await getClWarpConfig(request, env, false);
 
                 default:
-                    break;
+                    return await fallback(request);
             }
 
         case `/sub/warp-pro/${subPath}`:
@@ -205,7 +205,7 @@ export async function handleSubscriptions(request: Request, env: Env): Promise<R
                     return await getClWarpConfig(request, env, true);
 
                 default:
-                    break;
+                    return await fallback(request);
             }
 
         default:
@@ -704,6 +704,8 @@ async function fetchCustomSubs(subs: string[]): Promise<string> {
 }
 
 function isBase64(str: string): boolean {
-    if (!str || str.length % 4 !== 0) return false;
-    return /^[A-Za-z0-9+/=\r\n]+$/.test(str);
+    // Strip newlines first so multi-line plain-text configs are not misidentified as base64
+    const cleaned = str.replace(/[\r\n]/g, '');
+    if (!cleaned || cleaned.length % 4 !== 0) return false;
+    return /^[A-Za-z0-9+/=]+$/.test(cleaned);
 }

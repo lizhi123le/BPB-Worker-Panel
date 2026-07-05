@@ -271,20 +271,6 @@ function buildTLS(
     };
 }
 
-// function echBase64ToPEM(config: string) {
-//     const clean = config.replace(/\s+/g, "");
-//     const lines: string[] = [];
-
-//     for (let i = 0; i < clean.length; i += 64) {
-//         lines.push(clean.slice(i, i + 64));
-//     }
-
-//     return [
-//         "-----BEGIN ECH CONFIGS-----",
-//         ...lines,
-//         "-----END ECH CONFIGS-----",
-//     ].join("\n");
-// }
 
 function buildTransport(
     type: TransportType,

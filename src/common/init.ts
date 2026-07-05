@@ -41,8 +41,6 @@ globalThis.settings = {
     outProxyParams: {},
     cleanIPs: [],
     customCdnAddrs: [],
-    customCdnHost: "",
-    customCdnSni: "",
     bestVLTRInterval: 30,
     VLConfigs: true,
     TRConfigs: true,

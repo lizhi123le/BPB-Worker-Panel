@@ -715,10 +715,7 @@ function parseAddressEntry(value) {
 
 function validateMultipleHostNames() {
     const invalidValues = [
-        'cleanIPs',
-        'customCdnAddrs',
-        'customCdnSni',
-        'customCdnHost'
+        'cleanIPs'
     ].flatMap(parseElmValues)
         .filter(v => !v.startsWith('http://') && !v.startsWith('https://'))
         .map(parseAddressEntry)
@@ -878,20 +875,6 @@ function validateChainProxy() {
     return true;
 }
 
-function validateCustomCdn() {
-    const customCdnHost = getElmValue('customCdnHost');
-    const customCdnSni = getElmValue('customCdnSni');
-    const customCdnAddrs = parseElmValues('customCdnAddrs');
-    const isCustomCdn = customCdnAddrs.length || customCdnHost !== '' || customCdnSni !== '';
-
-    if (isCustomCdn && !(customCdnAddrs.length && customCdnHost && customCdnSni)) {
-        alert('⛔ All "Custom" fields should be filled or deleted together!');
-        return false;
-    }
-
-    return true;
-}
-
 function validateKnockerNoise() {
     const regex = /^(none|quic|random|[0-9A-Fa-f]+)$/;
     const knockerNoise = getElmValue("knockerNoiseMode");
@@ -1043,7 +1026,6 @@ function validateSettings() {
         validateMinMax(),
         validateUpstreamProxy(),
         validateChainProxy(),
-        validateCustomCdn(),
         validateKnockerNoise(),
         validateXrayNoises(fields),
         validateCustomRules(),

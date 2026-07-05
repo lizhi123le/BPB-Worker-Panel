@@ -86,8 +86,6 @@ declare global {
         outProxyParams: any;
         cleanIPs: string[];
         customCdnAddrs: string[];
-        customCdnHost: string;
-        customCdnSni: string;
         bestVLTRInterval: number;
         VLConfigs: boolean;
         TRConfigs: boolean;

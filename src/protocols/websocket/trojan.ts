@@ -104,7 +104,7 @@ function parseTrHeader(buffer: ArrayBuffer) {
     const password = new TextDecoder().decode(buffer.slice(0, crLfIndex));
     const { TrPass } = globalThis.globalConfig;
 
-    if (password !== sha224(TrPass!)) {
+    if (!TrPass || password !== sha224(TrPass)) {
         return {
             hasError: true,
             message: "invalid password",

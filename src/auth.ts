@@ -85,7 +85,7 @@ export async function resetPassword(request: Request, env: Env): Promise<Respons
 
     await env.kv.put('pwd', newPwd);
 
-    return respond(true, HttpStatus.OK, 'Successfully logged in!', null, {
+    return respond(true, HttpStatus.OK, 'Password reset successfully.', null, {
         'Set-Cookie': 'jwtToken=; Path=/; Secure; SameSite=None; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
         'Content-Type': 'text/plain',
     });
