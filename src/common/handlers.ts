@@ -566,6 +566,8 @@ export async function getURLConfigs() {
             customCdnSni,
             VLConfigs,
             TRConfigs,
+            enableECH,
+            echServerName,
             outProxy,
             remoteDNS,
             customConfigs,
@@ -606,6 +608,9 @@ export async function getURLConfigs() {
             config.searchParams.append('sni', sni);
             config.searchParams.append('fp', fingerprint);
             config.searchParams.append('alpn', alpn || 'h3,h2');
+            if (enableECH) {
+                config.searchParams.append('ech', `${echServerName || host}+${remoteDNS}`);
+            }
         }
 
         return config.href;
