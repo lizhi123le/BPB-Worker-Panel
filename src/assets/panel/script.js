@@ -87,7 +87,7 @@ function populatePanel(proxySettings) {
         const key = elm.id;
         const element = document.getElementById(key);
         const value = proxySettings[key]?.join('\r\n');
-        const rowsCount = proxySettings[key].length;
+        const rowsCount = proxySettings[key]?.length || 0;
         element.style.height = 'auto';
         if (rowsCount) element.rows = rowsCount;
         element.value = value;
@@ -269,7 +269,7 @@ function downloadJSON(data, fileName) {
 function exportSettings() {
     const form = validateSettings();
     const data = JSON.stringify(form, null, 4);
-    const encodedData = btoa(data);
+    const encodedData = btoa(unescape(encodeURIComponent(data)));
     downloadJSON(encodedData, `BPB-settings.dat`);
 }
 
@@ -285,8 +285,7 @@ async function uploadSettings(event) {
 
     try {
         const text = await file.text();
-        const data = atob(text);
-        const settings = JSON.parse(data);
+        const data = JSON.parse(decodeURIComponent(escape(atob(text))));
         updateSettings(event, settings);
         initiatePanel(settings);
     } catch (err) {

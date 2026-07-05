@@ -116,7 +116,12 @@ async function buildJszipRuntime() {
         legalComments: 'none'
     });
 
-    const text = result.outputFiles[0].text.replace(/\/\/ .*/g, '');
+    let text = result.outputFiles[0].text.replace(/\/\/ .*/g, '');
+    // In CF Workers ESM context (export default in worker code),
+    // `var __jszip__` at module top-level is module-scoped and does
+    // NOT set globalThis.__jszip__. Replace with an explicit global
+    // assignment so the shim (const x = globalThis.__jszip__) works.
+    text = text.replace('var __jszip__ =', 'globalThis.__jszip__ =');
     return text;
 }
 
