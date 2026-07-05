@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname as pathDirname } from 'path';
 import { fileURLToPath } from 'url';
 import { build } from 'esbuild';
@@ -84,6 +84,42 @@ function generateJunkCode() {
     return `${junkVars}\n${junkFuncs}\n`;
 }
 
+/** esbuild plugin: shim 'jszip' import to use globalThis.__jszip__ at runtime */
+const jszipShimPlugin = {
+    name: 'jszip-shim',
+    setup(build) {
+        build.onResolve({ filter: /^jszip$/ }, args => {
+            if (args.kind === 'require') return;
+            return { path: args.path, namespace: 'jszip-shim' };
+        });
+        build.onLoad({ filter: /.*/, namespace: 'jszip-shim' }, () => ({
+            contents: 'const __jszip__ = globalThis.__jszip__; export { __jszip__ as default }',
+            loader: 'js'
+        }));
+    }
+};
+
+/** Build JSZip as a standalone IIFE that sets globalThis.__jszip__ */
+async function buildJszipRuntime() {
+    const JSDIR = join(__dirname, '..', 'node_modules', 'jszip', 'dist');
+    const entry = join(JSDIR, 'jszip.min.js');
+    if (!existsSync(entry)) throw new Error('jszip/dist/jszip.min.js not found — run npm install');
+
+    const result = await build({
+        entryPoints: [{ in: entry, out: 'jszip' }],
+        bundle: true,
+        format: 'iife',
+        globalName: '__jszip__',
+        write: false,
+        platform: 'browser',
+        target: 'esnext',
+        legalComments: 'none'
+    });
+
+    const text = result.outputFiles[0].text.replace(/\/\/ .*/g, '');
+    return text;
+}
+
 async function buildWorker() {
 
     const htmls = await processHtmlPages();
@@ -96,8 +132,10 @@ async function buildWorker() {
         format: 'esm',
         write: false,
         external: ['cloudflare:sockets'],
+        plugins: [jszipShimPlugin],
         platform: 'browser',
         target: 'esnext',
+        legalComments: 'none',
         loader: { '.ts': 'ts' },
         define: {
             __PANEL_HTML_CONTENT__: htmls['panel'] ?? '""',
@@ -128,6 +166,7 @@ async function buildWorker() {
         return minified;
     }
 
+    const jszipRuntime = await buildJszipRuntime();
     let finalCode;
 
     if (mangleMode) {
@@ -142,8 +181,8 @@ async function buildWorker() {
                 "rc4"
             ],
             numbersToExpressions: true,
-            transformObjectKeys: true,
-            renameGlobals: true,
+            transformObjectKeys: false,
+            renameGlobals: false,
             deadCodeInjection: true,
             deadCodeInjectionThreshold: 0.2,
             target: "browser"
@@ -153,9 +192,7 @@ async function buildWorker() {
         finalCode = obfuscationResult.getObfuscatedCode();
     }
 
-    const buildTimestamp = new Date().toISOString();
-    const buildInfo = `// Build: ${buildTimestamp}\n`;
-    const worker = `${buildInfo}// @ts-nocheck\n${finalCode}`;
+    const worker = `${jszipRuntime}${finalCode}`.replace(/\/\/ .*/g, '').replace(/\n+/g, '');
     mkdirSync(DIST_PATH, { recursive: true });
     writeFileSync('./dist/worker.js', worker, 'utf8');
 
