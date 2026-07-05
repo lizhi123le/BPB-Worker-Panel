@@ -8,7 +8,7 @@ import { fetchWarpAccounts } from "@warp";
 import { VlOverWSHandler } from "@vless";
 import { TrOverWSHandler } from "@trojan";
 import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
-import { generateRemark, generateWsPath, getConfigAddresses, randomUpperCase, resolveDNS } from "@utils";
+import { entryAddress, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, randomUpperCase, resetRemarkCounter, resolveDNS } from "@utils";
 import JSZip from "jszip";
 
 export async function handleWebsocket(request: Request): Promise<Response> {
@@ -551,6 +551,7 @@ async function geoLookupBatch(ipList: string[]): Promise<GeoResult[]> {
 }
 
 export async function getURLConfigs() {
+    resetRemarkCounter();
     const {
         globalConfig: { userID, TrPass },
         httpConfig: { defaultHttpsPorts, client, hostName },
@@ -558,6 +559,7 @@ export async function getURLConfigs() {
         settings: {
             fingerprint,
             ports,
+            cleanIPs,
             customCdnAddrs,
             customCdnHost,
             customCdnSni,
@@ -572,7 +574,7 @@ export async function getURLConfigs() {
     } = globalThis;
 
     const buildConfig = (protocol: string, addr: string, port: number, host: string, sni: string, remark: string) => {
-        const isTLS = defaultHttpsPorts.includes(port) || addr === upstreamServer;
+        const isTLS = defaultHttpsPorts.includes(port) || addr === upstreamServer || Object.values(entryPortMap).includes(port);
         const security = isTLS ? 'tls' : 'none';
         const config = new URL(`${protocol}://config`);
 
@@ -584,7 +586,7 @@ export async function getURLConfigs() {
         }
 
         const path = generateWsPath(protocol);
-        config.hostname = addr;
+        config.hostname = parseHostPort(addr).host;
         config.port = port.toString();
         config.searchParams.append('host', host);
         config.searchParams.append('type', 'ws');
@@ -609,7 +611,6 @@ export async function getURLConfigs() {
     }
 
     let VLConfs = '', TRConfs = '', chainProxy = '';
-    let proxyIndex = 1;
     const addrs = await getConfigAddresses(false);
 
     if (upstreamServer && upstreamPort) {
@@ -617,26 +618,35 @@ export async function getURLConfigs() {
         addrs.unshift(upstreamServer);
     }
 
-    for (const port of ports) {
+    const entryPortMap: Record<string, number> = {};
+    for (const e of [...cleanIPs, ...customCdnAddrs]) {
+        const port = entryPort(e);
+        if (port) {
+            entryPortMap[entryAddress(e)] = port;
+        }
+    }
+    const entryPorts = [...new Set(Object.values(entryPortMap))];
+    const activePorts = entryPorts.length ? [...new Set([...ports, ...entryPorts])] : ports;
+
+    for (const port of activePorts) {
         for (const addr of addrs) {
-            const isCustomAddr = customCdnAddrs.some(e => e.split('#')[0].trim() === addr);
+            if (entryPortMap[addr] && entryPortMap[addr] !== port) continue;
+            const isCustomAddr = customCdnAddrs.some(e => entryAddress(e) === addr);
             const sni = isCustomAddr ? customCdnSni : randomUpperCase(hostName);
             const host = isCustomAddr ? customCdnHost : hostName;
             if ((port === upstreamPort) !== (addr === upstreamServer)) continue;
 
             if (VLConfigs) {
-                const remark = generateRemark(proxyIndex, port, addr, _VL_, false, false);
+                const remark = generateRemark(port, addr, _VL_, false, false);
                 const vlConfig = buildConfig(atob('dmxlc3M='), addr, port, host, sni, remark);
                 VLConfs += `${vlConfig}\n`;
             }
 
             if (TRConfigs) {
-                const remark = generateRemark(proxyIndex, port, addr, _TR_, false, false);
+                const remark = generateRemark(port, addr, _TR_, false, false);
                 const trConfig = buildConfig(atob('dHJvamFu'), addr, port, host, sni, remark);
                 TRConfs += `${trConfig}\n`;
             }
-
-            proxyIndex++;
         }
     }
 

@@ -3,7 +3,7 @@ import { buildDNS } from './dns';
 import { buildRoutingRules } from './routing';
 import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound } from './outbounds.js';
 import { Outbound, WireguardEndpoint, Config } from '#types/sing-box';
-import { getConfigAddresses, generateRemark, isHttps, getProtocols } from '@utils';
+import { getConfigAddresses, generateRemark, isHttps, getProtocols, resetRemarkCounter } from '@utils';
 import { buildMixedInbound, tun } from './inbounds';
 
 async function buildConfig(
@@ -77,6 +77,7 @@ async function buildConfig(
 }
 
 export async function getSbCustomConfig(isFragment: boolean): Promise<Response> {
+    resetRemarkCounter();
     const { outProxy, ports, upstreamParams: { upstreamServer, upstreamPort } } = globalThis.settings;
     const chainProxy = outProxy ? buildChainOutbound() : undefined;
     const isChain = !!chainProxy;
@@ -96,12 +97,11 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
     const selectorTags = ["最佳延迟 🚀"].concatIf(isChain, "🔗 最佳延迟 🚀");
 
     for (const protocol of protocols) {
-        let protocolIndex = 1;
         for (const port of totalPorts) {
             for (const host of hosts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
-                const tag = generateRemark(protocolIndex, port, host, protocol, isFragment, false);
+                const tag = generateRemark(port, host, protocol, isFragment, false);
                 const outbound = buildWebsocketOutbound(protocol, tag, host, port, isFragment);
 
                 outbounds.push(outbound);
@@ -109,7 +109,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                 selectorTags.push(tag);
 
                 if (isChain) {
-                    const chainTag = generateRemark(protocolIndex, port, host, protocol, isFragment, true);
+                    const chainTag = generateRemark(port, host, protocol, isFragment, true);
                     const chain = structuredClone(chainProxy);
                     chain.tag = chainTag;
                     chain.detour = tag;
@@ -118,8 +118,6 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                     chainTags.push(chainTag);
                     selectorTags.push(chainTag);
                 }
-
-                protocolIndex++;
             }
         }
     }

@@ -3,7 +3,7 @@ import { buildDNS } from './dns';
 import { buildRoutingRules, buildRuleProviders } from './routing';
 import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound } from './outbounds';
 import type { WireguardOutbound, Config, Outbound } from '#types/clash';
-import { getConfigAddresses, generateRemark, getProtocols } from '@utils';
+import { getConfigAddresses, generateRemark, getProtocols, resetRemarkCounter } from '@utils';
 import { sniffer, tun } from './inbounds';
 
 async function buildConfig(
@@ -75,6 +75,7 @@ async function buildConfig(
 }
 
 export async function getClNormalConfig(): Promise<Response> {
+    resetRemarkCounter();
     const { outProxy, ports, upstreamParams: { upstreamServer, upstreamPort } } = globalThis.settings;
     const chainProxy = outProxy ? buildChainOutbound() : undefined;
     const isChain = !!chainProxy;
@@ -92,12 +93,11 @@ export async function getClNormalConfig(): Promise<Response> {
     const selectorTags = ["最佳延迟 🚀"].concatIf(isChain, "🔗 最佳延迟 🚀");
 
     for (const protocol of protocols) {
-        let protocolIndex = 1;
         for (const port of ports) {
             for (const host of hosts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
-                const tag = generateRemark(protocolIndex, port, host, protocol, false, false);
+                const tag = generateRemark(port, host, protocol, false, false);
                 const outbound = buildWebsocketOutbound(protocol, tag, host, port);
 
                 if (outbound) {
@@ -106,7 +106,7 @@ export async function getClNormalConfig(): Promise<Response> {
                     outbounds.push(outbound);
 
                     if (isChain) {
-                        const chainTag = generateRemark(protocolIndex, port, host, protocol, false, true);
+                        const chainTag = generateRemark(port, host, protocol, false, true);
                         let chain = structuredClone(chainProxy);
                         chain['name'] = chainTag;
                         chain['dialer-proxy'] = tag;
@@ -115,8 +115,6 @@ export async function getClNormalConfig(): Promise<Response> {
                         chainTags.push(chainTag);
                         selectorTags.push(chainTag);
                     }
-
-                    protocolIndex++;
                 }
             }
         }

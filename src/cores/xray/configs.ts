@@ -16,7 +16,8 @@ import {
     isDomain,
     isHttps,
     getProtocols,
-    parseHostPort
+    parseHostPort,
+    resetRemarkCounter
 } from '@utils';
 
 function buildBalancer(tag: string, selector: string, hasFallback: boolean): Balancer {
@@ -252,6 +253,7 @@ async function addWorkerlessConfigs(configs: Config[]) {
 }
 
 export async function getXrCustomConfigs(isFragment: boolean): Promise<Response> {
+    resetRemarkCounter();
     const { outProxy, ports, upstreamParams: { upstreamServer, upstreamPort } } = globalThis.settings;
     const chainProxy = outProxy ? buildChainOutbound() : undefined;
     const hosts = await getConfigAddresses(isFragment);
@@ -269,7 +271,6 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     let index = 1;
 
     for (const protocol of protocols) {
-        let protocolIndex = 1;
         for (const port of totalPorts) {
             for (const host of hosts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
@@ -278,12 +279,12 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
                 const proxy = modifyOutbound(outbound, `proxy-${index}`);
                 proxies.push(proxy);
 
-                const remark = generateRemark(protocolIndex, port, host, protocol, isFragment, false);
+                const remark = generateRemark(port, host, protocol, isFragment, false);
                 const config = await buildConfig(remark, [outbound], false, false, false, false, false, [host]);
                 configs.push(config);
 
                 if (chainProxy) {
-                    const remark = generateRemark(protocolIndex, port, host, protocol, isFragment, true);
+                    const remark = generateRemark(port, host, protocol, isFragment, true);
                     const chainConfig = await buildConfig(remark, [chainProxy, outbound], false, true, false, false, false, [host]);
                     configs.push(chainConfig);
 
@@ -291,7 +292,6 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
                     chains.push(chain);
                 }
 
-                protocolIndex++;
                 index++;
             }
         }

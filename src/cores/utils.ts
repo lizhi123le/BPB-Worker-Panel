@@ -6,9 +6,16 @@ export function isDomain(address: string): boolean {
     return domainRegex.test(address);
 }
 
-/** Extract address part from "address#name" entry */
+/** Extract address part (host only, no port) from "address#name" entry */
 export function entryAddress(entry: string): string {
-    return entry.split('#')[0].trim();
+    const addr = entry.split('#')[0].trim();
+    return parseHostPort(addr, true).host;
+}
+
+/** Extract port from "address:port#name" entry, or 0 if none */
+export function entryPort(entry: string): number {
+    const addr = entry.split('#')[0].trim();
+    return parseHostPort(addr).port;
 }
 
 /** Extract name part from "address#name" entry, or undefined */
@@ -116,8 +123,15 @@ export async function getConfigAddresses(isFragment: boolean): Promise<string[]>
     return addrs.concatIf(!isFragment, entryAddresses(customCdnAddrs));
 }
 
+const remarkCounter: Record<string, number> = {};
+
+export function resetRemarkCounter() {
+    for (const key of Object.keys(remarkCounter)) {
+        delete remarkCounter[key];
+    }
+}
+
 export function generateRemark(
-    index: number,
     port: number,
     address: string,
     _protocol: string,
@@ -147,8 +161,15 @@ export function generateRemark(
     }
 
     const chainPrefix = isChain ? '🔗 ' : '';
-    const suffix = String(index).padStart(2, '0');
 
+    if (isChain) {
+        const currentCount = remarkCounter[baseName] || 0;
+        if (currentCount === 0) return `${chainPrefix}${baseName}`;
+        return `${chainPrefix}${baseName}-${String(currentCount).padStart(2, '0')}`;
+    }
+
+    remarkCounter[baseName] = (remarkCounter[baseName] || 0) + 1;
+    const suffix = String(remarkCounter[baseName]).padStart(2, '0');
     return `${chainPrefix}${baseName}-${suffix}`;
 }
 
