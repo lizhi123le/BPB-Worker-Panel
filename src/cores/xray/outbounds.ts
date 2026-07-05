@@ -109,7 +109,7 @@ export function buildWebsocketOutbound(
         fingerprint,
         enableECH && !isFragment,
         pickRandomEch(echServerName),
-        alpn || undefined,
+        enableECH ? undefined : (alpn || undefined),
     ) : undefined;
 
     const streamSettings: StreamSettings = {

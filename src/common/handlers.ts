@@ -607,7 +607,7 @@ export async function getURLConfigs() {
         if (isTLS) {
             config.searchParams.append('sni', sni);
             config.searchParams.append('fp', fingerprint);
-            if (alpn) config.searchParams.append('alpn', alpn);
+            if (!enableECH && alpn) config.searchParams.append('alpn', alpn);
             if (enableECH) {
                 config.searchParams.append('ech', `${pickRandomEch(echServerName) || host}+${remoteDNS}`);
             }
