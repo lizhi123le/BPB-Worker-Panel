@@ -106,7 +106,7 @@ export function buildWebsocketOutbound(
     const tlsSettings = isTLS ? buildTlsSettings(
         sni,
         fingerprint,
-        alpn || "h3,h2",
+        alpn || undefined,
         enableECH && !isFragment,
         echServerName || undefined,
     ) : undefined;
@@ -377,7 +377,7 @@ function buildSockopt(
 function buildTlsSettings(
     serverName: string,
     fingerprint: Fingerprint,
-    alpn: string,
+    alpn?: string,
     enableECH: boolean,
     echServerName?: string
 ): TlsSettings {

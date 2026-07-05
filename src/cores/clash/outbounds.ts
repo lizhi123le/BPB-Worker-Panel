@@ -76,7 +76,7 @@ export function buildWebsocketOutbound(
         sni, 
         enableECH, 
         echServerName || undefined, 
-        alpn || "h3,h2", 
+        alpn || undefined, 
         fingerprint
     ) : {};
     
