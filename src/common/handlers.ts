@@ -8,7 +8,7 @@ import { fetchWarpAccounts } from "@warp";
 import { VlOverWSHandler } from "@vless";
 import { TrOverWSHandler } from "@trojan";
 import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
-import { entryAddress, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, randomUpperCase, resetRemarkCounter, resolveDNS } from "@utils";
+import { buildEntryPortMap, entryAddress, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, randomUpperCase, resetRemarkCounter, resolveDNS } from "@utils";
 import JSZip from "jszip";
 
 export async function handleWebsocket(request: Request): Promise<Response> {
@@ -586,7 +586,7 @@ export async function getURLConfigs() {
         }
 
         const path = generateWsPath(protocol);
-        config.hostname = parseHostPort(addr).host;
+        config.hostname = parseHostPort(addr, true).host;
         config.port = port.toString();
         config.searchParams.append('host', host);
         config.searchParams.append('type', 'ws');
@@ -618,19 +618,12 @@ export async function getURLConfigs() {
         addrs.unshift(upstreamServer);
     }
 
-    const entryPortMap: Record<string, number> = {};
-    for (const e of [...cleanIPs, ...customCdnAddrs]) {
-        const port = entryPort(e);
-        if (port) {
-            entryPortMap[entryAddress(e)] = port;
-        }
-    }
-    const entryPorts = [...new Set(Object.values(entryPortMap))];
-    const activePorts = entryPorts.length ? [...new Set([...ports, ...entryPorts])] : ports;
+    const entryPortMap = buildEntryPortMap();
 
-    for (const port of activePorts) {
-        for (const addr of addrs) {
-            if (entryPortMap[addr] && entryPortMap[addr] !== port) continue;
+    for (const addr of addrs) {
+        const addrPorts = entryPortMap[addr] ? [entryPortMap[addr]] : ports;
+
+        for (const port of addrPorts) {
             const isCustomAddr = customCdnAddrs.some(e => entryAddress(e) === addr);
             const sni = isCustomAddr ? customCdnSni : randomUpperCase(hostName);
             const host = isCustomAddr ? customCdnHost : hostName;

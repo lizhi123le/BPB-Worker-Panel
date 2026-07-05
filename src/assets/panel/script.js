@@ -540,12 +540,26 @@ function parseHostPort(input) {
     const regex = /^(?<host>\[.*?\]|[^:]+)(?::(?<port>\d+))?$/;
     const match = input.match(regex);
 
-    if (!match) return null;
+    if (match) {
+        return {
+            host: match.groups.host,
+            port: match.groups.port ? +match.groups.port : null
+        };
+    }
 
-    return {
-        host: match.groups.host,
-        port: match.groups.port ? +match.groups.port : null
-    };
+    if ((input.match(/:/g) || []).length >= 2) {
+        const lastColon = input.lastIndexOf(':');
+        const after = input.slice(lastColon + 1);
+        if (/^\d+$/.test(after)) {
+            const hostPart = input.slice(0, lastColon);
+            if (hostPart.includes(':') && !hostPart.endsWith(':')) {
+                return { host: `[${hostPart}]`, port: +after };
+            }
+        }
+        return { host: `[${input}]`, port: null };
+    }
+
+    return null;
 }
 
 function isValidHostName(value, isHost) {

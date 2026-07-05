@@ -30,6 +30,19 @@ export function entryAddresses(entries: string[]): string[] {
     return entries.map(entryAddress).filter(Boolean);
 }
 
+/** Build port map from entry lists — maps bare address → explicit port */
+export function buildEntryPortMap(): Record<string, number> {
+    const { settings: { cleanIPs, customCdnAddrs } } = globalThis;
+    const map: Record<string, number> = {};
+    for (const e of [...cleanIPs, ...customCdnAddrs]) {
+        const port = entryPort(e);
+        if (port) {
+            map[entryAddress(e)] = port;
+        }
+    }
+    return map;
+}
+
 /** Find custom name for an address across multiple entry lists */
 export function findNameForAddress(entries: string[], address: string): string | undefined {
     for (const e of entries) {
@@ -52,7 +65,16 @@ export async function resolveUrlEntries(entries: string[]): Promise<string[]> {
                 const text = await res.text();
                 const lines = text.split('\n')
                     .map(l => l.trim())
-                    .filter(l => l && !l.startsWith('#') && !l.startsWith('//'));
+                    .filter(l => l && !l.startsWith('#') && !l.startsWith('//'))
+                    .map(l => {
+                        const hashIdx = l.indexOf('#');
+                        const addrPart = (hashIdx >= 0 ? l.slice(0, hashIdx) : l).trim();
+                        const namePart = hashIdx >= 0 ? l.slice(hashIdx) : '';
+                        if ((addrPart.match(/:/g) || []).length >= 2 && !addrPart.startsWith('[')) {
+                            return `[${addrPart}]${namePart}`;
+                        }
+                        return l;
+                    });
                 resolved.push(...lines);
             } catch {
                 continue;
@@ -232,7 +254,8 @@ export function isIPv4(address: string): boolean {
 
 export function isIPv6(address: string): boolean {
     const ipv6Pattern = /^\[(?:(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,7}:|::(?:[a-fA-F0-9]{1,4}:){0,7}|(?:[a-fA-F0-9]{1,4}:){1,6}:[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,5}(?::[a-fA-F0-9]{1,4}){1,2}|(?:[a-fA-F0-9]{1,4}:){1,4}(?::[a-fA-F0-9]{1,4}){1,3}|(?:[a-fA-F0-9]{1,4}:){1,3}(?::[a-fA-F0-9]{1,4}){1,4}|(?:[a-fA-F0-9]{1,4}:){1,2}(?::[a-fA-F0-9]{1,4}){1,5}|[a-fA-F0-9]{1,4}:(?::[a-fA-F0-9]{1,4}){1,6})\](?:\/(1[0-1][0-9]|12[0-8]|[0-9]?[0-9]))?$/;
-    return ipv6Pattern.test(address);
+    if (ipv6Pattern.test(address)) return true;
+    return (address.match(/:/g) || []).length >= 2;
 }
 
 export function getDomain(url: string) {
@@ -267,17 +290,30 @@ export function selectSniHost(address: string) {
 }
 
 export function parseHostPort(input: string, brackets?: boolean): { host: string, port: number } {
-    const regex = /^(?:\[(?<ipv6>.+?)\]|(?<host>[^:]+))(:(?<port>\d+))?$/;
-    const match = input.match(regex);
+    const bm = input.match(/^\[(?<ipv6>.+?)\](?::(?<port>\d+))?$/);
+    if (bm?.groups) {
+        const host = brackets ? `[${bm.groups.ipv6}]` : bm.groups.ipv6;
+        return { host, port: bm.groups.port ? Number(bm.groups.port) : 0 };
+    }
 
-    if (!match || !match.groups) return { host: "", port: 0 };
-    const { ipv6, host: plainHost, port: portStr } = match.groups;
+    if (input.includes('::')) {
+        const lastColon = input.lastIndexOf(':');
+        const afterLastColon = input.slice(lastColon + 1);
+        if (/^\d+$/.test(afterLastColon)) {
+            const hostPart = input.slice(0, lastColon);
+            if (hostPart.includes(':') && !hostPart.endsWith(':')) {
+                return { host: brackets ? `[${hostPart}]` : hostPart, port: Number(afterLastColon) };
+            }
+        }
+        return { host: brackets ? `[${input}]` : input, port: 0 };
+    }
 
-    let host = ipv6 ?? plainHost ?? "";
-    if (brackets && ipv6) host = `[${ipv6}]`;
-    const port = portStr ? Number(portStr) : 0;
+    const hm = input.match(/^(?<host>[^:]+)(?::(?<port>\d+))?$/);
+    if (hm?.groups) {
+        return { host: hm.groups.host, port: hm.groups.port ? Number(hm.groups.port) : 0 };
+    }
 
-    return { host, port };
+    return { host: "", port: 0 };
 }
 
 export function isHttps(port: number): boolean {

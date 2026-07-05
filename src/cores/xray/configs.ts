@@ -11,6 +11,7 @@ import {
 } from './outbounds';
 
 import {
+    buildEntryPortMap,
     getConfigAddresses,
     generateRemark,
     isDomain,
@@ -257,6 +258,7 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     const { outProxy, ports, upstreamParams: { upstreamServer, upstreamPort } } = globalThis.settings;
     const chainProxy = outProxy ? buildChainOutbound() : undefined;
     const hosts = await getConfigAddresses(isFragment);
+    const entryPortMap = buildEntryPortMap();
     const totalPorts = ports.filter(port => !isFragment || isHttps(port));
     const protocols = getProtocols();
 
@@ -271,8 +273,10 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     let index = 1;
 
     for (const protocol of protocols) {
-        for (const port of totalPorts) {
-            for (const host of hosts) {
+        for (const host of hosts) {
+            const addrPorts = entryPortMap[host] ? [entryPortMap[host]] : totalPorts;
+
+            for (const port of addrPorts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
                 const outbound = buildWebsocketOutbound("proxy", protocol, host, port, isFragment);

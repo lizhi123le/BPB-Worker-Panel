@@ -3,7 +3,7 @@ import { buildDNS } from './dns';
 import { buildRoutingRules, buildRuleProviders } from './routing';
 import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound } from './outbounds';
 import type { WireguardOutbound, Config, Outbound } from '#types/clash';
-import { getConfigAddresses, generateRemark, getProtocols, resetRemarkCounter } from '@utils';
+import { buildEntryPortMap, getConfigAddresses, generateRemark, getProtocols, resetRemarkCounter } from '@utils';
 import { sniffer, tun } from './inbounds';
 
 async function buildConfig(
@@ -80,6 +80,7 @@ export async function getClNormalConfig(): Promise<Response> {
     const chainProxy = outProxy ? buildChainOutbound() : undefined;
     const isChain = !!chainProxy;
     const hosts = await getConfigAddresses(false);
+    const entryPortMap = buildEntryPortMap();
     const protocols = getProtocols();
 
     if (upstreamServer && upstreamPort) {
@@ -93,8 +94,10 @@ export async function getClNormalConfig(): Promise<Response> {
     const selectorTags = ["最佳延迟 🚀"].concatIf(isChain, "🔗 最佳延迟 🚀");
 
     for (const protocol of protocols) {
-        for (const port of ports) {
-            for (const host of hosts) {
+        for (const host of hosts) {
+            const addrPorts = entryPortMap[host] ? [entryPortMap[host]] : ports;
+
+            for (const port of addrPorts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
                 const tag = generateRemark(port, host, protocol, false, false);

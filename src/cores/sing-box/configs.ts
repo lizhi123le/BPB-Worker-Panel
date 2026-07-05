@@ -3,7 +3,7 @@ import { buildDNS } from './dns';
 import { buildRoutingRules } from './routing';
 import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound } from './outbounds.js';
 import { Outbound, WireguardEndpoint, Config } from '#types/sing-box';
-import { getConfigAddresses, generateRemark, isHttps, getProtocols, resetRemarkCounter } from '@utils';
+import { buildEntryPortMap, getConfigAddresses, generateRemark, isHttps, getProtocols, resetRemarkCounter } from '@utils';
 import { buildMixedInbound, tun } from './inbounds';
 
 async function buildConfig(
@@ -83,6 +83,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
     const isChain = !!chainProxy;
     const protocols = getProtocols();
     const hosts = await getConfigAddresses(isFragment);
+    const entryPortMap = buildEntryPortMap();
     const totalPorts = ports.filter(port => !isFragment || isHttps(port));
 
     if (upstreamServer && upstreamPort && !isFragment) {
@@ -97,8 +98,10 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
     const selectorTags = ["最佳延迟 🚀"].concatIf(isChain, "🔗 最佳延迟 🚀");
 
     for (const protocol of protocols) {
-        for (const port of totalPorts) {
-            for (const host of hosts) {
+        for (const host of hosts) {
+            const addrPorts = entryPortMap[host] ? [entryPortMap[host]] : totalPorts;
+
+            for (const port of addrPorts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
                 const tag = generateRemark(port, host, protocol, isFragment, false);
