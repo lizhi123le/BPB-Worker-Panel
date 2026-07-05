@@ -6,6 +6,57 @@ export function isDomain(address: string): boolean {
     return domainRegex.test(address);
 }
 
+/** Extract address part from "address#name" entry */
+export function entryAddress(entry: string): string {
+    return entry.split('#')[0].trim();
+}
+
+/** Extract name part from "address#name" entry, or undefined */
+export function entryName(entry: string): string | undefined {
+    const idx = entry.indexOf('#');
+    if (idx === -1) return undefined;
+    return entry.slice(idx + 1).trim() || undefined;
+}
+
+/** Map entries to clean address array */
+export function entryAddresses(entries: string[]): string[] {
+    return entries.map(entryAddress).filter(Boolean);
+}
+
+/** Find custom name for an address across multiple entry lists */
+export function findNameForAddress(entries: string[], address: string): string | undefined {
+    for (const e of entries) {
+        if (entryAddress(e) === address) {
+            const name = entryName(e);
+            if (name) return name;
+        }
+    }
+    return undefined;
+}
+
+/** Resolve URL entries in an array — fetches http/https URLs and replaces them with their content lines */
+export async function resolveUrlEntries(entries: string[]): Promise<string[]> {
+    const resolved: string[] = [];
+    for (const entry of entries) {
+        if (entry.startsWith('http://') || entry.startsWith('https://')) {
+            try {
+                const res = await fetch(entry);
+                if (!res.ok) continue;
+                const text = await res.text();
+                const lines = text.split('\n')
+                    .map(l => l.trim())
+                    .filter(l => l && !l.startsWith('#') && !l.startsWith('//'));
+                resolved.push(...lines);
+            } catch {
+                continue;
+            }
+        } else {
+            resolved.push(entry);
+        }
+    }
+    return resolved;
+}
+
 export async function resolveDNS(domain: string, onlyIPv4 = false): Promise<DnsResult> {
     const dohBaseURL = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}`;
     const dohURLs = {
@@ -59,38 +110,46 @@ export async function getConfigAddresses(isFragment: boolean): Promise<string[]>
         'www.speedtest.net',
         ...ipv4,
         ...ipv6.map((ip: string) => `[${ip}]`),
-        ...cleanIPs
+        ...entryAddresses(cleanIPs)
     ];
 
-    return addrs.concatIf(!isFragment, customCdnAddrs);
+    return addrs.concatIf(!isFragment, entryAddresses(customCdnAddrs));
 }
 
 export function generateRemark(
     index: number,
     port: number,
     address: string,
-    protocol: string,
-    isFragment: boolean,
+    _protocol: string,
+    _isFragment: boolean,
     isChain: boolean
 ): string {
     const {
-        settings: { cleanIPs, customCdnAddrs, upstreamParams: { upstreamServer } },
-        dict: { _VL_, _VL_CAP_, _TR_CAP_ }
+        settings: { cleanIPs, customCdnAddrs, upstreamParams: { upstreamServer } }
     } = globalThis;
 
-    const isCustomAddr = customCdnAddrs.includes(address);
-    const configType = isCustomAddr ? ' C' : isFragment ? ' F' : '';
-    const chainSign = isChain ? '🔗 ' : '';
-    const protoSign = protocol === _VL_ ? _VL_CAP_ : _TR_CAP_;
-    let addressType;
+    const customName = findNameForAddress([...cleanIPs, ...customCdnAddrs], address);
 
-    cleanIPs.includes(address)
-        ? addressType = 'Clean IP'
-        : addressType = isDomain(address) ? 'Domain' : isIPv4(address) ? 'IPv4' : isIPv6(address) ? 'IPv6' : '';
+    let baseName: string;
 
-    return address === upstreamServer
-        ? `💦 ${index} - ${chainSign}${protoSign}${configType} - Upstream Proxy`
-        : `💦 ${index} - ${chainSign}${protoSign}${configType} - ${addressType} : ${port}`;
+    if (customName) {
+        baseName = customName;
+    } else if (address === upstreamServer) {
+        baseName = '上游代理';
+    } else if (isDomain(address)) {
+        baseName = address;
+    } else if (isIPv4(address)) {
+        baseName = 'IPv4优选';
+    } else if (isIPv6(address)) {
+        baseName = 'IPv6优选';
+    } else {
+        baseName = '节点';
+    }
+
+    const chainPrefix = isChain ? '🔗 ' : '';
+    const suffix = String(index).padStart(2, '0');
+
+    return `${chainPrefix}${baseName}-${suffix}`;
 }
 
 export function randomUpperCase(str: string): string {
@@ -179,7 +238,7 @@ export function selectSniHost(address: string) {
         settings: { customCdnAddrs, customCdnHost, customCdnSni }
     } = globalThis;
 
-    const isCustomAddr = customCdnAddrs.includes(address);
+    const isCustomAddr = entryAddresses(customCdnAddrs).includes(address);
     const sni = isCustomAddr ? customCdnSni : randomUpperCase(hostName);
     const host = isCustomAddr ? customCdnHost : hostName;
 

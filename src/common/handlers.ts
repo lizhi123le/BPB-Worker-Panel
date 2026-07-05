@@ -619,7 +619,7 @@ export async function getURLConfigs() {
 
     for (const port of ports) {
         for (const addr of addrs) {
-            const isCustomAddr = customCdnAddrs.includes(addr);
+            const isCustomAddr = customCdnAddrs.some(e => e.split('#')[0].trim() === addr);
             const sni = isCustomAddr ? customCdnSni : randomUpperCase(hostName);
             const host = isCustomAddr ? customCdnHost : hostName;
             if ((port === upstreamPort) !== (addr === upstreamServer)) continue;
@@ -641,7 +641,7 @@ export async function getURLConfigs() {
     }
 
     if (outProxy) {
-        let chainRemark = `#${encodeURIComponent('💦 Chain proxy 🔗')}`;
+        let chainRemark = `#${encodeURIComponent('🔗 链式代理')}`;
         if (outProxy.startsWith('socks') || outProxy.startsWith('http')) {
             const regex = /^(?:socks|http):\/\/([^@]+)@/;
             const isUserPass = outProxy.match(regex);
@@ -663,7 +663,7 @@ export async function getURLConfigs() {
             'Content-Type': 'text/plain;charset=utf-8',
             'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
             'CDN-Cache-Control': 'no-store',
-            'Profile-Title': `base64:${base64EncodeUtf8(`💦 ${_project_} Raw`)}`,
+            'Profile-Title': `base64:${base64EncodeUtf8(`${_project_} Raw`)}`,
             'DNS': remoteDNS
         }
     });
