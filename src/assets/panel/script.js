@@ -989,6 +989,22 @@ function validateEchConfig() {
     return true;
 }
 
+function validateHostSniList() {
+    const hostSniList = document.getElementById("hostSniList").value;
+
+    if (!hostSniList) return true;
+
+    const names = hostSniList.split('\n').map(v => v.trim()).filter(Boolean);
+    for (const name of names) {
+        if (!isDomain(name)) {
+            alert('⛔ Each HOST/SNI should be a valid domain!');
+            return false;
+        }
+    }
+
+    return true;
+}
+
 function validateUpstreamProxy() {
     const upstreamProxy = getElmValue('upstreamProxy');
 
@@ -1031,7 +1047,8 @@ function validateSettings() {
         validateKnockerNoise(),
         validateXrayNoises(fields),
         validateCustomRules(),
-        validateEchConfig()
+        validateEchConfig(),
+        validateHostSniList()
     ];
 
     if (!validations.every(Boolean)) {

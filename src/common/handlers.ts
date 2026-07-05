@@ -8,7 +8,7 @@ import { fetchWarpAccounts } from "@warp";
 import { VlOverWSHandler } from "@vless";
 import { TrOverWSHandler } from "@trojan";
 import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
-import { buildEntryPortMap, entryAddress, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, randomUpperCase, resetRemarkCounter, resolveDNS } from "@utils";
+import { buildEntryPortMap, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, resetRemarkCounter, resolveDNS, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
 export async function handleWebsocket(request: Request): Promise<Response> {
@@ -560,14 +560,11 @@ export async function getURLConfigs() {
             fingerprint,
             alpn,
             ports,
-            cleanIPs,
-            customCdnAddrs,
-            customCdnHost,
-            customCdnSni,
             VLConfigs,
             TRConfigs,
             enableECH,
             echServerName,
+            hostSniList,
             outProxy,
             remoteDNS,
             customConfigs,
@@ -630,9 +627,7 @@ export async function getURLConfigs() {
         const addrPorts = entryPortMap[addr] ? [entryPortMap[addr]] : ports;
 
         for (const port of addrPorts) {
-            const isCustomAddr = customCdnAddrs.some(e => entryAddress(e) === addr);
-            const sni = isCustomAddr ? customCdnSni : randomUpperCase(hostName);
-            const host = isCustomAddr ? customCdnHost : hostName;
+            const { host, sni } = selectSniHost(addr, pickRandomEch(hostSniList));
             if ((port === upstreamPort) !== (addr === upstreamServer)) continue;
 
             if (VLConfigs) {

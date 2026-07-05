@@ -60,6 +60,7 @@ globalThis.settings = {
     fragmentPackets: "tlshello",
     enableECH: false,
     echServerName: [],
+    hostSniList: [],
     bypassIran: false,
     bypassChina: false,
     bypassRussia: false,

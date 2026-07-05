@@ -61,21 +61,23 @@ export function buildWebsocketOutbound(
             enableIPv6, 
             enableECH, 
             echServerName, 
+            hostSniList, 
             upstreamParams: { upstreamServer } 
         }
     } = globalThis;
 
     const isTLS = isHttps(port) || address === upstreamServer;
     if (protocol === _TR_ && !isTLS) return null;
-    const { host, sni, allowInsecure } = selectSniHost(address);
+    const pickedEch = enableECH ? pickRandomEch(echServerName) : undefined;
+    const { host, sni, allowInsecure } = selectSniHost(address, pickRandomEch(hostSniList));
 
     const tls = isTLS ? buildTLS(
         protocol, 
         "tls", 
         allowInsecure, 
         sni, 
-        enableECH, 
-        pickRandomEch(echServerName), 
+        !!pickedEch, 
+        pickedEch, 
         enableECH ? undefined : (alpn || undefined), 
         fingerprint
     ) : {};

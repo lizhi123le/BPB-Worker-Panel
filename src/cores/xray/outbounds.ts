@@ -96,6 +96,7 @@ export function buildWebsocketOutbound(
             enableTFO,
             enableECH,
             echServerName,
+            hostSniList,
             upstreamParams: { upstreamServer }
         },
         globalConfig: { userID, TrPass },
@@ -103,12 +104,13 @@ export function buildWebsocketOutbound(
     } = globalThis;
 
     const isTLS = isHttps(port) || address === upstreamServer;
-    const { host, sni } = selectSniHost(address);
+    const pickedEch = enableECH && !isFragment ? pickRandomEch(echServerName) : undefined;
+    const { host, sni } = selectSniHost(address, pickRandomEch(hostSniList));
     const tlsSettings = isTLS ? buildTlsSettings(
         sni,
         fingerprint,
-        enableECH && !isFragment,
-        pickRandomEch(echServerName),
+        !!pickedEch,
+        pickedEch,
         enableECH ? undefined : (alpn || undefined),
     ) : undefined;
 

@@ -101,6 +101,7 @@ export async function updateDataset(request: Request, env: Env): Promise<Setting
             ["fragmentPackets"],
             ["enableECH"],
             ["echServerName", "echServerName", normalizeEchNames],
+            ["hostSniList", "hostSniList", normalizeEchNames],
             ["bypassIran"],
             ["bypassChina"],
             ["bypassRussia"],

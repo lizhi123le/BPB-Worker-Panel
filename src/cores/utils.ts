@@ -281,11 +281,15 @@ export function getDomain(url: string) {
     }
 }
 
-export function selectSniHost(address: string) {
+export function selectSniHost(address: string, sniHostOverride?: string) {
     const {
         httpConfig: { hostName },
         settings: { customCdnAddrs, customCdnHost, customCdnSni }
     } = globalThis;
+
+    if (sniHostOverride) {
+        return { host: sniHostOverride, sni: sniHostOverride, allowInsecure: false };
+    }
 
     const isCustomAddr = entryAddresses(customCdnAddrs).includes(address);
     const sni = isCustomAddr ? customCdnSni : randomUpperCase(hostName);
