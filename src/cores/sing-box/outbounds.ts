@@ -4,7 +4,8 @@ import {
     generateWsPath,
     parseHostPort,
     selectSniHost,
-    isDomain
+    isDomain,
+    pickRandomEch
 } from '@utils';
 
 import {
@@ -81,7 +82,7 @@ export function buildWebsocketOutbound(
             allowInsecure,
             sni,
             enableECH && !isFragment,
-            echServerName || undefined,
+            pickRandomEch(echServerName),
             alpn || undefined,
             fingerprint
         ) : undefined;

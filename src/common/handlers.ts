@@ -8,7 +8,7 @@ import { fetchWarpAccounts } from "@warp";
 import { VlOverWSHandler } from "@vless";
 import { TrOverWSHandler } from "@trojan";
 import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
-import { buildEntryPortMap, entryAddress, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, randomUpperCase, resetRemarkCounter, resolveDNS } from "@utils";
+import { buildEntryPortMap, entryAddress, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, randomUpperCase, resetRemarkCounter, resolveDNS } from "@utils";
 import JSZip from "jszip";
 
 export async function handleWebsocket(request: Request): Promise<Response> {
@@ -609,7 +609,7 @@ export async function getURLConfigs() {
             config.searchParams.append('fp', fingerprint);
             if (alpn) config.searchParams.append('alpn', alpn);
             if (enableECH) {
-                config.searchParams.append('ech', `${echServerName || host}+${remoteDNS}`);
+                config.searchParams.append('ech', `${pickRandomEch(echServerName) || host}+${remoteDNS}`);
             }
         }
 

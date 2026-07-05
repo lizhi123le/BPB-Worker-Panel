@@ -975,11 +975,16 @@ function validateXrayNoises(fields) {
 }
 
 function validateEchConfig() {
-    const echServerName = getElmValue("echServerName");
+    const echServerName = document.getElementById("echServerName").value;
 
-    if (echServerName && !isDomain(echServerName)) {
-        alert('⛔ The ECH Server Name should be a domain!');
-        return false;
+    if (!echServerName) return true;
+
+    const names = echServerName.split('\n').map(v => v.trim()).filter(Boolean);
+    for (const name of names) {
+        if (!isDomain(name)) {
+            alert('⛔ Each ECH Server Name should be a valid domain!');
+            return false;
+        }
     }
 
     return true;

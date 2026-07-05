@@ -1,4 +1,4 @@
-import { isHttps, generateWsPath, parseHostPort, selectSniHost } from '@utils';
+import { isHttps, generateWsPath, parseHostPort, pickRandomEch, selectSniHost } from '@utils';
 import {
     BaseOutbound,
     HttpOutbound,
@@ -75,7 +75,7 @@ export function buildWebsocketOutbound(
         allowInsecure, 
         sni, 
         enableECH, 
-        echServerName || undefined, 
+        pickRandomEch(echServerName), 
         alpn || undefined, 
         fingerprint
     ) : {};

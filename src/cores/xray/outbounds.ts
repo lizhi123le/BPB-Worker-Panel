@@ -3,7 +3,8 @@ import {
     isHttps,
     generateWsPath,
     toRange,
-    selectSniHost
+    selectSniHost,
+    pickRandomEch
 } from '@utils';
 
 import {
@@ -108,7 +109,7 @@ export function buildWebsocketOutbound(
         fingerprint,
         alpn || undefined,
         enableECH && !isFragment,
-        echServerName || undefined,
+        pickRandomEch(echServerName),
     ) : undefined;
 
     const streamSettings: StreamSettings = {

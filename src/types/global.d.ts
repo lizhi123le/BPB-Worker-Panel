@@ -104,7 +104,7 @@ declare global {
         fragmentMaxSplitMin?: number;
         fragmentMaxSplitMax?: number;
         enableECH: boolean;
-        echServerName: string;
+        echServerName: string[];
         bypassIran: boolean;
         bypassChina: boolean;
         bypassRussia: boolean;

@@ -233,6 +233,11 @@ export function generateWsPath(protocol: string): string {
     return `/${btoa(JSON.stringify(config))}`;
 }
 
+export function pickRandomEch(echServerNames: string[]): string | undefined {
+    if (!echServerNames || echServerNames.length === 0) return undefined;
+    return echServerNames[Math.floor(Math.random() * echServerNames.length)];
+}
+
 export function base64ToDecimal(base64: string): number[] {
     const binaryString = atob(base64);
     const hexString = Array

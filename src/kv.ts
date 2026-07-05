@@ -18,6 +18,11 @@ export async function getDataset(
             proxySettings = settings;
         }
 
+        if (proxySettings && typeof (proxySettings as any).echServerName === 'string') {
+            const val = (proxySettings as any).echServerName;
+            (proxySettings as any).echServerName = val ? [val] : [];
+        }
+
         if (!warpAccounts) {
             warpAccounts = await fetchWarpAccounts(env);
         }
@@ -95,7 +100,7 @@ export async function updateDataset(request: Request, env: Env): Promise<Setting
             ["fragmentMaxSplitMax"],
             ["fragmentPackets"],
             ["enableECH"],
-            ["echServerName"],
+            ["echServerName", "echServerName", normalizeEchNames],
             ["bypassIran"],
             ["bypassChina"],
             ["bypassRussia"],
@@ -289,3 +294,10 @@ function extractUpstreamParams(upstreamProxy: string): UpstreamProxy {
 
 //     throw new Error("ECH record not found");
 // }
+
+function normalizeEchNames(val: unknown): string[] {
+    if (!val) return [];
+    if (Array.isArray(val)) return val;
+    if (typeof val === 'string') return val ? [val] : [];
+    return [];
+}
