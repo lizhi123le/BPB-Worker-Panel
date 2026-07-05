@@ -93,6 +93,7 @@ declare global {
         TRConfigs: boolean;
         ports: number[];
         fingerprint: Fingerprint;
+        alpn: string;
         enableTFO: boolean;
         fragmentMode: "custom" | "low" | "medium" | "high";
         fragmentLengthMin: number;

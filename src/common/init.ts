@@ -48,6 +48,7 @@ globalThis.settings = {
     TRConfigs: true,
     ports: [443],
     fingerprint: "chrome",
+    alpn: "",
     enableTFO: false,
     fragmentMode: "custom",
     fragmentLengthMin: 100,

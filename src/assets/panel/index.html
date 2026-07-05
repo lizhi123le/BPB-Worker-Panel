@@ -172,6 +172,20 @@
                         </div>
                     </div>
                     <div class="form-control">
+                        <label for="alpn">👇 ALPN</label>
+                        <div>
+                            <select id="alpn" name="alpn">
+                                <option value="">Default (h3,h2)</option>
+                                <option value="h3">h3</option>
+                                <option value="h2">h2</option>
+                                <option value="http/1.1">http/1.1</option>
+                                <option value="h3,h2">h3,h2</option>
+                                <option value="h2,http/1.1">h2,http/1.1</option>
+                                <option value="h3,h2,http/1.1">h3,h2,http/1.1</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-control">
                         <label for="bestVLTRInterval">🔄 Best Interval</label>
                         <div>
                             <input type="number" id="bestVLTRInterval" name="bestVLTRInterval" min="10" max="90">

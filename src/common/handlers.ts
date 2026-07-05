@@ -558,6 +558,7 @@ export async function getURLConfigs() {
         dict: { _VL_, _TR_, _project_ },
         settings: {
             fingerprint,
+            alpn,
             ports,
             cleanIPs,
             customCdnAddrs,
@@ -604,7 +605,7 @@ export async function getURLConfigs() {
         if (isTLS) {
             config.searchParams.append('sni', sni);
             config.searchParams.append('fp', fingerprint);
-            config.searchParams.append('alpn', 'http/1.1');
+            config.searchParams.append('alpn', alpn || 'h3,h2');
         }
 
         return config.href;

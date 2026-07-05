@@ -91,6 +91,7 @@ export function buildWebsocketOutbound(
     const {
         settings: {
             fingerprint,
+            alpn,
             enableTFO,
             enableECH,
             echServerName,
@@ -105,7 +106,7 @@ export function buildWebsocketOutbound(
     const tlsSettings = isTLS ? buildTlsSettings(
         sni,
         fingerprint,
-        "http/1.1",
+        alpn || "h3,h2",
         enableECH && !isFragment,
         echServerName || undefined,
     ) : undefined;

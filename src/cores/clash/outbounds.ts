@@ -56,6 +56,7 @@ export function buildWebsocketOutbound(
         globalConfig: { userID, TrPass },
         settings: { 
             fingerprint, 
+            alpn, 
             enableTFO, 
             enableIPv6, 
             enableECH, 
@@ -75,7 +76,7 @@ export function buildWebsocketOutbound(
         sni, 
         enableECH, 
         echServerName || undefined, 
-        "http/1.1", 
+        alpn || "h3,h2", 
         fingerprint
     ) : {};
     
