@@ -696,6 +696,10 @@ function validateCustomRules() {
     return true;
 }
 
+function parseAddressEntry(value) {
+    return value.includes('#') ? value.split('#')[0].trim() : value;
+}
+
 function validateMultipleHostNames() {
     const invalidValues = [
         'cleanIPs',
@@ -703,6 +707,8 @@ function validateMultipleHostNames() {
         'customCdnSni',
         'customCdnHost'
     ].flatMap(parseElmValues)
+        .filter(v => !v.startsWith('http://') && !v.startsWith('https://'))
+        .map(parseAddressEntry)
         .filter(value => !isValidHostName(value));
 
     if (invalidValues.length) {

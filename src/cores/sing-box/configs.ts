@@ -67,11 +67,11 @@ async function buildConfig(
         }
     };
 
-    const tag = isWarp ? `💦 Warp - Best Ping 🚀` : "💦 Best Ping 🚀";
+    const tag = isWarp ? "Warp - 最佳延迟 🚀" : "最佳延迟 🚀";
     const mainUrlTest = buildUrlTest(tag, urlTestTags, isWarp);
     config.outbounds.push(mainUrlTest);
-    if (isWarp) config.outbounds.push(buildUrlTest("💦 WoW - Best Ping 🚀", secondUrlTestTags, isWarp));
-    if (isChain) config.outbounds.push(buildUrlTest("💦 🔗 Best Ping 🚀", secondUrlTestTags, isWarp));
+    if (isWarp) config.outbounds.push(buildUrlTest("WoW - 最佳延迟 🚀", secondUrlTestTags, isWarp));
+    if (isChain) config.outbounds.push(buildUrlTest("🔗 最佳延迟 🚀", secondUrlTestTags, isWarp));
 
     return config;
 }
@@ -93,7 +93,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
     const chainTags: string[] = [];
     const outbounds: Outbound[] = [];
 
-    const selectorTags = ["💦 Best Ping 🚀"].concatIf(isChain, "💦 🔗 Best Ping 🚀");
+    const selectorTags = ["最佳延迟 🚀"].concatIf(isChain, "🔗 最佳延迟 🚀");
 
     for (const protocol of protocols) {
         let protocolIndex = 1;
@@ -152,15 +152,15 @@ export async function getSbWarpConfig(request: Request, env: Env): Promise<Respo
     const chainTags: string[] = [];
     const outbounds: WireguardEndpoint[] = [];
     const selectorTags = [
-        "💦 Warp - Best Ping 🚀",
-        "💦 WoW - Best Ping 🚀"
+        "Warp - 最佳延迟 🚀",
+        "WoW - 最佳延迟 🚀"
     ];
 
     warpEndpoints.forEach((endpoint, index) => {
-        const warpTag = `💦 ${index + 1} - Warp 🇮🇷`;
+        const warpTag = `Warp-${String(index + 1).padStart(2, '0')} 🇮🇷`;
         proxyTags.push(warpTag);
 
-        const wowTag = `💦 ${index + 1} - WoW 🌍`;
+        const wowTag = `WoW-${String(index + 1).padStart(2, '0')} 🌍`;
         chainTags.push(wowTag);
 
         selectorTags.push(warpTag, wowTag);

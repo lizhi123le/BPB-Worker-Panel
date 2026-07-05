@@ -1,5 +1,6 @@
 import { getDataset } from "@kv";
 import { isValidUUID } from "@common";
+import { resolveUrlEntries } from "@utils";
 
 globalThis.dict = {
     _VL_: atob('dmxlc3M='),
@@ -111,7 +112,12 @@ globalThis.settings = {
 
 export async function setSettings(request: Request, env: Env) {
     const dataset = await getDataset(request, env);
-    globalThis.settings = dataset.settings;
+    const settings = dataset.settings;
+    if (settings) {
+        settings.cleanIPs = await resolveUrlEntries(settings.cleanIPs || []);
+        settings.customCdnAddrs = await resolveUrlEntries(settings.customCdnAddrs || []);
+    }
+    globalThis.settings = settings;
 }
 
 export function init(request: Request, env: Env) {

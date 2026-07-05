@@ -145,8 +145,7 @@ async function addBestPingConfigs(
 ) {
     const isChain = !!chainOutbounds.length;
     const chainSign = isChain ? '🔗 ' : '';
-    const configType = isFragment ? ' F' : '';
-    const remark = `💦 ${chainSign}Best Ping${configType} 🚀`;
+    const remark = `${chainSign}最佳延迟 🚀`;
     const outbounds = [
         ...chainOutbounds,
         ...proxyOutbounds
@@ -193,7 +192,7 @@ async function addBestFragmentConfigs(
 
     const chainSign = isChain ? '🔗 ' : '';
     const config = await buildConfig(
-        `💦 ${chainSign}Best Fragment 😎`,
+        `${chainSign}最佳分片 😎`,
         outbounds,
         true,
         isChain,
@@ -222,7 +221,7 @@ async function addWorkerlessConfigs(configs: Config[]) {
     ];
 
     const cfDnsConfig = await buildConfig(
-        `💦 1 - Workerless ⭐`,
+        `Workerless-01 ⭐`,
         outbounds,
         false,
         false,
@@ -236,7 +235,7 @@ async function addWorkerlessConfigs(configs: Config[]) {
     );
 
     const googleDnsConfig = await buildConfig(
-        `💦 2 - Workerless ⭐`,
+        `Workerless-02 ⭐`,
         outbounds,
         false,
         false,
@@ -338,7 +337,7 @@ export async function getXrWarpConfigs(
         const wowOutbound = buildWarpOutbound(warpAccounts[1], endpoint, true, isPro, isKnocker);
 
         const warpConfig = await buildConfig(
-            `💦 ${index + 1} - Warp${proIndicator}🇮🇷`,
+            `Warp-${String(index + 1).padStart(2, '0')}${proIndicator}🇮🇷`,
             [warpOutbound],
             false,
             false,
@@ -349,7 +348,7 @@ export async function getXrWarpConfigs(
         );
 
         const wowConfig = await buildConfig(
-            `💦 ${index + 1} - WoW${proIndicator}🌍`,
+            `WoW-${String(index + 1).padStart(2, '0')}${proIndicator}🌍`,
             [wowOutbound, warpOutbound],
             false,
             true,
@@ -369,7 +368,7 @@ export async function getXrWarpConfigs(
     }
 
     const warpBestPing = await buildConfig(
-        `💦 Warp${proIndicator}- Best Ping 🚀`,
+        `Warp${proIndicator}- 最佳延迟 🚀`,
         [...proxies],
         true,
         false,
@@ -380,7 +379,7 @@ export async function getXrWarpConfigs(
     );
 
     const wowBestPing = await buildConfig(
-        `💦 WoW${proIndicator}- Best Ping 🚀`,
+        `WoW${proIndicator}- 最佳延迟 🚀`,
         [...chains, ...proxies],
         true,
         true,
