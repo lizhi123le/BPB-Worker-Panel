@@ -107,9 +107,9 @@ export function buildWebsocketOutbound(
     const tlsSettings = isTLS ? buildTlsSettings(
         sni,
         fingerprint,
-        alpn || undefined,
         enableECH && !isFragment,
         pickRandomEch(echServerName),
+        alpn || undefined,
     ) : undefined;
 
     const streamSettings: StreamSettings = {
@@ -223,7 +223,7 @@ export function buildChainOutbound(): Outbound | undefined {
         network: type || "raw",
         ...buildTransport(type, headerType, path, host, serviceName, mode, authority),
         security,
-        tlsSettings: security === 'tls' ? buildTlsSettings(sni || address, fp, alpn, false, undefined) : undefined,
+        tlsSettings: security === 'tls' ? buildTlsSettings(sni || address, fp, false, undefined, alpn) : undefined,
         realitySettings: security === "reality" ? buildRealitySettings(sni, fp, pbk, sid, spx) : undefined,
         sockopt: buildSockopt(false, false, "UseIPv4", "proxy")
     };
@@ -378,9 +378,9 @@ function buildSockopt(
 function buildTlsSettings(
     serverName: string,
     fingerprint: Fingerprint,
-    alpn?: string,
     enableECH: boolean,
-    echServerName?: string
+    echServerName?: string,
+    alpn?: string
 ): TlsSettings {
     const { localDNS } = globalThis.settings;
     const echQueryDNS = localDNS === "localhost" ? "8.8.8.8" : localDNS
