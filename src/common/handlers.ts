@@ -69,7 +69,7 @@ export async function handlePanel(request: Request, env: Env): Promise<Response>
             return await getMyIP(request);
 
         case '/panel/region':
-            return await getRegionInfo(request);
+            return await getRegionInfo(request, env);
 
         case '/panel/update-warp':
             return await updateWarpConfigs(request, env);
@@ -318,8 +318,10 @@ async function getMyIP(request: Request): Promise<Response> {
     }
 }
 
-async function getRegionInfo(request: Request): Promise<Response> {
+async function getRegionInfo(request: Request, env: Env): Promise<Response> {
     try {
+        await setSettings(request, env);
+
         const cf = (request as any).cf || {};
         const country = cf.country || '';
         const colo = cf.colo || '';

@@ -448,7 +448,7 @@ export const REGION_NEIGHBORS: Record<string, string[]> = {
 const COUNTRY_TO_REGION: Record<string, string> = {
     US: 'US', CA: 'US',
     SG: 'SG', MY: 'SG', ID: 'SG', PH: 'SG', TH: 'SG', VN: 'SG', BN: 'SG',
-    HK: 'HK', MO: 'HK',
+    HK: 'HK', MO: 'HK', CN: 'SG',
     JP: 'JP',
     KR: 'KR',
     IN: 'IN', LK: 'IN', BD: 'IN', NP: 'IN',
