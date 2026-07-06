@@ -27,6 +27,7 @@ declare global {
         panelIPs?: string[];
         workerRegion?: string;
         regionMatch?: boolean;
+        wkRegion?: string;
     }
 
     interface Env {

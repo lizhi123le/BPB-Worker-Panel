@@ -1334,12 +1334,13 @@ async function fetchSystemStatus() {
 
         const update = (id, val) => document.getElementById(id).textContent = val || '-';
 
-        update('status-worker-region', body.workerRegion);
+        const effectiveRegion = body.wkRegion || body.workerRegion;
+        update('status-worker-region', effectiveRegion);
         update('status-cf-edge', body.workerColo);
-        update('status-cf-country', body.workerCountry || body.workerRegion);
+        update('status-cf-country', body.workerRegion);
         update('status-your-ip', body.clientIP);
         update('status-your-country', body.clientCountry || '-');
-        update('status-wk-region', document.getElementById('wkRegion')?.value || '');
+        update('status-wk-region', body.wkRegion || '(detected)');
 
         const regionMatch = document.getElementById('regionMatch')?.value === 'true';
         update('status-region-match', regionMatch ? '✅ Enabled' : 'Disabled');
