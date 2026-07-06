@@ -1,5 +1,5 @@
 import { connect } from 'cloudflare:sockets';
-import { isIPv4, parseHostPort, resolveDNS } from '@utils';
+import { isIPv4, parseHostPort, resolveDNS, selectProxyIPByRegion, stripRegionTag } from '@utils';
 import { safeErrorMessage } from '@common';
 
 export const WS_READY_STATE_OPEN = 1;
@@ -45,8 +45,12 @@ export async function handleTCPOutBound(
         if (proxyMode === 'proxyip') {
             log(`direct connection failed, trying to use Proxy IP for ${addressRemote}`);
             const proxyIPs = panelIPs?.length ? panelIPs : parseIPs(envProxyIPs) ?? defaultProxyIPs;
-            const proxyIP = getRandomValue(proxyIPs);
-            const { host, port } = parseHostPort(proxyIP, true);
+            const { regionMatch, workerRegion } = globalThis.wsConfig;
+            const proxyIP = (regionMatch && workerRegion)
+                ? (selectProxyIPByRegion(proxyIPs, workerRegion) ?? getRandomValue(proxyIPs))
+                : getRandomValue(proxyIPs);
+            const cleanIP = stripRegionTag(proxyIP);
+            const { host, port } = parseHostPort(cleanIP, true);
             addressRemote = host || addressRemote;
             portRemote = port || portRemote;
         } else if (proxyMode === 'prefix') {

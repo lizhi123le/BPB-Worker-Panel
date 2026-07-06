@@ -74,6 +74,8 @@ export async function updateDataset(request: Request, env: Env): Promise<Setting
             ["logLevel"],
             ["allowLANConnection"],
             ["proxyIPMode"],
+            ["regionMatch"],
+            ["wkRegion"],
             ["proxyIPs"],
             ["prefixes"],
             ["upstreamProxy"],

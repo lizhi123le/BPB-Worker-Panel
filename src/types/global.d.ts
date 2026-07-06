@@ -25,6 +25,8 @@ declare global {
         wsProtocol?: "vl" | "tr";
         proxyMode?: "proxyip" | "prefix";
         panelIPs?: string[];
+        workerRegion?: string;
+        regionMatch?: boolean;
     }
 
     interface Env {
@@ -78,6 +80,8 @@ declare global {
         remoteDNS: string;
         remoteDnsHost: DnsHost;
         proxyIPMode: "proxyip" | "prefix";
+        regionMatch: boolean;
+        wkRegion?: string;
         proxyIPs: string[];
         prefixes: string[];
         upstreamProxy: string;
