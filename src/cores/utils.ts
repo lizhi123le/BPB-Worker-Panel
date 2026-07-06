@@ -219,7 +219,7 @@ export function getRandomString(lengthMin: number, lengthMax: number): string {
 
 export function generateWsPath(protocol: string): string {
     const {
-        settings: { proxyIPMode, proxyIPs, prefixes, regionMatch },
+        settings: { proxyIPMode, proxyIPs, prefixes, regionMatch, wkRegion },
         dict: { _VL_ }
     } = globalThis;
 
@@ -228,7 +228,8 @@ export function generateWsPath(protocol: string): string {
         protocol: protocol === _VL_ ? "vl" : "tr",
         mode: proxyIPMode,
         panelIPs: proxyIPMode === 'proxyip' ? proxyIPs : prefixes,
-        regionMatch: regionMatch
+        regionMatch: regionMatch,
+        wkRegion: wkRegion || ''
     };
 
     return `/${btoa(JSON.stringify(config))}`;
@@ -428,11 +429,11 @@ export const ALL_REGIONS = ['HK', 'US', 'SG', 'JP', 'KR', 'IN', 'AU', 'GB', 'DE'
 export const REGION_NEIGHBORS: Record<string, string[]> = {
     HK: ['SG', 'JP', 'KR', 'US'],
     US: ['SG', 'JP', 'KR', 'GB'],
-    SG: ['HK', 'JP', 'KR', 'US', 'IN', 'AU'],
-    JP: ['HK', 'KR', 'SG', 'US'],
-    KR: ['JP', 'HK', 'SG', 'US'],
-    IN: ['SG', 'AE', 'HK'],
-    AU: ['SG', 'HK', 'JP', 'US'],
+    SG: ['JP', 'KR', 'US', 'IN', 'AU'],
+    JP: ['KR', 'SG', 'US'],
+    KR: ['JP', 'SG', 'US'],
+    IN: ['SG', 'AE'],
+    AU: ['SG', 'JP', 'US'],
     GB: ['NL', 'DE', 'SE', 'FI', 'US'],
     DE: ['NL', 'GB', 'SE', 'FI', 'AE'],
     NL: ['DE', 'GB', 'SE', 'FI'],

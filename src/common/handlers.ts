@@ -16,20 +16,19 @@ export async function handleWebsocket(request: Request): Promise<Response> {
     const encodedPathConfig = pathName.replace("/", "");
 
     try {
-        const { protocol, mode, panelIPs, regionMatch } = JSON.parse(atob(encodedPathConfig));
+        const { protocol, mode, panelIPs, regionMatch, wkRegion } = JSON.parse(atob(encodedPathConfig));
         globalThis.wsConfig = {
             ...globalThis.wsConfig,
             wsProtocol: protocol,
             proxyMode: mode,
             panelIPs: panelIPs,
-            regionMatch: regionMatch ?? false
+            regionMatch: regionMatch ?? false,
+            wkRegion: wkRegion || ''
         };
 
-        // Detect worker region from Cloudflare request
+        // Detect worker region: manual wkRegion override (from client config) > cf.country
         const cfCountry = request.cf?.country;
-        if (cfCountry) {
-            globalThis.wsConfig.workerRegion = cfCountry;
-        }
+        globalThis.wsConfig.workerRegion = (wkRegion && wkRegion.trim()) ? wkRegion.trim() : (cfCountry || '');
 
         switch (protocol) {
             case 'vl':
@@ -336,6 +335,8 @@ async function getRegionInfo(request: Request): Promise<Response> {
             } catch { /* ignore */ }
         }
 
+        const manualRegion = (globalThis.settings?.wkRegion || '').trim();
+
         return respond(true, HttpStatus.OK, '', {
             workerRegion: country,
             workerColo: colo,
@@ -344,7 +345,8 @@ async function getRegionInfo(request: Request): Promise<Response> {
             clientCountry: clientGeo?.country || '',
             clientCountryCode: clientGeo?.countryCode || '',
             clientCity: clientGeo?.city || '',
-            clientIsp: clientGeo?.isp || ''
+            clientIsp: clientGeo?.isp || '',
+            wkRegion: manualRegion
         });
     } catch (error) {
         console.error('Error fetching region info:', error);
