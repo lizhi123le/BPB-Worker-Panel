@@ -8,7 +8,7 @@ import { fetchWarpAccounts } from "@warp";
 import { VlOverWSHandler } from "@vless";
 import { TrOverWSHandler } from "@trojan";
 import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
-import { buildEntryPortMap, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, resetRemarkCounter, resolveDNS, selectSniHost } from "@utils";
+import { buildEntryPortMap, countryToRegion, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, resetRemarkCounter, resolveDNS, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
 export async function handleWebsocket(request: Request): Promise<Response> {
@@ -337,6 +337,7 @@ async function getRegionInfo(request: Request): Promise<Response> {
         }
 
         const manualRegion = (globalThis.settings?.wkRegion || '').trim();
+        const resolvedProxyRegion = countryToRegion(country) || '';
 
         return respond(true, HttpStatus.OK, '', {
             workerRegion: country,
@@ -347,7 +348,8 @@ async function getRegionInfo(request: Request): Promise<Response> {
             clientCountryCode: clientGeo?.countryCode || '',
             clientCity: clientGeo?.city || '',
             clientIsp: clientGeo?.isp || '',
-            wkRegion: manualRegion
+            wkRegion: manualRegion,
+            resolvedProxyRegion
         });
     } catch (error) {
         console.error('Error fetching region info:', error);

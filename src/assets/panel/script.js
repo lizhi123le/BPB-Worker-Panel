@@ -1340,7 +1340,7 @@ async function fetchSystemStatus() {
         update('status-cf-country', body.workerRegion);
         update('status-your-ip', body.clientIP);
         update('status-your-country', body.clientCountry || '-');
-        update('status-wk-region', body.wkRegion || '(detected)');
+        update('status-wk-region', body.wkRegion || body.resolvedProxyRegion || '(detected)');
 
         const regionMatch = document.getElementById('regionMatch')?.value === 'true';
         update('status-region-match', regionMatch ? '✅ Enabled' : 'Disabled');
