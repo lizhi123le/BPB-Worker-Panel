@@ -219,7 +219,7 @@ export function getRandomString(lengthMin: number, lengthMax: number): string {
 
 export function generateWsPath(protocol: string): string {
     const {
-        settings: { proxyIPMode, proxyIPs, prefixes },
+        settings: { proxyIPMode, proxyIPs, prefixes, regionMatch },
         dict: { _VL_ }
     } = globalThis;
 
@@ -227,7 +227,8 @@ export function generateWsPath(protocol: string): string {
         junk: getRandomString(8, 16),
         protocol: protocol === _VL_ ? "vl" : "tr",
         mode: proxyIPMode,
-        panelIPs: proxyIPMode === 'proxyip' ? proxyIPs : prefixes
+        panelIPs: proxyIPMode === 'proxyip' ? proxyIPs : prefixes,
+        regionMatch: regionMatch
     };
 
     return `/${btoa(JSON.stringify(config))}`;
@@ -418,4 +419,112 @@ Array.prototype.concatIf = function <T>(condition: boolean, concat: T | T[]): T[
 Object.prototype.omitEmpty = function <T>(): T | undefined {
     if (Object.keys(this).length === 0) return undefined;
     return this as T;
+}
+
+// ── Region matching for nearest proxy IP selection ──
+
+export const ALL_REGIONS = ['HK', 'US', 'SG', 'JP', 'KR', 'IN', 'AU', 'GB', 'DE', 'NL', 'SE', 'FI', 'AE', 'ZA', 'BR', 'RU'];
+
+export const REGION_NEIGHBORS: Record<string, string[]> = {
+    HK: ['SG', 'JP', 'KR', 'US'],
+    US: ['SG', 'JP', 'KR', 'GB'],
+    SG: ['HK', 'JP', 'KR', 'US', 'IN', 'AU'],
+    JP: ['HK', 'KR', 'SG', 'US'],
+    KR: ['JP', 'HK', 'SG', 'US'],
+    IN: ['SG', 'AE', 'HK'],
+    AU: ['SG', 'HK', 'JP', 'US'],
+    GB: ['NL', 'DE', 'SE', 'FI', 'US'],
+    DE: ['NL', 'GB', 'SE', 'FI', 'AE'],
+    NL: ['DE', 'GB', 'SE', 'FI'],
+    SE: ['FI', 'NL', 'DE', 'GB'],
+    FI: ['SE', 'NL', 'DE', 'GB'],
+    AE: ['DE', 'GB', 'IN', 'ZA'],
+    ZA: ['AE', 'DE', 'GB'],
+    BR: ['US', 'AE'],
+    RU: ['FI', 'SE', 'DE'],
+};
+
+const COUNTRY_TO_REGION: Record<string, string> = {
+    US: 'US', CA: 'US',
+    SG: 'SG', MY: 'SG', ID: 'SG', PH: 'SG', TH: 'SG', VN: 'SG', BN: 'SG',
+    HK: 'HK', MO: 'HK',
+    JP: 'JP',
+    KR: 'KR',
+    IN: 'IN', LK: 'IN', BD: 'IN', NP: 'IN',
+    AU: 'AU', NZ: 'AU',
+    GB: 'GB', IE: 'GB',
+    DE: 'DE', AT: 'DE', CH: 'DE', FR: 'DE', IT: 'DE', ES: 'DE', PT: 'DE',
+    NL: 'NL', BE: 'NL', LU: 'NL',
+    SE: 'SE', NO: 'SE', DK: 'SE', IS: 'SE',
+    FI: 'FI',
+    AE: 'AE', SA: 'AE', IL: 'AE',
+    ZA: 'ZA',
+    BR: 'BR', AR: 'BR',
+    RU: 'RU',
+};
+
+/** Map CF country code (ISO 3166-1 alpha-2) to proxy region */
+export function countryToRegion(countryCode: string): string | undefined {
+    if (!countryCode) return undefined;
+    return COUNTRY_TO_REGION[countryCode.toUpperCase()];
+}
+
+/** Build region priority list: own region → neighbors → all remaining */
+export function getRegionPriorityList(region: string): string[] {
+    const neighbors = REGION_NEIGHBORS[region] || [];
+    const otherRegions = ALL_REGIONS.filter(r => r !== region && !neighbors.includes(r));
+    return [region, ...neighbors, ...otherRegions];
+}
+
+/** Parse "host:port@REGION" entry into components */
+export function parseProxyIPWithRegion(entry: string): { host: string; port: number; region?: string } {
+    const clean = entry.split('#')[0].trim();
+    const atIdx = clean.lastIndexOf('@');
+    if (atIdx !== -1) {
+        const addressPart = clean.slice(0, atIdx).trim();
+        const region = clean.slice(atIdx + 1).trim().toUpperCase();
+        const { host, port } = parseHostPort(addressPart, true);
+        return { host, port, region: region || undefined };
+    }
+    const { host, port } = parseHostPort(clean, true);
+    return { host, port };
+}
+
+/** Strip @REGION suffix from proxy IP, return the clean address part */
+export function stripRegionTag(entry: string): string {
+    const clean = entry.split('#')[0].trim();
+    const atIdx = clean.lastIndexOf('@');
+    if (atIdx !== -1) return clean.slice(0, atIdx).trim();
+    return clean;
+}
+
+/** Pick a proxy IP from the list, preferring those matching the worker's region */
+export function selectProxyIPByRegion(proxyIPs: string[], workerRegion: string): string | undefined {
+    const region = countryToRegion(workerRegion);
+    if (!region) {
+        return proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+    }
+
+    const parsed = proxyIPs.map(ip => ({
+        entry: ip,
+        parsed: parseProxyIPWithRegion(ip)
+    }));
+
+    const tagged = parsed.filter(p => p.parsed.region);
+    if (tagged.length === 0) {
+        return proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+    }
+
+    const priorityRegions = getRegionPriorityList(region);
+
+    for (const targetRegion of priorityRegions) {
+        const matches = tagged.filter(p => p.parsed.region === targetRegion);
+        if (matches.length > 0) {
+            return matches[Math.floor(Math.random() * matches.length)].entry;
+        }
+    }
+
+    return tagged.length > 0
+        ? tagged[Math.floor(Math.random() * tagged.length)].entry
+        : proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
 }

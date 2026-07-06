@@ -30,6 +30,8 @@ globalThis.settings = {
         ipv6: []
     },
     proxyIPMode: "proxyip",
+    regionMatch: true,
+    wkRegion: '',
     proxyIPs: [],
     prefixes: [],
     upstreamProxy: "",

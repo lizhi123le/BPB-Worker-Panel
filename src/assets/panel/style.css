@@ -787,6 +787,47 @@ summary h3 {
     cursor: pointer;
 }
 
+/* System Status Panel */
+#system-status-container {
+    margin-top: 0;
+}
+
+#system-status-container h2 {
+    margin: 0 0 12px 0;
+}
+
+.status-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.status-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 10px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--element-border-radius);
+    background-color: var(--input-background-color);
+}
+
+.status-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--primary-color);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.status-value {
+    font-size: 1rem;
+    font-weight: 500;
+    word-break: break-all;
+    text-align: center;
+}
+
 @media only screen and (min-width: 600px) {
     .form-control {
         flex-direction: row;

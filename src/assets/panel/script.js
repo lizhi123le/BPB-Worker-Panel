@@ -55,6 +55,8 @@ fetch('/panel/settings')
                 this.textContent = isPassword ? "visibility" : "visibility_off";
             });
         });
+
+        fetchSystemStatus();
     });
 
 function initiatePanel(proxySettings) {
@@ -736,7 +738,13 @@ function validateMultipleHostNames() {
 
 function validateProxyIPs() {
     const invalidValues = parseElmValues('proxyIPs')
-        .filter(value => !isValidHostName(value));
+        .filter(value => {
+            // Strip optional @REGION suffix before hostname validation
+            const cleanValue = value.lastIndexOf('@') !== -1
+                ? value.slice(0, value.lastIndexOf('@')).trim()
+                : value;
+            return !isValidHostName(cleanValue);
+        });
 
     if (invalidValues.length) {
         alert(
@@ -1316,3 +1324,36 @@ function renderUdpNoiseBlock(xrayUdpNoises) {
 
     globalThis.xrayNoiseCount = xrayUdpNoises.length;
 }
+
+async function fetchSystemStatus() {
+    try {
+        const response = await fetch('/panel/region', { method: 'GET', credentials: 'include' });
+        const { success, body } = await response.json();
+
+        if (!success) return;
+
+        const update = (id, val) => document.getElementById(id).textContent = val || '-';
+
+        update('status-worker-region', body.workerRegion);
+        update('status-cf-edge', body.workerColo);
+        update('status-cf-country', body.workerCountry || body.workerRegion);
+        update('status-your-ip', body.clientIP);
+        update('status-your-country', body.clientCountry || '-');
+        update('status-wk-region', document.getElementById('wkRegion')?.value || '');
+
+        const regionMatch = document.getElementById('regionMatch')?.value === 'true';
+        update('status-region-match', regionMatch ? '✅ Enabled' : 'Disabled');
+
+        const echSelect = document.getElementById('enableECH');
+        const echEnabled = echSelect?.value === 'true';
+        const echServerName = document.getElementById('echServerName')?.value?.trim();
+        update('status-ech', echEnabled
+            ? (echServerName ? `✅ ${echServerName.split('\n')[0]}` : '✅ On')
+            : '❌ Off');
+    } catch (error) {
+        console.error("System status fetch error:", error.message || error);
+    }
+}
+
+// Auto-refresh every 30 seconds
+setInterval(fetchSystemStatus, 30000);

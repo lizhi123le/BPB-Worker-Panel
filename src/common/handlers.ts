@@ -16,13 +16,20 @@ export async function handleWebsocket(request: Request): Promise<Response> {
     const encodedPathConfig = pathName.replace("/", "");
 
     try {
-        const { protocol, mode, panelIPs } = JSON.parse(atob(encodedPathConfig));
+        const { protocol, mode, panelIPs, regionMatch } = JSON.parse(atob(encodedPathConfig));
         globalThis.wsConfig = {
             ...globalThis.wsConfig,
             wsProtocol: protocol,
             proxyMode: mode,
-            panelIPs: panelIPs
+            panelIPs: panelIPs,
+            regionMatch: regionMatch ?? false
         };
+
+        // Detect worker region from Cloudflare request
+        const cfCountry = request.cf?.country;
+        if (cfCountry) {
+            globalThis.wsConfig.workerRegion = cfCountry;
+        }
 
         switch (protocol) {
             case 'vl':
@@ -61,6 +68,9 @@ export async function handlePanel(request: Request, env: Env): Promise<Response>
 
         case '/panel/my-ip':
             return await getMyIP(request);
+
+        case '/panel/region':
+            return await getRegionInfo(request);
 
         case '/panel/update-warp':
             return await updateWarpConfigs(request, env);
@@ -306,6 +316,39 @@ async function getMyIP(request: Request): Promise<Response> {
     } catch (error) {
         console.error('Error fetching IP address:', error);
         return respond(false, HttpStatus.INTERNAL_SERVER_ERROR, `Error fetching IP address: ${safeErrorMessage(error)}`)
+    }
+}
+
+async function getRegionInfo(request: Request): Promise<Response> {
+    try {
+        const cf = (request as any).cf || {};
+        const country = cf.country || '';
+        const colo = cf.colo || '';
+        const city = cf.city || '';
+        const clientIP = request.headers.get('CF-Connecting-IP') || '';
+
+        // Fetch client geolocation
+        let clientGeo = null;
+        if (clientIP) {
+            try {
+                const geoRes = await fetch(`http://ip-api.com/json/${clientIP}?fields=query,country,countryCode,city,isp,status&nocache=${Date.now()}`);
+                clientGeo = await geoRes.json();
+            } catch { /* ignore */ }
+        }
+
+        return respond(true, HttpStatus.OK, '', {
+            workerRegion: country,
+            workerColo: colo,
+            workerCity: city,
+            clientIP,
+            clientCountry: clientGeo?.country || '',
+            clientCountryCode: clientGeo?.countryCode || '',
+            clientCity: clientGeo?.city || '',
+            clientIsp: clientGeo?.isp || ''
+        });
+    } catch (error) {
+        console.error('Error fetching region info:', error);
+        return respond(false, HttpStatus.INTERNAL_SERVER_ERROR, `Error fetching region info: ${safeErrorMessage(error)}`)
     }
 }
 
