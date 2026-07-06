@@ -327,7 +327,8 @@ async function getRegionInfo(request: Request): Promise<Response> {
         const clientIP = request.headers.get('CF-Connecting-IP') || '';
 
         // Fetch client geolocation
-        let clientGeo = null;
+        interface GeoResponse { country: string; countryCode: string; city: string; isp: string; }
+        let clientGeo: GeoResponse | null = null;
         if (clientIP) {
             try {
                 const geoRes = await fetch(`http://ip-api.com/json/${clientIP}?fields=query,country,countryCode,city,isp,status&nocache=${Date.now()}`);
