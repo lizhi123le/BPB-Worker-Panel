@@ -120,7 +120,8 @@ export async function setSettings(request: Request, env: Env) {
         settings.customCdnAddrs = await resolveUrlEntries(settings.customCdnAddrs || []);
         settings.proxyIPs = await resolveUrlEntries(settings.proxyIPs || []);
     }
-    globalThis.settings = settings;
+    // 合并而非替换，确保新字段（alpn, hostSniList, regionMatch 等）不会被旧 KV 数据覆盖
+    Object.assign(globalThis.settings, settings);
 
     // 对齐 cfnew：订阅生成时记录 Worker 所在地，用于静态预选 Proxy IP
     const cf = (request as any).cf || {};

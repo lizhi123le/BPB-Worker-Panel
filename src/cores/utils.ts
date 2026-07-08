@@ -60,7 +60,7 @@ export async function resolveUrlEntries(entries: string[]): Promise<string[]> {
     for (const entry of entries) {
         if (entry.startsWith('http://') || entry.startsWith('https://')) {
             try {
-                const res = await fetch(entry);
+                const res = await fetch(entry, { signal: AbortSignal.timeout(10_000) });
                 if (!res.ok) continue;
                 const text = await res.text();
                 const lines = text.split('\n')
@@ -104,7 +104,10 @@ export async function resolveDNS(domain: string, onlyIPv4 = false): Promise<DnsR
 
 export async function fetchDNSRecords(url: string, recordType: number): Promise<string[]> {
     try {
-        const response = await fetch(url, { headers: { accept: 'application/dns-json' } });
+        const response = await fetch(url, {
+            headers: { accept: 'application/dns-json' },
+            signal: AbortSignal.timeout(10_000),
+        });
         const data: any = await response.json();
 
         if (!data.Answer) return [];
