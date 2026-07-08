@@ -4,6 +4,7 @@ import { safeErrorMessage } from '@common';
 
 export const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
+const CONNECT_TIMEOUT = 5000; // 连接超时 5 秒
 
 export async function handleTCPOutBound(
     remoteSocket: { value: Socket | null },
@@ -22,6 +23,15 @@ export async function handleTCPOutBound(
         });
 
         remoteSocket.value = tcpSocket;
+
+        // 连接超时保护：防止连到不通的 IP 时卡死
+        await Promise.race([
+            tcpSocket.opened,
+            new Promise<void>((_, reject) =>
+                setTimeout(() => reject(new Error(`连接超时 (${address}:${port})`)), CONNECT_TIMEOUT)
+            )
+        ]);
+
         log(`connected to ${address}:${port}`);
         const writer = tcpSocket.writable.getWriter();
         await writer.write(rawClientData);

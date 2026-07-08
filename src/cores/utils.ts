@@ -1,3 +1,4 @@
+import { connect } from 'cloudflare:sockets';
 import { safeErrorMessage } from "@common";
 
 export function isDomain(address: string): boolean {
@@ -137,11 +138,18 @@ export async function getConfigAddresses(isFragment: boolean): Promise<string[]>
     } = globalThis;
 
     const { ipv4, ipv6 } = await resolveDNS(hostName, !enableIPv6);
+
+    // 对 DNS 解析出的 IP 做可达性探测，过滤不可达地址（并行探测）
+    const [reachableIPv4, reachableIPv6] = await Promise.all([
+        ipv4.length > 0 ? filterReachableIPs(ipv4) : Promise.resolve([] as string[]),
+        ipv6.length > 0 ? filterReachableIPs(ipv6) : Promise.resolve([] as string[]),
+    ]);
+
     const addrs = [
         hostName,
         'www.speedtest.net',
-        ...ipv4,
-        ...ipv6.map((ip: string) => `[${ip}]`),
+        ...reachableIPv4,
+        ...reachableIPv6.map((ip: string) => `[${ip}]`),
         ...entryAddresses(cleanIPs)
     ];
 
@@ -586,6 +594,48 @@ export function stripRegionTag(entry: string): string {
     const atIdx = clean.lastIndexOf('@');
     if (atIdx !== -1) return clean.slice(0, atIdx).trim();
     return clean;
+}
+
+// ── IP 可达性探测（TCP 连接检查，对齐 cfnew 的 `探测IP可达性`）──
+
+const PROBE_TIMEOUT = 2000; // 单 IP 探测超时 2 秒
+
+/** 对单个 IP:port 做 TCP 连接探测，返回是否可达 */
+export async function probeIPReachability(
+    hostname: string,
+    port: number = 443,
+    timeoutMs: number = PROBE_TIMEOUT
+): Promise<boolean> {
+    try {
+        const socket = connect({ hostname, port });
+        await Promise.race([
+            socket.opened,
+            new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('timeout')), timeoutMs)
+            ),
+        ]);
+        socket.close();
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/** 对 IP 数组做并发探测，返回可达的 IP 子集 */
+export async function filterReachableIPs(
+    ips: string[],
+    port: number = 443
+): Promise<string[]> {
+    const results = await Promise.all(
+        ips.map(async (ip) => {
+            const clean = ip.replace(/^\[|\]$/g, ''); // 去掉 IPv6 括号
+            const ok = await probeIPReachability(clean, port);
+            return { ip, ok };
+        })
+    );
+    const reachable = results.filter(r => r.ok).map(r => r.ip);
+    // 如果全部不通则回退原始列表（避免空列表导致完全不可用）
+    return reachable.length > 0 ? reachable : ips;
 }
 
 /** Built-in fallback proxy IPs for all 9 regions (cfnew 备用地址列表 equivalent).
