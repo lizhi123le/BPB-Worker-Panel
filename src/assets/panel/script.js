@@ -739,10 +739,13 @@ function validateMultipleHostNames() {
 function validateProxyIPs() {
     const invalidValues = parseElmValues('proxyIPs')
         .filter(value => {
-            // Strip optional @REGION suffix before hostname validation
-            const cleanValue = value.lastIndexOf('@') !== -1
-                ? value.slice(0, value.lastIndexOf('@')).trim()
-                : value;
+            // URLs are allowed — resolved server-side by resolveUrlEntries
+            if (value.startsWith('http://') || value.startsWith('https://')) return false;
+            // Strip #comment and @REGION before hostname validation
+            const noComment = value.indexOf('#') !== -1 ? value.slice(0, value.indexOf('#')).trim() : value;
+            const cleanValue = noComment.lastIndexOf('@') !== -1
+                ? noComment.slice(0, noComment.lastIndexOf('@')).trim()
+                : noComment;
             return !isValidHostName(cleanValue);
         });
 

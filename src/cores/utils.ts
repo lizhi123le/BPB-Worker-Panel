@@ -223,12 +223,38 @@ export function generateWsPath(protocol: string): string {
         dict: { _VL_ }
     } = globalThis;
 
+    // 3 层回退：用户配置 → URL 拉取(resolveUrlEntries 已在 init 时合并) → 内置默认
+    const effectiveIPs = (proxyIPMode === 'proxyip' && proxyIPs.length === 0)
+        ? DEFAULT_PROXY_IPS
+        : proxyIPs;
+
+    // 对齐 cfnew：订阅时静态预选 Proxy IP，而非连接时动态选择
+    let selectedIPs: string[];
+    let effectiveRegionMatch = regionMatch;
+
+    if (proxyIPMode === 'proxyip' && regionMatch) {
+        const wr = globalThis.workerRegion || '';
+        if (wr && effectiveIPs.length > 0) {
+            const selected = selectProxyIPByRegion(effectiveIPs, wr);
+            if (selected) {
+                selectedIPs = [selected];          // 只嵌入匹配到的单一 IP
+                effectiveRegionMatch = false;       // 静态预选后连接时不再需要动态匹配
+            } else {
+                selectedIPs = effectiveIPs;         // fallback：全部传入
+            }
+        } else {
+            selectedIPs = effectiveIPs;
+        }
+    } else {
+        selectedIPs = proxyIPMode === 'proxyip' ? effectiveIPs : prefixes;
+    }
+
     const config = {
         junk: getRandomString(8, 16),
         protocol: protocol === _VL_ ? "vl" : "tr",
         mode: proxyIPMode,
-        panelIPs: proxyIPMode === 'proxyip' ? proxyIPs : prefixes,
-        regionMatch: regionMatch,
+        panelIPs: selectedIPs,
+        regionMatch: effectiveRegionMatch,
         wkRegion: wkRegion || ''
     };
 
@@ -424,50 +450,92 @@ Object.prototype.omitEmpty = function <T>(): T | undefined {
 
 // ── Region matching for nearest proxy IP selection ──
 
-export const ALL_REGIONS = ['HK', 'US', 'SG', 'JP', 'KR', 'IN', 'AU', 'GB', 'DE', 'NL', 'SE', 'FI', 'AE', 'ZA', 'BR', 'RU'];
+export const ALL_REGIONS = ['US', 'SG', 'JP', 'KR', 'DE', 'SE', 'NL', 'FI', 'GB'];
 
 export const REGION_NEIGHBORS: Record<string, string[]> = {
-    HK: ['SG', 'JP', 'KR', 'US'],
-    US: ['SG', 'JP', 'KR', 'GB'],
-    SG: ['JP', 'KR', 'US', 'IN', 'AU'],
-    JP: ['KR', 'SG', 'US'],
+    US: ['SG', 'JP', 'KR'],
+    SG: ['JP', 'KR', 'US'],
+    JP: ['SG', 'KR', 'US'],
     KR: ['JP', 'SG', 'US'],
-    IN: ['SG', 'AE'],
-    AU: ['SG', 'JP', 'US'],
-    GB: ['NL', 'DE', 'SE', 'FI', 'US'],
-    DE: ['NL', 'GB', 'SE', 'FI', 'AE'],
+    DE: ['NL', 'GB', 'SE', 'FI'],
+    SE: ['DE', 'NL', 'FI', 'GB'],
     NL: ['DE', 'GB', 'SE', 'FI'],
-    SE: ['FI', 'NL', 'DE', 'GB'],
-    FI: ['SE', 'NL', 'DE', 'GB'],
-    AE: ['DE', 'GB', 'IN', 'ZA'],
-    ZA: ['AE', 'DE', 'GB'],
-    BR: ['US', 'AE'],
-    RU: ['FI', 'SE', 'DE'],
+    FI: ['SE', 'DE', 'NL', 'GB'],
+    GB: ['DE', 'NL', 'SE', 'FI'],
 };
 
 const COUNTRY_TO_REGION: Record<string, string> = {
-    US: 'US', CA: 'US',
-    SG: 'SG', MY: 'SG', ID: 'SG', PH: 'SG', TH: 'SG', VN: 'SG', BN: 'SG',
-    HK: 'HK', MO: 'HK', CN: 'SG',
+    US: 'US',
+    SG: 'SG',
     JP: 'JP',
     KR: 'KR',
-    IN: 'IN', LK: 'IN', BD: 'IN', NP: 'IN',
-    AU: 'AU', NZ: 'AU',
-    GB: 'GB', IE: 'GB',
-    DE: 'DE', AT: 'DE', CH: 'DE', FR: 'DE', IT: 'DE', ES: 'DE', PT: 'DE',
-    NL: 'NL', BE: 'NL', LU: 'NL',
-    SE: 'SE', NO: 'SE', DK: 'SE', IS: 'SE',
+    DE: 'DE',
+    SE: 'SE',
+    NL: 'NL',
     FI: 'FI',
-    AE: 'AE', SA: 'AE', IL: 'AE',
-    ZA: 'ZA',
-    BR: 'BR', AR: 'BR',
-    RU: 'RU',
+    GB: 'GB',
+    CN: 'SG',
+    TW: 'JP',
+    AU: 'SG',
+    CA: 'US',
+    FR: 'DE',
+    IT: 'DE',
+    ES: 'DE',
+    CH: 'DE',
+    AT: 'DE',
+    BE: 'NL',
+    DK: 'SE',
+    NO: 'SE',
+    IE: 'GB',
 };
 
-/** Map CF country code (ISO 3166-1 alpha-2) to proxy region */
-export function countryToRegion(countryCode: string): string | undefined {
-    if (!countryCode) return undefined;
-    return COUNTRY_TO_REGION[countryCode.toUpperCase()];
+/** Emoji flag → ISO 3166-1 alpha-2 country code */
+const EMOJI_TO_COUNTRY: Record<string, string> = {
+    '🇺🇸': 'US', '🇸🇬': 'SG', '🇯🇵': 'JP', '🇰🇷': 'KR',
+    '🇩🇪': 'DE', '🇸🇪': 'SE', '🇳🇱': 'NL', '🇫🇮': 'FI', '🇬🇧': 'GB',
+    '🇨🇳': 'CN', '🇹🇼': 'TW', '🇨🇦': 'CA', '🇫🇷': 'FR',
+    '🇦🇺': 'AU', '🇮🇹': 'IT', '🇪🇸': 'ES', '🇨🇭': 'CH',
+    '🇧🇪': 'BE', '🇩🇰': 'DK', '🇳🇴': 'NO', '🇮🇪': 'IE',
+};
+/** Chinese country/region name → ISO 3166-1 alpha-2 country code */
+const CN_NAME_TO_COUNTRY: Record<string, string> = {
+    '美国': 'US', '新加坡': 'SG', '日本': 'JP', '韩国': 'KR',
+    '德国': 'DE', '瑞典': 'SE', '荷兰': 'NL', '芬兰': 'FI',
+    '英国': 'GB', '中国': 'CN', '台湾': 'TW', '加拿大': 'CA',
+    '法国': 'FR', '澳大利亚': 'AU', '意大利': 'IT', '西班牙': 'ES',
+    '瑞士': 'CH', '奥地利': 'AT', '比利时': 'BE', '丹麦': 'DK',
+    '挪威': 'NO', '爱尔兰': 'IE', '俄罗斯': 'RU', '印度': 'IN',
+};
+
+/** Normalize a region tag (emoji flag, Chinese name, uppercase code, alias)
+ *  to a canonical ALL_REGIONS-compatible region code.
+ *  Returns the ALL_REGIONS code, or undefined if unrecognized. */
+export function normalizeRegionTag(tag: string): string | undefined {
+    if (!tag) return undefined;
+    const trimmed = tag.trim();
+
+    // 1. Emoji flag → country code → ALL_REGIONS code
+    const emojiCC = EMOJI_TO_COUNTRY[trimmed];
+    if (emojiCC) return COUNTRY_TO_REGION[emojiCC] || (ALL_REGIONS.includes(emojiCC) ? emojiCC : undefined);
+
+    // 2. Chinese name → country code → ALL_REGIONS code
+    const cnCC = CN_NAME_TO_COUNTRY[trimmed];
+    if (cnCC) return COUNTRY_TO_REGION[cnCC] || (ALL_REGIONS.includes(cnCC) ? cnCC : undefined);
+
+    // 3. Uppercase country code or alias (e.g. UK → GB)
+    const upper = trimmed.toUpperCase();
+    const alias: Record<string, string> = { 'UK': 'GB' };
+    const code = alias[upper] || upper;
+    if (COUNTRY_TO_REGION[code]) return COUNTRY_TO_REGION[code];
+    if (ALL_REGIONS.includes(code)) return code;
+    return undefined;
+}
+
+/** Map CF country code (ISO 3166-1 alpha-2) to proxy region.
+ *  Falls back to 'SG' for unmapped countries (cfnew alignment). */
+export function countryToRegion(countryCode: string): string {
+    if (!countryCode) return 'SG';
+    return COUNTRY_TO_REGION[countryCode.toUpperCase()] || 'SG';
 }
 
 /** Build region priority list: own region → neighbors → all remaining */
@@ -477,16 +545,34 @@ export function getRegionPriorityList(region: string): string[] {
     return [region, ...neighbors, ...otherRegions];
 }
 
-/** Parse "host:port@REGION" entry into components */
+/** Parse "host:port@REGION[#name]" or "host:port[#region-tag name]" entry into components.
+ *  Region tag supports: emoji flag (🇸🇬), Chinese name (新加坡), uppercase code (SG). */
 export function parseProxyIPWithRegion(entry: string): { host: string; port: number; region?: string } {
-    const clean = entry.split('#')[0].trim();
+    const hashIdx = entry.indexOf('#');
+    const clean = hashIdx >= 0 ? entry.slice(0, hashIdx).trim() : entry.trim();
+    const comment = hashIdx >= 0 ? entry.slice(hashIdx + 1).trim() : '';
+
+    // Try @REGION tag first
     const atIdx = clean.lastIndexOf('@');
     if (atIdx !== -1) {
         const addressPart = clean.slice(0, atIdx).trim();
-        const region = clean.slice(atIdx + 1).trim().toUpperCase();
-        const { host, port } = parseHostPort(addressPart, true);
-        return { host, port, region: region || undefined };
+        const region = normalizeRegionTag(clean.slice(atIdx + 1));
+        if (region) {
+            const { host, port } = parseHostPort(addressPart, true);
+            return { host, port, region };
+        }
     }
+
+    // Fallback: try to extract region from #name part (full text or first token)
+    if (comment) {
+        const regionFromComment = normalizeRegionTag(comment)
+            || normalizeRegionTag(comment.split(/\s+/)[0]);
+        if (regionFromComment) {
+            const { host, port } = parseHostPort(clean, true);
+            return { host, port, region: regionFromComment };
+        }
+    }
+
     const { host, port } = parseHostPort(clean, true);
     return { host, port };
 }
@@ -499,12 +585,23 @@ export function stripRegionTag(entry: string): string {
     return clean;
 }
 
-/** Pick a proxy IP from the list, preferring those matching the worker's region */
+/** Built-in fallback proxy IPs for all 9 regions (cfnew 备用地址列表 equivalent).
+ *  Used when the user's proxyIPs list is empty and no URL-resolved IPs are available. */
+export const DEFAULT_PROXY_IPS: string[] = [
+    'ProxyIP.US.CMLiussss.net:443@US',
+    'ProxyIP.SG.CMLiussss.net:443@SG',
+    'ProxyIP.JP.CMLiussss.net:443@JP',
+    'ProxyIP.KR.CMLiussss.net:443@KR',
+    'ProxyIP.DE.CMLiussss.net:443@DE',
+    'ProxyIP.SE.CMLiussss.net:443@SE',
+    'ProxyIP.NL.CMLiussss.net:443@NL',
+    'ProxyIP.FI.CMLiussss.net:443@FI',
+    'ProxyIP.GB.CMLiussss.net:443@GB',
+];
+
+/** Pick a proxy IP from the list, preferring those matching the worker's region. */
 export function selectProxyIPByRegion(proxyIPs: string[], workerRegion: string): string | undefined {
     const region = countryToRegion(workerRegion);
-    if (!region) {
-        return proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
-    }
 
     const parsed = proxyIPs.map(ip => ({
         entry: ip,

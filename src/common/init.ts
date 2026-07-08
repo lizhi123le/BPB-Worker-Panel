@@ -118,8 +118,13 @@ export async function setSettings(request: Request, env: Env) {
     if (settings) {
         settings.cleanIPs = await resolveUrlEntries(settings.cleanIPs || []);
         settings.customCdnAddrs = await resolveUrlEntries(settings.customCdnAddrs || []);
+        settings.proxyIPs = await resolveUrlEntries(settings.proxyIPs || []);
     }
     globalThis.settings = settings;
+
+    // 对齐 cfnew：订阅生成时记录 Worker 所在地，用于静态预选 Proxy IP
+    const cf = (request as any).cf || {};
+    globalThis.workerRegion = cf.country || '';
 }
 
 export function init(request: Request, env: Env) {
