@@ -38,7 +38,7 @@ jobs:
         run: npm run check
         
       - name: Build project
-        run: NODE_ENV=production npm run build
+        run: npm run build
 
       - name: Read release note
         id: read_release
