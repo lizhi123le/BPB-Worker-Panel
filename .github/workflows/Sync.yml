@@ -146,7 +146,7 @@ jobs:
         run: echo "RELEASE_VERSION=$(jq -r .version package.json)" >> $GITHUB_ENV
 
       - name: Build
-        run: npm run build
+        run: NODE_ENV=production npm run build
 
       - name: Prepare release notes and collect artifacts
         id: prepare_artifacts
