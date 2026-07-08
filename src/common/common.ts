@@ -51,4 +51,24 @@ export function safeErrorMessage(error: any): string {
     return error instanceof Error ? error.message : String(error);
 }
 
+/** Alias for safeErrorMessage — matches upstream naming */
+export const safeError = safeErrorMessage;
+
+/** Decompress gzip-compressed base64-encoded data */
+export async function decompressGzipBase64(base64: string): Promise<string> {
+    const binaryStr = atob(base64);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+    }
+    return await new Response(
+        new ReadableStream({
+            start(c) {
+                c.enqueue(bytes);
+                c.close();
+            }
+        }).pipeThrough(new DecompressionStream('gzip'))
+    ).text();
+}
+
 
