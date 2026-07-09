@@ -157,6 +157,11 @@ declare global {
     var globalConfig: GlobalConfig;
     var httpConfig: HttpConfig;
     var wsConfig: WsConfig;
+    var __kvCache: {
+        settings: Settings | null;
+        timestamp: number;
+        version: string;
+    } | undefined;
     var workerRegion: string;
     var dict: {
         readonly _VL_: string;

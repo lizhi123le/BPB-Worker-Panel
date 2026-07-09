@@ -1,4 +1,4 @@
-import { init, initHttp, initWs } from '@init';
+import { init, initHttp, initWs, setSettings } from '@init';
 import {
 	fallback,
 	serveIcon,
@@ -21,6 +21,7 @@ export default {
 
 			if (upgradeHeader === 'websocket') {
 				initWs(env);
+				await setSettings(request, env);
 				return await handleWebsocket(request);
 			} else {
 				initHttp(request, env);

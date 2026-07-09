@@ -1,5 +1,6 @@
 import { Authenticate, generateJWTToken, resetPassword } from "@auth";
 import { getDataset, updateDataset } from "@kv";
+import { setKvCache, clearKvCache } from "../kv-cache";
 import { setSettings } from "@init";
 import { getClNormalConfig, getClWarpConfig } from "@clash/configs";
 import { getSbCustomConfig, getSbWarpConfig } from "@sing-box/configs";
@@ -8,7 +9,7 @@ import { fetchWarpAccounts } from "@warp";
 import { VlOverWSHandler } from "@vless";
 import { TrOverWSHandler } from "@trojan";
 import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
-import { buildEntryPortMap, countryToRegion, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, resetRemarkCounter, resolveDNS, selectProxyIPByRegion, selectSniHost } from "@utils";
+import { buildEntryPortMap, countryToRegion, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, resetRemarkCounter, resolveDNS, selectProxyIPByRegion, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
 export async function handleWebsocket(request: Request): Promise<Response> {
@@ -16,23 +17,61 @@ export async function handleWebsocket(request: Request): Promise<Response> {
     const encodedPathConfig = pathName.replace("/", "");
 
     try {
-        const { protocol, mode, panelIPs, regionMatch, wkRegion } = JSON.parse(atob(encodedPathConfig));
+        const parsed = JSON.parse(atob(encodedPathConfig));
+        const { protocol, mode, panelIPs: pathPanelIPs, regionMatch: pathRegionMatch, wkRegion: pathWkRegion } = parsed;
+
+        // ── 对齐 cfnew：配置来自 KV + URL query 参数，而非仅订阅 URL 路径 ──
+        // cfnew 优先级：URL query 参数 > KV 设置 > URL path > 内置默认值
+        // URL query: wk=Worker地区, rm=地区匹配(no关闭), p=ProxyIP
+        const reqUrl = new URL(request.url);
+        const queryWk = (reqUrl.searchParams.get('wk') || '').toUpperCase();
+        const queryRm = reqUrl.searchParams.get('rm');
+
+        const {
+            proxyIPs = [],
+            regionMatch: kvRegionMatch,
+            wkRegion: kvWkRegion,
+            proxyIPMode
+        } = globalThis.settings;
+
+        // 1. wkRegion：URL query wk > KV wkRegion > URL path wkRegion
+        const effectiveWkRegion = queryWk || kvWkRegion || pathWkRegion || '';
+
+        // 2. regionMatch：URL query rm(no=关闭) > KV regionMatch > URL path regionMatch > 默认开启
+        const effectiveRegionMatch = queryRm !== null
+            ? queryRm.toLowerCase() !== 'no'
+            : (kvRegionMatch ?? pathRegionMatch ?? true);
+
+        // 3. proxyIPs：
+        //    对齐 cfnew：KV proxyIPs（已由 setSettings resolveUrlEntries）> URL path panelIPs
+        //    > envProxyIPs（env.PROXY_IP 降级，cfnew 的 获取配置值('p', env.p)）> DEFAULT_PROXY_IPS
+        const envFallbackIPs = globalThis.wsConfig?.envProxyIPs
+            ? [globalThis.wsConfig.envProxyIPs]
+            : [];
+        const effectivePanelIPs = proxyIPs.length > 0
+            ? proxyIPs
+            : (pathPanelIPs && pathPanelIPs.length > 0 ? pathPanelIPs
+                : (envFallbackIPs.length > 0 ? envFallbackIPs : DEFAULT_PROXY_IPS));
+
+        // 4. proxyMode：KV proxyIPMode > URL path mode
+        const effectiveProxyMode = proxyIPMode || mode;
+
         globalThis.wsConfig = {
             ...globalThis.wsConfig,
             wsProtocol: protocol,
-            proxyMode: mode,
-            panelIPs: panelIPs,
-            regionMatch: regionMatch ?? false,
-            wkRegion: wkRegion || ''
+            proxyMode: effectiveProxyMode,
+            panelIPs: effectivePanelIPs,
+            regionMatch: effectiveRegionMatch,
+            wkRegion: effectiveWkRegion
         };
 
-        // Detect worker region: manual wkRegion override (from client config) > cf.country
+        // Detect worker region: manual wkRegion > cf.country
         const cfCountry = request.cf?.country;
-        globalThis.wsConfig.workerRegion = (wkRegion && wkRegion.trim()) ? wkRegion.trim() : (cfCountry || '');
+        globalThis.wsConfig.workerRegion = effectiveWkRegion || (cfCountry || '');
 
-        // 对齐 cfnew：连接时按请求的 cf.country 动态选择 Proxy IP，而非订阅生成时预锁死
-        if (regionMatch && globalThis.wsConfig.workerRegion && globalThis.wsConfig.panelIPs && globalThis.wsConfig.panelIPs.length > 0) {
-            const selected = selectProxyIPByRegion(globalThis.wsConfig.panelIPs, globalThis.wsConfig.workerRegion);
+        // 对齐 cfnew：连接时按请求的 cf.country 动态选择 Proxy IP
+        if (effectiveRegionMatch && globalThis.wsConfig.workerRegion && effectivePanelIPs.length > 0) {
+            const selected = selectProxyIPByRegion(effectivePanelIPs, globalThis.wsConfig.workerRegion);
             if (selected) {
                 globalThis.wsConfig.panelIPs = [selected];
             }
@@ -264,6 +303,10 @@ async function resetSettings(request: Request, env: Env): Promise<Response> {
     try {
         const { settings } = globalThis;
         await env.kv.put("proxySettings", JSON.stringify(settings));
+        // 对齐 cfnew：重置后更新版本键 + 填充内存缓存
+        const newVer = String(Date.now());
+        await env.kv.put("proxySettings_ver", newVer).catch(() => {});
+        setKvCache(settings, newVer);
         return respond(true, HttpStatus.OK, '', settings);
     } catch (error) {
         console.log(error);

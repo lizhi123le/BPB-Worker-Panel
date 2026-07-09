@@ -15,6 +15,10 @@ export async function handleTCPOutBound(
     VLResponseHeader: Uint8Array<ArrayBuffer> | null,
     log: Function
 ) {
+    // 保存原始目标地址，兜底直连时使用
+    const originalAddress = addressRemote;
+    const originalPort = portRemote;
+
     async function connectAndWrite(address: string, port: number): Promise<Socket> {
         // if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(address)) address = `${atob('d3d3Lg==')}${address}${atob('LnNzbGlwLmlv')}`;
         const tcpSocket = connect({
@@ -39,59 +43,82 @@ export async function handleTCPOutBound(
         return tcpSocket;
     }
 
-    async function retry() {
-        const {
-            proxyMode,
-            panelIPs,
-            envProxyIPs,
-            defaultProxyIPs,
-            envPrefixes,
-            defaultPrefixes
-        } = globalThis.wsConfig;
+    const getRandomValue = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
+    const parseIPs = (value: string) => value ? value.split(',').map(val => val.trim()).filter(Boolean) : undefined;
 
-        const getRandomValue = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
-        const parseIPs = (value: string) => value ? value.split(',').map(val => val.trim()).filter(Boolean) : undefined;
-
-        if (proxyMode === 'proxyip') {
-            log(`direct connection failed, trying to use Proxy IP for ${addressRemote}`);
-            const proxyIPs = panelIPs?.length ? panelIPs : parseIPs(envProxyIPs) ?? defaultProxyIPs;
-            const { regionMatch, workerRegion } = globalThis.wsConfig;
-            const proxyIP = (regionMatch && workerRegion)
-                ? (selectProxyIPByRegion(proxyIPs, workerRegion) ?? getRandomValue(proxyIPs))
-                : getRandomValue(proxyIPs);
-            const cleanIP = stripRegionTag(proxyIP);
-            const { host, port } = parseHostPort(cleanIP, true);
-            addressRemote = host || addressRemote;
-            portRemote = port || portRemote;
-        } else if (proxyMode === 'prefix') {
-            log(`direct connection failed, trying to generate dynamic prefix for ${addressRemote}`);
-            const prefixes = panelIPs?.length ? panelIPs : parseIPs(envPrefixes) ?? defaultPrefixes;
-            const prefix = getRandomValue(prefixes);
-            const dynamicProxyIP = await getDynamicProxyIP(addressRemote, prefix);
-
-            if (dynamicProxyIP) {
-                addressRemote = dynamicProxyIP;
-            } else {
-                webSocket.close(1011, 'Retry connection failed: Invalid Prefix');
-            }
-        }
-
+    // 兜底：直连原始目标地址
+    async function fallbackDirect() {
+        log(`proxy IP failed, falling back to direct connection for ${originalAddress}`);
         try {
-            const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+            const tcpSocket = await connectAndWrite(originalAddress, originalPort);
             tcpSocket.closed
-                .catch(error => console.log('retry TCP socket closed error', error))
+                .catch(error => console.log('direct TCP socket closed error', error))
                 .finally(() => safeCloseWebSocket(webSocket));
-
             remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
         } catch (error) {
-            console.error('Retry connection failed:', error);
-            webSocket.close(1011, `Retry connection failed: ${safeErrorMessage(error)}`);
+            console.error('Direct connection failed:', error);
+            webSocket.close(1011, `Direct connection failed: ${safeErrorMessage(error)}`);
         }
     }
 
+    // prefix 兜底：直连无数据返回时，用 prefix 生成动态 IP
+    async function fallbackPrefix() {
+        log(`direct connection idle, trying prefix-generated IP for ${originalAddress}`);
+        const { panelIPs, envPrefixes, defaultPrefixes } = globalThis.wsConfig;
+        const prefixes = panelIPs?.length ? panelIPs : parseIPs(envPrefixes) ?? defaultPrefixes;
+        const prefix = getRandomValue(prefixes);
+
+        try {
+            const dynamicProxyIP = await getDynamicProxyIP(originalAddress, prefix);
+            if (!dynamicProxyIP) {
+                webSocket.close(1011, 'Retry connection failed: Invalid Prefix');
+                return;
+            }
+            log(`trying prefix IP ${dynamicProxyIP}:${originalPort}`);
+            const tcpSocket = await connectAndWrite(dynamicProxyIP, originalPort);
+            tcpSocket.closed
+                .catch(error => console.log('prefix TCP socket closed error', error))
+                .finally(() => safeCloseWebSocket(webSocket));
+            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+        } catch (error) {
+            console.error('Prefix retry failed:', error);
+            webSocket.close(1011, `Prefix retry failed: ${safeErrorMessage(error)}`);
+        }
+    }
+
+    // 首次连接：优先使用代理 IP（区域匹配），直连作为兜底
+    const { proxyMode, panelIPs, envProxyIPs, envPrefixes, defaultProxyIPs, defaultPrefixes } = globalThis.wsConfig;
+
+    if (proxyMode === 'proxyip') {
+        const proxyIPs = panelIPs?.length ? panelIPs : parseIPs(envProxyIPs) ?? defaultProxyIPs;
+        const { regionMatch, workerRegion } = globalThis.wsConfig;
+        const proxyIP = (regionMatch && workerRegion)
+            ? (selectProxyIPByRegion(proxyIPs, workerRegion) ?? getRandomValue(proxyIPs))
+            : getRandomValue(proxyIPs);
+        const cleanIP = stripRegionTag(proxyIP);
+        const { host, port } = parseHostPort(cleanIP, true);
+        const proxyAddr = host || originalAddress;
+        const proxyPort = port || originalPort;
+
+        try {
+            log(`trying Proxy IP ${proxyAddr}:${proxyPort} for ${originalAddress}`);
+            const tcpSocket = await connectAndWrite(proxyAddr, proxyPort);
+            // proxy IP 连接成功但无数据返回时，降级直连
+            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, fallbackDirect, log);
+            return;
+        } catch (error) {
+            console.error(`Proxy IP connection failed: ${error}`);
+            log(`proxy IP failed, falling back to direct connection`);
+            // 代理 IP 连接失败，直接降级直连
+        }
+    }
+
+    // 降级或非 proxyip 模式：直接连接目标地址
     try {
-        const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-        remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, retry, log);
+        const tcpSocket = await connectAndWrite(originalAddress, originalPort);
+        // prefix 模式：直连无数据时用 prefix 生成动态 IP 重试
+        const retryFn = proxyMode === 'prefix' ? fallbackPrefix : null;
+        remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, retryFn, log);
     } catch (error) {
         console.error(`Connection failed: ${error}`);
         webSocket.close(1011, `Connection failed: ${safeErrorMessage(error)}`);

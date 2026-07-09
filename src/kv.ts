@@ -1,6 +1,7 @@
 import { fetchWarpAccounts } from '@warp';
 import { getDomain, parseHostPort, resolveDNS } from '@utils';
 import { base64DecodeUtf8, safeErrorMessage } from '@common';
+import { getKvCache, setKvCache, clearKvCache } from './kv-cache';
 
 export async function getDataset(
     request: Request,
@@ -10,11 +11,17 @@ export async function getDataset(
     let proxySettings: Settings | null, warpAccounts: WarpAccount[] | null;
 
     try {
-        proxySettings = await env.kv.get("proxySettings", { type: 'json' });
+        // 对齐 cfnew：通过内存缓存读取，减少 KV 读取次数
+        proxySettings = await getKvCache(env);
         warpAccounts = await env.kv.get('warpAccounts', { type: 'json' });
 
         if (!proxySettings) {
+            // KV 尚无配置（首次部署）→ 写入默认值
+            const initVer = String(Date.now());
             await env.kv.put("proxySettings", JSON.stringify(settings));
+            await env.kv.put("proxySettings_ver", initVer);
+            // 直接填充缓存，避免下一个请求再读 KV
+            setKvCache(settings, initVer);
             proxySettings = settings;
         }
 
@@ -28,6 +35,8 @@ export async function getDataset(
         }
 
         if (panelVersion !== proxySettings.panelVersion) {
+            // 迁移前清缓存，使 updateDataset 读取最新 KV 数据而非 5min 内的旧缓存
+            clearKvCache();
             proxySettings = await updateDataset(request, env);
         }
 
@@ -47,7 +56,8 @@ export async function updateDataset(request: Request, env: Env): Promise<Setting
     let currentSettings: Settings | null;
 
     try {
-        currentSettings = await env.kv.get("proxySettings", { type: 'json' });
+        // 对齐 cfnew：通过缓存读取当前配置
+        currentSettings = await getKvCache(env);
     } catch (error) {
         console.log(error);
         throw new Error(`An error occurred while getting current KV settings: ${safeErrorMessage(error)}`);
@@ -158,6 +168,11 @@ export async function updateDataset(request: Request, env: Env): Promise<Setting
 
     try {
         await env.kv.put("proxySettings", JSON.stringify(updatedSettings));
+        // 对齐 cfnew：写入后更新版本键，使其它 isolate 在下个请求时检测变更
+        const newVer = String(Date.now());
+        await env.kv.put("proxySettings_ver", newVer).catch(() => {});
+        // 对齐 cfnew：前端保存后直接填充内存缓存，后续请求 0 KV 读取
+        setKvCache(updatedSettings, newVer);
         return updatedSettings;
     } catch (error) {
         console.log(error);
