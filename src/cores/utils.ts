@@ -645,7 +645,7 @@ export function selectProxyIPByRegion(proxyIPs: string[], workerRegion: string):
 
     const tagged = parsed.filter(p => p.parsed.region);
     if (tagged.length === 0) {
-        return proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+        return proxyIPs[0];
     }
 
     const priorityRegions = getRegionPriorityList(region);
@@ -653,11 +653,9 @@ export function selectProxyIPByRegion(proxyIPs: string[], workerRegion: string):
     for (const targetRegion of priorityRegions) {
         const matches = tagged.filter(p => p.parsed.region === targetRegion);
         if (matches.length > 0) {
-            return matches[Math.floor(Math.random() * matches.length)].entry;
+            return matches[0].entry;
         }
     }
 
-    return tagged.length > 0
-        ? tagged[Math.floor(Math.random() * tagged.length)].entry
-        : proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+    return tagged[0].entry;
 }

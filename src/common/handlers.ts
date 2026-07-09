@@ -66,8 +66,12 @@ export async function handleWebsocket(request: Request): Promise<Response> {
         };
 
         // Detect worker region: manual wkRegion > cf.country
+        // 对齐 cfnew：自定义 proxyIP（用户通过面板手动设置）且未设 wkRegion 时，
+        // 不自动检测 cf.country（cfnew CUSTOM 语义），由用户显式指定地区或关闭匹配
+        const hasCustomProxyIPs = proxyIPs.length > 0;
         const cfCountry = request.cf?.country;
-        globalThis.wsConfig.workerRegion = effectiveWkRegion || (cfCountry || '');
+        globalThis.wsConfig.workerRegion = effectiveWkRegion
+            || (hasCustomProxyIPs ? '' : (cfCountry || ''));
 
         // 对齐 cfnew：连接时按请求的 cf.country 动态选择 Proxy IP
         if (effectiveRegionMatch && globalThis.wsConfig.workerRegion && effectivePanelIPs.length > 0) {
