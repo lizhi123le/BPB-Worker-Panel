@@ -8,7 +8,7 @@ import { fetchWarpAccounts } from "@warp";
 import { VlOverWSHandler } from "@vless";
 import { TrOverWSHandler } from "@trojan";
 import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
-import { buildEntryPortMap, countryToRegion, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, resetRemarkCounter, resolveDNS, selectSniHost } from "@utils";
+import { buildEntryPortMap, countryToRegion, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, resetRemarkCounter, resolveDNS, selectProxyIPByRegion, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
 export async function handleWebsocket(request: Request): Promise<Response> {
@@ -29,6 +29,14 @@ export async function handleWebsocket(request: Request): Promise<Response> {
         // Detect worker region: manual wkRegion override (from client config) > cf.country
         const cfCountry = request.cf?.country;
         globalThis.wsConfig.workerRegion = (wkRegion && wkRegion.trim()) ? wkRegion.trim() : (cfCountry || '');
+
+        // 对齐 cfnew：连接时按请求的 cf.country 动态选择 Proxy IP，而非订阅生成时预锁死
+        if (regionMatch && globalThis.wsConfig.workerRegion && globalThis.wsConfig.panelIPs && globalThis.wsConfig.panelIPs.length > 0) {
+            const selected = selectProxyIPByRegion(globalThis.wsConfig.panelIPs, globalThis.wsConfig.workerRegion);
+            if (selected) {
+                globalThis.wsConfig.panelIPs = [selected];
+            }
+        }
 
         switch (protocol) {
             case 'vl':

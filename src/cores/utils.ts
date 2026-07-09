@@ -239,33 +239,15 @@ export function generateWsPath(protocol: string): string {
         ? DEFAULT_PROXY_IPS
         : proxyIPs;
 
-    // 对齐 cfnew：订阅时静态预选 Proxy IP，而非连接时动态选择
-    let selectedIPs: string[];
-    let effectiveRegionMatch = regionMatch;
-
-    if (proxyIPMode === 'proxyip' && regionMatch) {
-        const wr = globalThis.workerRegion || '';
-        if (wr && effectiveIPs.length > 0) {
-            const selected = selectProxyIPByRegion(effectiveIPs, wr);
-            if (selected) {
-                selectedIPs = [selected];          // 只嵌入匹配到的单一 IP
-                effectiveRegionMatch = false;       // 静态预选后连接时不再需要动态匹配
-            } else {
-                selectedIPs = effectiveIPs;         // fallback：全部传入
-            }
-        } else {
-            selectedIPs = effectiveIPs;
-        }
-    } else {
-        selectedIPs = proxyIPMode === 'proxyip' ? effectiveIPs : prefixes;
-    }
+    // 对齐 cfnew：传递全部 IP 到连接时动态选择（handleWebsocket 中按 cf.country 实时匹配），不在订阅生成时预锁死
+    const selectedIPs = proxyIPMode === 'proxyip' ? effectiveIPs : prefixes;
 
     const config = {
         junk: getRandomString(8, 16),
         protocol: protocol === _VL_ ? "vl" : "tr",
         mode: proxyIPMode,
         panelIPs: selectedIPs,
-        regionMatch: effectiveRegionMatch,
+        regionMatch: regionMatch,
         wkRegion: wkRegion || ''
     };
 
