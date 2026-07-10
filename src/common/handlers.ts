@@ -18,10 +18,10 @@ export async function handleWebsocket(request: Request): Promise<Response> {
 
     try {
         const parsed = JSON.parse(atob(encodedPathConfig));
-        const { protocol, mode, panelIPs: pathPanelIPs, regionMatch: pathRegionMatch, wkRegion: pathWkRegion } = parsed;
+        const { protocol } = parsed;
 
-        // ── 对齐 cfnew：配置来自 KV + URL query 参数，而非仅订阅 URL 路径 ──
-        // cfnew 优先级：URL query 参数 > KV 设置 > URL path > 内置默认值
+        // ── 对齐 cfnew：路径不包含代理IP/地区信息，配置完全来自 KV + URL query ──
+        // cfnew 优先级：URL query 参数 > KV 设置 > 内置默认值
         // URL query: wk=Worker地区, rm=地区匹配(no关闭), p=ProxyIP
         const reqUrl = new URL(request.url);
         const queryWk = (reqUrl.searchParams.get('wk') || '').toUpperCase();
@@ -34,32 +34,26 @@ export async function handleWebsocket(request: Request): Promise<Response> {
             proxyIPMode
         } = globalThis.settings;
 
-        // 1. wkRegion：URL query wk > KV wkRegion > URL path wkRegion
-        const effectiveWkRegion = queryWk || kvWkRegion || pathWkRegion || '';
+        // 1. wkRegion：URL query wk > KV wkRegion > 空（由 cf.country 自动检测）
+        const effectiveWkRegion = queryWk || kvWkRegion || '';
 
-        // 2. regionMatch：URL query rm(no=关闭) > KV regionMatch > URL path regionMatch > 默认开启
+        // 2. regionMatch：URL query rm(no=关闭) > KV regionMatch > 默认开启
         const effectiveRegionMatch = queryRm !== null
             ? queryRm.toLowerCase() !== 'no'
-            : (kvRegionMatch ?? pathRegionMatch ?? true);
+            : (kvRegionMatch ?? true);
 
-        // 3. proxyIPs：
-        //    对齐 cfnew：KV proxyIPs（已由 setSettings resolveUrlEntries）> URL path panelIPs
-        //    > envProxyIPs（env.PROXY_IP 降级，cfnew 的 获取配置值('p', env.p)）> DEFAULT_PROXY_IPS
+        // 3. proxyIPs：KV proxyIPs > envProxyIPs > DEFAULT_PROXY_IPS（对齐 cfnew 备用地址列表）
         const envFallbackIPs = globalThis.wsConfig?.envProxyIPs
             ? [globalThis.wsConfig.envProxyIPs]
             : [];
         const effectivePanelIPs = proxyIPs.length > 0
             ? proxyIPs
-            : (pathPanelIPs && pathPanelIPs.length > 0 ? pathPanelIPs
-                : (envFallbackIPs.length > 0 ? envFallbackIPs : DEFAULT_PROXY_IPS));
-
-        // 4. proxyMode：KV proxyIPMode > URL path mode
-        const effectiveProxyMode = proxyIPMode || mode;
+            : (envFallbackIPs.length > 0 ? envFallbackIPs : DEFAULT_PROXY_IPS);
 
         globalThis.wsConfig = {
             ...globalThis.wsConfig,
             wsProtocol: protocol,
-            proxyMode: effectiveProxyMode,
+            proxyMode: proxyIPMode,
             panelIPs: effectivePanelIPs,
             regionMatch: effectiveRegionMatch,
             wkRegion: effectiveWkRegion
@@ -73,7 +67,7 @@ export async function handleWebsocket(request: Request): Promise<Response> {
         globalThis.wsConfig.workerRegion = effectiveWkRegion
             || (hasCustomProxyIPs ? '' : (cfCountry || ''));
 
-        // 对齐 cfnew：连接时按请求的 cf.country 动态选择 Proxy IP
+        // 对齐 cfnew：连接时按 workerRegion 动态选择 Proxy IP（服务端选择，不暴露给客户端）
         if (effectiveRegionMatch && globalThis.wsConfig.workerRegion && effectivePanelIPs.length > 0) {
             const selected = selectProxyIPByRegion(effectivePanelIPs, globalThis.wsConfig.workerRegion);
             if (selected) {

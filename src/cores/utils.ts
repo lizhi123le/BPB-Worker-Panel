@@ -229,26 +229,13 @@ export function getRandomString(lengthMin: number, lengthMax: number): string {
 }
 
 export function generateWsPath(protocol: string): string {
-    const {
-        settings: { proxyIPMode, proxyIPs, prefixes, regionMatch, wkRegion },
-        dict: { _VL_ }
-    } = globalThis;
+    const { dict: { _VL_ } } = globalThis;
 
-    // 3 层回退：用户配置 → URL 拉取(resolveUrlEntries 已在 init 时合并) → 内置默认
-    const effectiveIPs = (proxyIPMode === 'proxyip' && proxyIPs.length === 0)
-        ? DEFAULT_PROXY_IPS
-        : proxyIPs;
-
-    // 对齐 cfnew：传递全部 IP 到连接时动态选择（handleWebsocket 中按 cf.country 实时匹配），不在订阅生成时预锁死
-    const selectedIPs = proxyIPMode === 'proxyip' ? effectiveIPs : prefixes;
-
+    // 对齐 cfnew：路径不包含代理IP/地区信息，仅保留 protocol 用于协议识别
+    // 代理IP选择完全在服务端 handleWebsocket 中完成（KV → DEFAULT_PROXY_IPS 回退）
     const config = {
         junk: getRandomString(8, 16),
         protocol: protocol === _VL_ ? "vl" : "tr",
-        mode: proxyIPMode,
-        panelIPs: selectedIPs,
-        regionMatch: regionMatch,
-        wkRegion: wkRegion || ''
     };
 
     return `/${btoa(JSON.stringify(config))}`;
