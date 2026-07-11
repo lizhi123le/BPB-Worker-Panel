@@ -65,7 +65,7 @@ export async function handleWebsocket(request: Request): Promise<Response> {
         const hasCustomProxyIPs = proxyIPs.length > 0;
         const cfCountry = request.cf?.country;
         globalThis.wsConfig.workerRegion = effectiveWkRegion
-            || (hasCustomProxyIPs ? '' : (cfCountry || ''));
+            || (hasCustomProxyIPs ? '' : String(cfCountry ?? ''));
 
         // 对齐 cfnew：连接时按 workerRegion 动态选择 Proxy IP（服务端选择，不暴露给客户端）
         if (effectiveRegionMatch && globalThis.wsConfig.workerRegion && effectivePanelIPs.length > 0) {
