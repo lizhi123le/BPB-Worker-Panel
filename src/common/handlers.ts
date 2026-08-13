@@ -6,89 +6,73 @@ import { getClNormalConfig, getClWarpConfig } from "@clash/configs";
 import { getSbCustomConfig, getSbWarpConfig } from "@sing-box/configs";
 import { getXrCustomConfigs, getXrWarpConfigs } from "@xray/configs";
 import { fetchWarpAccounts } from "@warp";
-import { VlOverWSHandler } from "@vless";
-import { TrOverWSHandler } from "@trojan";
+import { UnifiedWSHandler } from "@unified";
 import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
-import { buildEntryPortMap, countryToRegion, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, resetRemarkCounter, resolveDNS, selectProxyIPByRegion, selectSniHost } from "@utils";
+import { buildEntryPortMap, countryToRegion, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
-export async function handleWebsocket(request: Request): Promise<Response> {
-    const { pathName } = globalThis.globalConfig;
-    const encodedPathConfig = pathName.replace("/", "");
+export async function handleWebsocket(request: Request, env: Env): Promise<Response> {
+    // 对齐 cfnew：路径不包含协议信息，协议由首包内容自动识别
+    // 客户端统一连接同一个 WS 端点，服务端根据首包判断 VLESS 或 Trojan
 
-    try {
-        const parsed = JSON.parse(atob(encodedPathConfig));
-        const { protocol } = parsed;
+    const reqUrl = new URL(request.url);
+    const queryWk = (reqUrl.searchParams.get('wk') || '').toUpperCase();
+    const queryRm = reqUrl.searchParams.get('rm');
 
-        // ── 对齐 cfnew：路径不包含代理IP/地区信息，配置完全来自 KV + URL query ──
-        // cfnew 优先级：URL query 参数 > KV 设置 > 内置默认值
-        // URL query: wk=Worker地区, rm=地区匹配(no关闭), p=ProxyIP
-        const reqUrl = new URL(request.url);
-        const queryWk = (reqUrl.searchParams.get('wk') || '').toUpperCase();
-        const queryRm = reqUrl.searchParams.get('rm');
+    const {
+        regionMatch: kvRegionMatch,
+        wkRegion: kvWkRegion,
+        proxyIPMode
+    } = globalThis.settings;
+    const rawProxyIPs = globalThis.settings.proxyIPs || [];
+    const proxyIPs = await resolveUrlEntries(rawProxyIPs, env); // 连接时解析（带 KV 缓存）
 
-        const {
-            proxyIPs = [],
-            regionMatch: kvRegionMatch,
-            wkRegion: kvWkRegion,
-            proxyIPMode
-        } = globalThis.settings;
+    // 1. wkRegion：URL query wk > KV wkRegion > 空（由 cf.country 自动检测）
+    const effectiveWkRegion = queryWk || kvWkRegion || '';
 
-        // 1. wkRegion：URL query wk > KV wkRegion > 空（由 cf.country 自动检测）
-        const effectiveWkRegion = queryWk || kvWkRegion || '';
+    // 2. regionMatch：URL query rm(no=关闭) > KV regionMatch > 默认开启
+    const effectiveRegionMatch = queryRm !== null
+        ? queryRm.toLowerCase() !== 'no'
+        : (kvRegionMatch ?? true);
 
-        // 2. regionMatch：URL query rm(no=关闭) > KV regionMatch > 默认开启
-        const effectiveRegionMatch = queryRm !== null
-            ? queryRm.toLowerCase() !== 'no'
-            : (kvRegionMatch ?? true);
+    // 3. proxyIPs：KV proxyIPs > envProxyIPs > DEFAULT_PROXY_IPS（对齐 cfnew 备用地址列表）
+    const envFallbackIPs = globalThis.wsConfig?.envProxyIPs
+        ? [globalThis.wsConfig.envProxyIPs]
+        : [];
+    // 自定义代理 = 面板手动设置的 proxyIPs 非空，或配置了 env PROXY_IP（envFallbackIPs 非空）。
+    // 写入 wsConfig.hasCustomProxyIPs：未配置自定义代理时直连优先（cfnew 默认策略），
+    // 与上方 effectivePanelIPs 的取值链（proxyIPs > envFallbackIPs > DEFAULT_PROXY_IPS）保持一致。
+    const hasCustomProxyIPs = proxyIPs.length > 0 || envFallbackIPs.length > 0;
+    const effectivePanelIPs = proxyIPs.length > 0
+        ? proxyIPs
+        : (envFallbackIPs.length > 0 ? envFallbackIPs : DEFAULT_PROXY_IPS);
 
-        // 3. proxyIPs：KV proxyIPs > envProxyIPs > DEFAULT_PROXY_IPS（对齐 cfnew 备用地址列表）
-        const envFallbackIPs = globalThis.wsConfig?.envProxyIPs
-            ? [globalThis.wsConfig.envProxyIPs]
-            : [];
-        const effectivePanelIPs = proxyIPs.length > 0
-            ? proxyIPs
-            : (envFallbackIPs.length > 0 ? envFallbackIPs : DEFAULT_PROXY_IPS);
+    globalThis.wsConfig = {
+        ...globalThis.wsConfig,
+        proxyMode: proxyIPMode,
+        panelIPs: effectivePanelIPs,
+        regionMatch: effectiveRegionMatch,
+        wkRegion: effectiveWkRegion,
+        hasCustomProxyIPs
+    };
 
-        globalThis.wsConfig = {
-            ...globalThis.wsConfig,
-            wsProtocol: protocol,
-            proxyMode: proxyIPMode,
-            panelIPs: effectivePanelIPs,
-            regionMatch: effectiveRegionMatch,
-            wkRegion: effectiveWkRegion
-        };
+    // Detect worker region: manual wkRegion > cf.country
+    // 对齐 cfnew：自定义 proxyIP（用户通过面板手动设置）且未设 wkRegion 时，
+    // 不自动检测 cf.country（cfnew CUSTOM 语义），由用户显式指定地区或关闭匹配
+    const cfCountry = request.cf?.country;
+    globalThis.wsConfig.workerRegion = effectiveWkRegion
+        || (hasCustomProxyIPs ? '' : String(cfCountry ?? ''));
 
-        // Detect worker region: manual wkRegion > cf.country
-        // 对齐 cfnew：自定义 proxyIP（用户通过面板手动设置）且未设 wkRegion 时，
-        // 不自动检测 cf.country（cfnew CUSTOM 语义），由用户显式指定地区或关闭匹配
-        const hasCustomProxyIPs = proxyIPs.length > 0;
-        const cfCountry = request.cf?.country;
-        globalThis.wsConfig.workerRegion = effectiveWkRegion
-            || (hasCustomProxyIPs ? '' : String(cfCountry ?? ''));
-
-        // 对齐 cfnew：连接时按 workerRegion 动态选择 Proxy IP（服务端选择，不暴露给客户端）
-        if (effectiveRegionMatch && globalThis.wsConfig.workerRegion && effectivePanelIPs.length > 0) {
-            const selected = selectProxyIPByRegion(effectivePanelIPs, globalThis.wsConfig.workerRegion);
-            if (selected) {
-                globalThis.wsConfig.panelIPs = [selected];
-            }
+    // 对齐 cfnew：连接时按 workerRegion 动态选择 Proxy IP（服务端选择，不暴露给客户端）
+    if (effectiveRegionMatch && globalThis.wsConfig.workerRegion && effectivePanelIPs.length > 0) {
+        const selected = selectProxyIPByRegion(effectivePanelIPs, globalThis.wsConfig.workerRegion);
+        if (selected) {
+            globalThis.wsConfig.panelIPs = [selected];
         }
-
-        switch (protocol) {
-            case 'vl':
-                return await VlOverWSHandler(request);
-
-            case 'tr':
-                return await TrOverWSHandler(request);
-
-            default:
-                return await fallback(request);
-        }
-
-    } catch (error) {
-        return new Response('Failed to parse WebSocket path config', { status: HttpStatus.BAD_REQUEST });
     }
+
+    // 使用统一处理器，协议由首包内容自动识别
+    return await UnifiedWSHandler(request);
 }
 
 export async function handlePanel(request: Request, env: Env): Promise<Response> {
@@ -189,6 +173,10 @@ export function logout(): Response {
 
 export async function handleSubscriptions(request: Request, env: Env): Promise<Response> {
     await setSettings(request, env);
+    // 仅在拉取订阅时解析 cleanIPs / customCdnAddrs 的 URL 并写入 KV 缓存；
+    // 前端设置只保存 URL 本身，不展示解析后的地址
+    globalThis.settings.cleanIPs = await resolveUrlEntries(globalThis.settings.cleanIPs || [], env);
+    globalThis.settings.customCdnAddrs = await resolveUrlEntries(globalThis.settings.customCdnAddrs || [], env);
     const {
         globalConfig: { pathName },
         httpConfig: { client, subPath }
@@ -684,7 +672,7 @@ export async function getURLConfigs() {
             config.username = TrPass;
         }
 
-        const path = generateWsPath(protocol);
+        const path = generateWsPath();
         config.hostname = parseHostPort(addr, true).host;
         config.port = port.toString();
         config.searchParams.append('host', host);
@@ -697,7 +685,8 @@ export async function getURLConfigs() {
             config.searchParams.append('ed', '2560');
             config.searchParams.append('path', path);
         } else {
-            config.searchParams.append('path', `${path}?ed=2560`);
+            config.searchParams.append('path', path);
+            config.searchParams.append('ed', '2560');
         }
 
         if (isTLS) {

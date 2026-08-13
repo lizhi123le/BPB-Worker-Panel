@@ -288,8 +288,7 @@ async function uploadSettings(event) {
     try {
         const text = await file.text();
         const data = JSON.parse(decodeURIComponent(escape(atob(text))));
-        updateSettings(event, settings);
-        initiatePanel(settings);
+        updateSettings(event, data);
     } catch (err) {
         console.error('Failed to import settings:', err.message);
     }

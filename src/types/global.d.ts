@@ -28,6 +28,9 @@ declare global {
         workerRegion?: string;
         regionMatch?: boolean;
         wkRegion?: string;
+        // 用户是否显式配置了自定义代理 IP（settings.proxyIPs 或 env PROXY_IP），
+        // 区别于 DEFAULT_PROXY_IPS 公共备用中继。false 时连接走直连优先策略（对齐 cfnew）。
+        hasCustomProxyIPs?: boolean;
     }
 
     interface Env {

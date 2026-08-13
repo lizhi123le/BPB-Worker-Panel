@@ -7,7 +7,8 @@ export async function getDataset(
     request: Request,
     env: Env
 ): Promise<{ settings: Settings, warpAccounts: WarpAccount[] }> {
-    const { httpConfig: { panelVersion }, settings } = globalThis;
+    const { httpConfig, settings } = globalThis;
+    const panelVersion = httpConfig?.panelVersion;
     let proxySettings: Settings | null, warpAccounts: WarpAccount[] | null;
 
     try {
@@ -34,7 +35,7 @@ export async function getDataset(
             warpAccounts = await fetchWarpAccounts(env);
         }
 
-        if (panelVersion !== proxySettings.panelVersion) {
+        if (panelVersion && panelVersion !== proxySettings.panelVersion) {
             // 迁移前清缓存，使 updateDataset 读取最新 KV 数据而非 5min 内的旧缓存
             clearKvCache();
             proxySettings = await updateDataset(request, env);
@@ -51,7 +52,8 @@ export async function getDataset(
 }
 
 export async function updateDataset(request: Request, env: Env): Promise<Settings> {
-    const { settings, httpConfig: { panelVersion } } = globalThis;
+    const { settings, httpConfig } = globalThis;
+    const panelVersion = httpConfig?.panelVersion;
     const newSettings: Settings | null = request.method === 'PUT' ? await request.json() : null;
     let currentSettings: Settings | null;
 

@@ -116,7 +116,7 @@ export function buildWebsocketOutbound(
 
     const streamSettings: StreamSettings = {
         network: "ws",
-        ...buildTransport("ws", "none", `${generateWsPath(protocol)}?ed=2560`, host),
+        ...buildTransport("ws", "none", generateWsPath(), host),
         security: isTLS ? "tls" : "none",
         tlsSettings,
         sockopt: buildSockopt(true, enableTFO, "UseIP"),

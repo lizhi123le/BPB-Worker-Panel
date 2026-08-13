@@ -1,6 +1,6 @@
+let uuid, password, uriPath;
 localStorage.getItem('darkMode') === 'enabled' && document.body.classList.add('dark-mode');
 generateCredentials();
-let uuid, password, uriPath;
 
 function generateUUID() {
     return crypto.randomUUID();

@@ -76,7 +76,7 @@ export function buildWebsocketOutbound(
 
     const pickedEch = enableECH && !isFragment ? pickRandomEch(echServerName) : undefined;
     const { host, sni, allowInsecure } = selectSniHost(address, pickRandomEch(hostSniList));
-    const transport = buildTransport("ws", "none", generateWsPath(protocol), host, undefined, 2560);
+    const transport = buildTransport("ws", "none", generateWsPath(), host, undefined, 2560);
     const tls = isHttps(port) || address === upstreamServer
         ? buildTLS(
             "tls",

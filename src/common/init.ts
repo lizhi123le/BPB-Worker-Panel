@@ -116,9 +116,8 @@ export async function setSettings(request: Request, env: Env) {
     const dataset = await getDataset(request, env);
     const settings = dataset.settings;
     if (settings) {
-        settings.cleanIPs = await resolveUrlEntries(settings.cleanIPs || []);
-        settings.customCdnAddrs = await resolveUrlEntries(settings.customCdnAddrs || []);
-        settings.proxyIPs = await resolveUrlEntries(settings.proxyIPs || []);
+        // URL 不再在此解析（原会在每次请求都 fetch）；改为在订阅拉取 / 连接时按需解析并缓存
+        Object.assign(globalThis.settings, settings);
     }
     // 合并而非替换，确保新字段（alpn, hostSniList, regionMatch 等）不会被旧 KV 数据覆盖
     Object.assign(globalThis.settings, settings);
@@ -152,7 +151,8 @@ export function initWs(env: any) {
             '[2a02:898:146:64::]',
             '[2602:fc59:b0:64::]',
             '[2602:fc59:11:64::]'
-        ]
+        ],
+        proxyMode: 'proxyip' // 默认模式，后续由 handleWebsocket 根据 settings 覆盖
     };
 }
 

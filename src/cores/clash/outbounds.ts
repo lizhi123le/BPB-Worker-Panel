@@ -82,7 +82,7 @@ export function buildWebsocketOutbound(
         fingerprint
     ) : {};
     
-    const transport = buildTransport("ws", undefined, generateWsPath(protocol), host, undefined, 2560);
+    const transport = buildTransport("ws", undefined, generateWsPath(), host, undefined, 2560);
 
     if (protocol === _VL_) return buildOutbound<VlessOutbound>(remark, protocol, address, port, enableIPv6, enableTFO, tls, transport, {
         "uuid": userID,

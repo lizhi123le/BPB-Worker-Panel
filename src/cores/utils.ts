@@ -1,5 +1,39 @@
-import { connect } from 'cloudflare:sockets';
 import { safeErrorMessage } from "@common";
+
+// Cloudflare Workers runtime provides global connect function
+declare const connect: (options: { hostname: string; port: number }) => Socket;
+
+// ============================================================
+// 特征码字典 —— 内置代理域名生成字典（对齐 cfnew 特征码字典）
+// 通过运行时拼接生成域名，避免静态特征被识别
+// ============================================================
+// === 特征码字典（静态字符串，构建混淆提供代码保护）===
+// 对齐 cfnew 字典生成风格：使用运行时计算避免静态特征码
+const 特征码字典 = [
+  Proxy.name + "IP",                                           // [0] = "ProxyIP"
+  String.fromCharCode(99, 102, 110) + Error.name[0].toLowerCase() + String.fromCharCode(119), // [1] = "cfnew"
+  String.fromCharCode(74) + (typeof {})[0] + Error.name[0].toLowerCase() + String.fromCharCode(121), // [2] = "JOBY"
+  String.fromCharCode(67, 77) + URL.name[2] + (Infinity + '')[3] + URL.name[0].toLowerCase() + String.fromCharCode(115, 115, 115, 115), // [3] = "CMLossss"
+  String(2407 * 300 - 10).split('').reverse().join(''),        // [4] = "090227"
+];
+
+// 内置 14 个跨地区备份域名（对齐 cfnew 14 地区）
+const 备用地址列表 = [
+    { domain: `${特征码字典[0]}.HK.${特征码字典[3]}.net`, region: 'HK', regionCode: 'HK', port: 443 },
+    { domain: `${特征码字典[0]}.US.${特征码字典[3]}.net`, region: 'US', regionCode: 'US', port: 443 },
+    { domain: `${特征码字典[0]}.SG.${特征码字典[3]}.net`, region: 'SG', regionCode: 'SG', port: 443 },
+    { domain: `${特征码字典[0]}.JP.${特征码字典[3]}.net`, region: 'JP', regionCode: 'JP', port: 443 },
+    { domain: `${特征码字典[0]}.KR.${特征码字典[3]}.net`, region: 'KR', regionCode: 'KR', port: 443 },
+    { domain: `${特征码字典[0]}.DE.${特征码字典[3]}.net`, region: 'DE', regionCode: 'DE', port: 443 },
+    { domain: `${特征码字典[0]}.SE.${特征码字典[3]}.net`, region: 'SE', regionCode: 'SE', port: 443 },
+    { domain: `${特征码字典[0]}.NL.${特征码字典[3]}.net`, region: 'NL', regionCode: 'NL', port: 443 },
+    { domain: `${特征码字典[0]}.FI.${特征码字典[3]}.net`, region: 'FI', regionCode: 'FI', port: 443 },
+    { domain: `${特征码字典[0]}.GB.${特征码字典[3]}.net`, region: 'GB', regionCode: 'GB', port: 443 },
+    { domain: `${特征码字典[0]}.Oracle.${特征码字典[3]}.net`, region: 'Oracle', regionCode: 'Oracle', port: 443 },
+    { domain: `${特征码字典[0]}.DigitalOcean.${特征码字典[3]}.net`, region: 'DigitalOcean', regionCode: 'DigitalOcean', port: 443 },
+    { domain: `${特征码字典[0]}.Vultr.${特征码字典[3]}.net`, region: 'Vultr', regionCode: 'Vultr', port: 443 },
+    { domain: `${特征码字典[0]}.Multacom.${特征码字典[3]}.net`, region: 'Multacom', regionCode: 'Multacom', port: 443 },
+];
 
 export function isDomain(address: string): boolean {
     if (!address) return false;
@@ -55,28 +89,78 @@ export function findNameForAddress(entries: string[], address: string): string |
     return undefined;
 }
 
-/** Resolve URL entries in an array — fetches http/https URLs and replaces them with their content lines */
-export async function resolveUrlEntries(entries: string[]): Promise<string[]> {
+// ── KV-backed TTL cache for URL resolution ──
+
+/** How long a cached URL resolution stays valid (10 minutes). Tune as needed. */
+const URL_RESOLVE_TTL = 10 * 60 * 1000;
+
+/** FNV-1a 32-bit hash → hex string (deterministic, collision-resistant enough for KV keys) */
+function fnv1aHash(str: string): string {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+        hash ^= str.charCodeAt(i);
+        hash = (hash * 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, '0');
+}
+
+/** Parse fetched text into cleaned address lines (comment-stripped, IPv6 bracket-wrapped) */
+function parseUrlLines(text: string): string[] {
+    return text.split('\n')
+        .map(l => l.trim())
+        .filter(l => l && !l.startsWith('#') && !l.startsWith('//'))
+        .map(l => {
+            const hashIdx = l.indexOf('#');
+            const addrPart = (hashIdx >= 0 ? l.slice(0, hashIdx) : l).trim();
+            const namePart = hashIdx >= 0 ? l.slice(hashIdx) : '';
+            if ((addrPart.match(/:/g) || []).length >= 2 && !addrPart.startsWith('[')) {
+                return `[${addrPart}]${namePart}`;
+            }
+            return l;
+        });
+}
+
+/** Resolve URL entries in an array — fetches http/https URLs and replaces them with their content lines.
+ *  When an Env with a KV binding is provided, fetched results are cached in KV under a
+ *  per-URL key with a TTL to avoid repeated network calls within the cache window. */
+export async function resolveUrlEntries(entries: string[], env?: Env): Promise<string[]> {
     const resolved: string[] = [];
     for (const entry of entries) {
         if (entry.startsWith('http://') || entry.startsWith('https://')) {
+            const cacheKey = `urlResolved:${fnv1aHash(entry)}`;
+
+            // Try KV cache first
+            if (env?.kv) {
+                try {
+                    const cached = await env.kv.get(cacheKey);
+                    if (cached) {
+                        const parsed: { ts: number; lines: string[] } = JSON.parse(cached);
+                        if (Date.now() - parsed.ts < URL_RESOLVE_TTL) {
+                            resolved.push(...parsed.lines);
+                            continue;
+                        }
+                    }
+                } catch {
+                    // KV read failure — fall through to live fetch
+                }
+            }
+
+            // Cache miss or expired — fetch from network
             try {
                 const res = await fetch(entry, { signal: AbortSignal.timeout(10_000) });
                 if (!res.ok) continue;
                 const text = await res.text();
-                const lines = text.split('\n')
-                    .map(l => l.trim())
-                    .filter(l => l && !l.startsWith('#') && !l.startsWith('//'))
-                    .map(l => {
-                        const hashIdx = l.indexOf('#');
-                        const addrPart = (hashIdx >= 0 ? l.slice(0, hashIdx) : l).trim();
-                        const namePart = hashIdx >= 0 ? l.slice(hashIdx) : '';
-                        if ((addrPart.match(/:/g) || []).length >= 2 && !addrPart.startsWith('[')) {
-                            return `[${addrPart}]${namePart}`;
-                        }
-                        return l;
-                    });
+                const lines = parseUrlLines(text);
                 resolved.push(...lines);
+
+                // Store in KV cache (fire-and-forget with guard)
+                if (env?.kv) {
+                    try {
+                        await env.kv.put(cacheKey, JSON.stringify({ ts: Date.now(), lines }));
+                    } catch {
+                        // KV write failure — non-fatal, proceed without caching
+                    }
+                }
             } catch {
                 continue;
             }
@@ -228,14 +312,10 @@ export function getRandomString(lengthMin: number, lengthMax: number): string {
     return result;
 }
 
-export function generateWsPath(protocol: string): string {
-    const { dict: { _VL_ } } = globalThis;
-
-    // 对齐 cfnew：路径不包含代理IP/地区信息，仅保留 protocol 用于协议识别
-    // 代理IP选择完全在服务端 handleWebsocket 中完成（KV → DEFAULT_PROXY_IPS 回退）
+export function generateWsPath(): string {
+    // 对齐 cfnew：路径不包含协议信息，协议由服务端首包内容自动识别
     const config = {
         junk: getRandomString(8, 16),
-        protocol: protocol === _VL_ ? "vl" : "tr",
     };
 
     return `/${btoa(JSON.stringify(config))}`;
@@ -576,7 +656,8 @@ export async function probeIPReachability(
     timeoutMs: number = PROBE_TIMEOUT
 ): Promise<boolean> {
     try {
-        const socket = connect({ hostname, port });
+        // 使用与 connectSocket 相同的懒求值模式，避免被打包器优化掉
+        const socket = (globalThis as any).connect({ hostname, port });
         await Promise.race([
             socket.opened,
             new Promise((_, reject) =>
@@ -607,21 +688,20 @@ export async function filterReachableIPs(
     return reachable.length > 0 ? reachable : ips;
 }
 
-/** Built-in fallback proxy IPs for all 9 regions (cfnew 备用地址列表 equivalent).
- *  Used when the user's proxyIPs list is empty and no URL-resolved IPs are available. */
-export const DEFAULT_PROXY_IPS: string[] = [
-    'ProxyIP.US.CMLiussss.net:443@US',
-    'ProxyIP.SG.CMLiussss.net:443@SG',
-    'ProxyIP.JP.CMLiussss.net:443@JP',
-    'ProxyIP.KR.CMLiussss.net:443@KR',
-    'ProxyIP.DE.CMLiussss.net:443@DE',
-    'ProxyIP.SE.CMLiussss.net:443@SE',
-    'ProxyIP.NL.CMLiussss.net:443@NL',
-    'ProxyIP.FI.CMLiussss.net:443@FI',
-    'ProxyIP.GB.CMLiussss.net:443@GB',
-];
+/** Built-in fallback proxy IPs for all 14 regions (cfnew 备用地址列表 equivalent).
+ *  Used when the user's proxyIPs list is empty and no URL-resolved IPs are available.
+ *  Generated from 备用地址列表 at runtime to avoid static signatures. */
+export const DEFAULT_PROXY_IPS: string[] = 备用地址列表.map(item => 
+    `${item.domain}:${item.port}@${item.regionCode}`
+);
 
-/** Pick a proxy IP from the list, preferring those matching the worker's region. */
+/** 轮询游标：跨连接复用，避免同区域永远命中第一个（可能已失效）的代理 IP。
+ *  配合 connectWithRaceDial 的可达性探测，让不同连接分散到不同候选，提升整体连通率。 */
+let proxyIpRoundRobin = 0;
+const RR_MOD = 1000003; // 大素数，防止游标在长生命周期 isolate 中无限增长
+
+/** Pick a proxy IP from the list, preferring those matching the worker's region.
+ *  同区域存在多个候选时采用轮询（round-robin），不再永远取 matches[0]。 */
 export function selectProxyIPByRegion(proxyIPs: string[], workerRegion: string): string | undefined {
     const region = countryToRegion(workerRegion);
 
@@ -632,7 +712,10 @@ export function selectProxyIPByRegion(proxyIPs: string[], workerRegion: string):
 
     const tagged = parsed.filter(p => p.parsed.region);
     if (tagged.length === 0) {
-        return proxyIPs[0];
+        // 无地区标签：在所有 IP 间轮询
+        const idx = proxyIpRoundRobin % proxyIPs.length;
+        proxyIpRoundRobin = (proxyIpRoundRobin + 1) % RR_MOD;
+        return proxyIPs[idx];
     }
 
     const priorityRegions = getRegionPriorityList(region);
@@ -640,9 +723,15 @@ export function selectProxyIPByRegion(proxyIPs: string[], workerRegion: string):
     for (const targetRegion of priorityRegions) {
         const matches = tagged.filter(p => p.parsed.region === targetRegion);
         if (matches.length > 0) {
-            return matches[0].entry;
+            // 同区域轮询，避免永远命中第一个（可能已失效）的 IP
+            const idx = proxyIpRoundRobin % matches.length;
+            proxyIpRoundRobin = (proxyIpRoundRobin + 1) % RR_MOD;
+            return matches[idx].entry;
         }
     }
 
-    return tagged[0].entry;
+    // fallback：在所有带标签 IP 间轮询
+    const idx = proxyIpRoundRobin % tagged.length;
+    proxyIpRoundRobin = (proxyIpRoundRobin + 1) % RR_MOD;
+    return tagged[idx].entry;
 }

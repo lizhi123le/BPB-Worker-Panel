@@ -10,7 +10,7 @@ import obfs from 'javascript-obfuscator';
 import pkg from '../package.json' with { type: 'json' };
 import { gzipSync } from 'zlib';
 
-const env = process.env.NODE_ENV || 'mangle';
+const env = process.env.NODE_ENV || 'obfuscate';
 const mangleMode = env === 'mangle';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -239,43 +239,37 @@ async function buildWorker() {
     } else {
         const minifiedCode = await minifyCode(code.outputFiles[0].text);
         const obfuscationResult = obfs.obfuscate(minifiedCode.code, {
-            // ── 字符串数组：全部提取 + 多层编码(RC4→Base64) + 索引偏移 ──
+            compact: true,
+            controlFlowFlattening: false,
+            controlFlowFlatteningThreshold: 0,
+            deadCodeInjection: false,
             stringArray: true,
-            stringArrayThreshold: 1,
-            stringArrayEncoding: ["rc4", "base64"],
-            stringArrayIndexShift: true,
-            stringArrayIndexesType: ['hexadecimal-number'],
-            stringArrayWrappersCount: 5,
-            stringArrayWrappersChainedCalls: true,
-            stringArrayWrappersParametersMaxCount: 4,
-
-            // ── 字符串拆分：10 字符一段，交叉引用，防 grep ──
-            splitStrings: true,
-            splitStringsChunkLength: 10,
-
-            // ── 控制流混淆：函数内逻辑打散为 switch-case 调度 ──
-            controlFlowFlattening: true,
-            controlFlowFlatteningThreshold: 0.75,
-
-            // ── 数字/表达式 ──
-            numbersToExpressions: true,
-
-            // ── 对象键混淆 ──
-            transformObjectKeys: true,
-
-            // ── 标识符：打乱顺序 + 混合命名 ──
+            stringArrayEncoding: ['base64'],
+            stringArrayThreshold: 1.0,
+            stringArrayRotate: true,
+            stringArrayShuffle: true,
+            stringArrayWrappersCount: 2,
+            stringArrayWrappersChainedCalls: false,
+            stringArrayWrappersParametersMaxCount: 3,
+            renameGlobals: true,
             identifierNamesGenerator: 'mangled-shuffled',
+            identifierNamesCache: null,
             identifiersPrefix: '',
-            renameGlobals: false,
-
-            // ── 死代码注入 ──
-            deadCodeInjection: true,
-            deadCodeInjectionThreshold: 0.4,
-
-            // ── Unicode 转义 ──
+            renameProperties: false,
+            renamePropertiesMode: 'safe',
+            ignoreImports: false,
+            target: 'browser',
+            numbersToExpressions: false,
+            simplify: false,
+            splitStrings: true,
+            splitStringsChunkLength: 1,
+            transformObjectKeys: false,
             unicodeEscapeSequence: true,
-
-            target: "browser"
+            selfDefending: false,
+            debugProtection: false,
+            debugProtectionInterval: 0,
+            disableConsoleOutput: false,
+            domainLock: []
         });
 
         console.log(`${success} Worker obfuscated successfuly!`);
