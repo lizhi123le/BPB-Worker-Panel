@@ -1,4 +1,4 @@
-import { resolveDNS, filterReachableIPs, selectProxyIPByRegion, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, countryToRegion } from '@utils';
+import { resolveDNS, resolveProxyIPPool, filterReachableIPs, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS } from '@utils';
 import { safeErrorMessage } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
@@ -15,20 +15,22 @@ export const connectSocket = (options: { hostname: string; port: number }, fetch
 
 export const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
-const CONNECT_TIMEOUT = 5000; // 连接超时 5 秒
+const DIRECT_DIAL_TIMEOUT = 1000; // 直连竞速与兜底直连连接超时（对齐 edgetunnel 连接超时毫秒 = 1000）
+const PROXY_DIAL_TIMEOUT = 1000; // 代理竞速连接超时（对齐 edgetunnel 连接超时毫秒 = 1000）
 const RACE_DIAL_CONCURRENCY = 3; // 并发拨号数量，参考 cfnew
 const RACE_DIAL_MAX_BATCHES = 5; // 最大重试批次
 
-// IP:port 黑名单：连续失败计数 + 冷却，避免反复拨号已知不通的 IP
-const IP_BLACKLIST_TTL = 5 * 60 * 1000;   // 基础冷却 5 分钟
-const IP_BLACKLIST_MAX_FAIL = 3;          // 连续失败达到该次数后，冷却期延长 3 倍
+// IP:port 黑名单：连续失败计数 + 指数退避冷却（对齐 edgetunnel 节点黑名单 250-253）
+const IP_BLACKLIST_TTL = 30 * 1000;          // 基础冷却 30 秒
+const IP_BLACKLIST_BACKOFF = 2;              // 指数退避系数
+const IP_BLACKLIST_MAX_TTL = 30 * 60 * 1000; // 最大冷却 30 分钟
+const IP_BLACKLIST_MAX_FAIL = 3;             // failCount 封顶，防止长生命周期 isolate 中无界增长
 const ipBlacklist = new Map<string, { failCount: number; lastFailAt: number }>();
 function blacklistCheck(key: string): boolean {
     const e = ipBlacklist.get(key);
     if (!e) return false;
-    // 连续失败越多，冷却越久：达到 IP_BLACKLIST_MAX_FAIL 后延长 3 倍，
-    // 避免对反复拨号已知不通的 IP 造成无谓的建连开销（对齐 cfnew 节点黑名单语义）
-    const ttl = e.failCount >= IP_BLACKLIST_MAX_FAIL ? IP_BLACKLIST_TTL * 3 : IP_BLACKLIST_TTL;
+    // 指数退避：基础 30s × 2^(failCount-1)，上限 30min（对齐 edgetunnel 节点黑名单计算过期时间）
+    const ttl = Math.min(IP_BLACKLIST_TTL * Math.pow(IP_BLACKLIST_BACKOFF, e.failCount - 1), IP_BLACKLIST_MAX_TTL);
     if (Date.now() - e.lastFailAt > ttl) {
         ipBlacklist.delete(key);
         return false;
@@ -43,6 +45,9 @@ function blacklistRecord(key: string) {
 }
 function blacklistClear(key: string) { ipBlacklist.delete(key); }
 
+// 代理竞速 IP 级轮询游标：成功候选推进游标（对齐 edgetunnel 缓存反代数组索引 5779/5800）
+let proxyIpPoolCursor = 0;
+
 /** cfnew 风格：竞速拨号多个代理 IP，取最快成功的 */
 async function connectWithRaceDial(
     targetAddress: string,
@@ -52,7 +57,7 @@ async function connectWithRaceDial(
     fetcher?: any
 ): Promise<{ socket: Socket; usedIp: string }> {
     // 1. 获取配置
-    const { panelIPs, envProxyIPs, proxyMode, regionMatch, workerRegion } = globalThis.wsConfig;
+    const { panelIPs, envProxyIPs, proxyMode } = globalThis.wsConfig;
     const proxyIPs = panelIPs?.length ? panelIPs : (envProxyIPs ? [envProxyIPs] : DEFAULT_PROXY_IPS);
     
     if (!proxyIPs.length) {
@@ -64,74 +69,83 @@ async function connectWithRaceDial(
         return await connectWithPrefixFallback(targetAddress, targetPort, rawClientData, log, fetcher);
     }
 
-    // 2. 根据 workerRegion 选择最优代理 IP（cfnew 逻辑）
-    let selectedProxyIP = proxyIPs[0];
-    if (regionMatch && workerRegion) {
-        const region = countryToRegion(workerRegion);
-        const regionSelected = selectProxyIPByRegion(proxyIPs, region);
-        if (regionSelected) selectedProxyIP = regionSelected;
-    }
-    
-    log(`selected proxy IP: ${selectedProxyIP} for ${targetAddress}:${targetPort}`);
+    // 2. 构建 IP 池输入：纯 IP/IP:port 直接入池轮询，域名（自动地区/指定地区）解析其 IP 入池
+    //    地区匹配已在 handlers.ts 收敛为匹配的 @ 后缀码域名（panelIPs=[selected]），
+    //    此处直接全列表作为池输入（对齐 edgetunnel 解析地址端口语义）
+    //    每项先 stripRegionTag 去 @REGION 标签（parseHostPort 不识别 @ 后缀）
+    const poolInput: string[] = proxyIPs.map(e => stripRegionTag(e));
 
-    // 3. 解析选中的代理域名（去除地区标签）
-    const cleanProxyIP = stripRegionTag(selectedProxyIP);
-    const { host: proxyHost, port: proxyPort } = parseHostPort(cleanProxyIP, true);
+    const firstClean = stripRegionTag(poolInput[0]);
+    const { host: proxyHost, port: proxyPort } = parseHostPort(firstClean, true);
     const proxyAddr = proxyHost || targetAddress;
     const proxyPortNum = proxyPort || targetPort;
 
-    // 4. DoH 解析代理域名获取 IP 池
-    log(`resolving proxy ${proxyAddr} via DoH...`);
-    const { ipv4, ipv6 } = await resolveDNS(proxyAddr, true);
-    const allIps = [...ipv4, ...ipv6.map(ip => `[${ip}]`)];
-    
+    log(`selected proxy IP: ${poolInput[0]} for ${targetAddress}:${targetPort}`);
+
+    // 3. 解析 IP 池（对齐 edgetunnel 解析地址端口 9895-10016）：
+    //    逐项分流——IP 字面量直接入池（不 DoH），域名走 DoH 双源解析；
+    //    整体排序 + LCG 确定性洗牌 + 取前 8；带缓存
+    log(`resolving proxy pool via DoH...`);
+    const pool = await resolveProxyIPPool(poolInput.join(','), targetAddress, '');
+    const allIps = pool.map(([host]) => host);
+
     if (allIps.length === 0) {
         throw new Error(`DNS resolution failed for proxy ${proxyAddr}`);
     }
-    
+
     log(`got ${allIps.length} IPs for proxy ${proxyAddr}, probing reachability...`);
-    
-    // 5. 并发探测前 8 个 IP 的可达性
+
+    // 4. 并发探测前 8 个 IP 的可达性（BPB 独有，兼容保留）
     const probeIps = allIps.slice(0, 8);
     const reachableIps = await filterReachableIPs(probeIps, proxyPortNum);
-    
+
     log(`reachable proxy IPs: ${reachableIps.join(', ')}`);
-    
-    // 6. 分批竞速拨号
+
+    // 6. 分批竞速拨号（IP 级游标轮询，对齐 edgetunnel 5779/5800）
     const dialConcurrency = RACE_DIAL_CONCURRENCY;
     let offset = 0;
-    
+
     for (let batch = 0; batch < RACE_DIAL_MAX_BATCHES && offset < reachableIps.length; batch++) {
-        const batchIps = reachableIps.slice(offset, offset + dialConcurrency);
+        // 游标轮询取候选：索引 = (游标 + 偏移) % 池长度（对齐 edgetunnel 5779）
+        const poolLen = reachableIps.length;
+        const batchIps: string[] = [];
+        const batchIndexes: number[] = [];
+        for (let j = 0; j < dialConcurrency && offset + j < poolLen; j++) {
+            const idx = (proxyIpPoolCursor + offset + j) % poolLen;
+            batchIps.push(reachableIps[idx]);
+            batchIndexes.push(idx);
+        }
         offset += dialConcurrency;
-        
+
         if (batchIps.length === 0) continue;
-        
+
         log(`race dialing batch ${batch + 1}: ${batchIps.join(', ')}`);
-        
-        // 并发拨号，取最快成功的
-        const dialPromises = batchIps.map(async (ip) => {
+
+        // 并发拨号，取最快成功的（黑名单预检跳过已知不通的 IP，对齐 edgetunnel 5782-5786）
+        const dialPromises = batchIps.map(async (ip, j) => {
             const cleanIp = ip.replace(/^\[|\]$/g, '');
+            const key = `${cleanIp}:${proxyPortNum}`;
+            if (blacklistCheck(key)) return { socket: null, ip: cleanIp, index: batchIndexes[j] };
             const socket = connectSocket({ hostname: cleanIp, port: proxyPortNum }, fetcher);
             // 等待连接建立
             await Promise.race([
                 socket.opened,
-                new Promise<never>((_, reject) => 
-                    setTimeout(() => reject(new Error('timeout')), CONNECT_TIMEOUT)
+                new Promise<never>((_, reject) =>
+                    setTimeout(() => reject(new Error('timeout')), PROXY_DIAL_TIMEOUT)
                 )
             ]);
-            return { socket, ip: cleanIp };
+            return { socket, ip: cleanIp, index: batchIndexes[j] };
         });
-        
+
         const results = await Promise.allSettled(dialPromises);
-        
+
         // 找第一个竞速成功的 socket，直接写载荷（对齐 cfnew 连接值发送直连路径 L4732-4768）：
         // 备用地址（CMLosss 等）是直连中继，竞速拨号建立 TCP 后无需 SOCKS5 握手，
         // 直接通过写入器把剥离 VLESS 头后的载荷写入即可。写入失败视同该候选不通，
         // 继续尝试本批下一个候选。
         for (const result of results) {
             if (result.status !== 'fulfilled' || !result.value || !result.value.socket) continue;
-            const { socket, ip } = result.value;
+            const { socket, ip, index } = result.value;
             try {
                 // 先写首包再关闭其余候选，避免连接被重置（对齐 cfnew 连接值发送 L4766-4768：
                 // if (值数据378.byteLength) await 写入器.write(值数据378)）
@@ -146,22 +160,27 @@ async function connectWithRaceDial(
                         try { other.value.socket.close(); } catch {}
                     }
                 }
+                // 成功：清除黑名单 + 游标推进到成功候选（对齐 edgetunnel 5799-5800）
+                blacklistClear(`${ip}:${proxyPortNum}`);
+                proxyIpPoolCursor = index;
                 log(`race dial winner: ${ip}:${proxyPortNum} (proxy: ${proxyAddr})`);
                 return { socket, usedIp: ip };
             } catch (writeError) {
                 log(`race dial write failed for ${ip}:${proxyPortNum}: ${safeErrorMessage(writeError)}`);
+                blacklistRecord(`${ip}:${proxyPortNum}`);
                 try { socket.close(); } catch {}
             }
         }
-        
-        // 本批次全部失败，关闭已建立的连接（如果有）
+
+        // 本批次全部失败，记录黑名单并关闭已建立的连接（如果有）
         for (const result of results) {
             if (result.status === 'fulfilled' && result.value && result.value.socket) {
+                blacklistRecord(`${result.value.ip}:${proxyPortNum}`);
                 try { result.value.socket.close(); } catch {}
             }
         }
     }
-    
+
     // 所有批次都失败，抛出错误让上层处理兜底
     throw new Error(`All race dial attempts failed for proxy ${proxyAddr}:${proxyPortNum}`);
 }
@@ -229,7 +248,7 @@ async function connectWithDirectRaceDial(
             await Promise.race([
                 socket.opened,
                 new Promise<never>((_, reject) =>
-                    setTimeout(() => reject(new Error('timeout')), CONNECT_TIMEOUT)
+                    setTimeout(() => reject(new Error('timeout')), DIRECT_DIAL_TIMEOUT)
                 )
             ]);
             return { socket, candidate };
@@ -294,7 +313,7 @@ async function connectAndWrite(address: string, port: number, rawClientData: Arr
     await Promise.race([
         tcpSocket.opened,
         new Promise<void>((_, reject) =>
-            setTimeout(() => reject(new Error(`连接超时 (${address}:${port})`)), CONNECT_TIMEOUT)
+            setTimeout(() => reject(new Error(`连接超时 (${address}:${port})`)), DIRECT_DIAL_TIMEOUT)
         )
     ]);
 
@@ -377,7 +396,7 @@ export async function handleTCPOutBound(
         await Promise.race([
             tcpSocket.opened,
             new Promise<void>((_, reject) =>
-                setTimeout(() => reject(new Error(`连接超时 (${address}:${port})`)), CONNECT_TIMEOUT)
+                setTimeout(() => reject(new Error(`连接超时 (${address}:${port})`)), DIRECT_DIAL_TIMEOUT)
             )
         ]);
 
@@ -388,8 +407,8 @@ export async function handleTCPOutBound(
         return tcpSocket;
     }
 
-    // 获取 proxyMode 与自定义代理标记（hasCustomProxyIPs 由 handlers.ts 写入 wsConfig）
-    const { proxyMode, hasCustomProxyIPs } = globalThis.wsConfig as WsConfig & { hasCustomProxyIPs?: boolean };
+    // 获取 proxyMode（hasCustomProxyIPs 保留在 wsConfig 供面板/未来使用，当前无读取方）
+    const { proxyMode } = globalThis.wsConfig as WsConfig;
 
     // 模式 1: prefix (NAT64) - 仅前端显式选择时使用（原逻辑不变，失败不回退）
     if (proxyMode === 'prefix') {
@@ -415,27 +434,25 @@ export async function handleTCPOutBound(
         }
     }
 
-    // 直连优先（对齐 cfnew 默认策略）：未配置自定义代理 IP 时，先直连目标
-    if (!hasCustomProxyIPs) {
-        try {
-            log(`attempting direct race dial for ${originalAddress}:${originalPort}`);
-            const { socket: tcpSocket, usedIp } = await connectWithDirectRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
-            
-            tcpSocket.closed
-                .catch(error => console.log('direct race dial TCP socket closed error', error))
-                .finally(() => safeCloseWebSocket(webSocket));
-            
-            log(`direct race dial connected via ${usedIp}:${originalPort}`);
-            // 首包写入已在 connectWithDirectRaceDial 内完成（对齐 cfnew 直连路径：竞速胜出后直接写载荷），
-            // 此处只需登记 remoteSocket 供后续数据转发。
-            remoteSocket.value = tcpSocket;
-            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
-            return;
-        } catch (directError) {
-            log(`direct race dial failed: ${safeErrorMessage(directError)}`);
-            console.warn(`Direct race dial failed: ${directError}`);
-            // 直连失败后继续走代理竞速与直连兜底，不能直接 close
-        }
+    // 直连优先（对齐 edgetunnel 默认策略）：无论是否配置自定义代理 IP，都先直连目标；直连失败才回退代理竞速与兜底直连
+    try {
+        log(`attempting direct race dial for ${originalAddress}:${originalPort}`);
+        const { socket: tcpSocket, usedIp } = await connectWithDirectRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
+        
+        tcpSocket.closed
+            .catch(error => console.log('direct race dial TCP socket closed error', error))
+            .finally(() => safeCloseWebSocket(webSocket));
+        
+        log(`direct race dial connected via ${usedIp}:${originalPort}`);
+        // 首包写入已在 connectWithDirectRaceDial 内完成（对齐 edgetunnel 直连路径：竞速胜出后直接写载荷），
+        // 此处只需登记 remoteSocket 供后续数据转发。
+        remoteSocket.value = tcpSocket;
+        remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+        return;
+    } catch (directError) {
+        log(`direct race dial failed: ${safeErrorMessage(directError)}`);
+        console.warn(`Direct race dial failed: ${directError}`);
+        // 直连失败后继续走代理竞速与直连兜底，不能直接 close
     }
 
     // 模式 2: proxyip - cfnew 风格竞速拨号（用户显式配置自定义代理 IP 时优先，或直连失败后的回退）

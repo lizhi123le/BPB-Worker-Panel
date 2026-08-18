@@ -171,20 +171,31 @@ export async function resolveUrlEntries(entries: string[], env?: Env): Promise<s
     return resolved;
 }
 
+// ── DoH dual-source constants (对齐 edgetunnel DoH 双源: Cloudflare + Google) ──
+const CF_DOH = 'https://cloudflare-dns.com/dns-query';
+const GOOGLE_DOH = 'https://dns.google/dns-query';
+
 export async function resolveDNS(domain: string, onlyIPv4 = false): Promise<DnsResult> {
-    const dohBaseURL = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}`;
-    const dohURLs = {
-        ipv4: `${dohBaseURL}&type=A`,
-        ipv6: `${dohBaseURL}&type=AAAA`,
-    };
+    const cfBase = `${CF_DOH}?name=${encodeURIComponent(domain)}`;
+    const googleBase = `${GOOGLE_DOH}?name=${encodeURIComponent(domain)}`;
 
     try {
-        const ipv4 = await fetchDNSRecords(dohURLs.ipv4, 1);
-        const ipv6 = onlyIPv4 ? [] : await fetchDNSRecords(dohURLs.ipv6, 28);
+        const ipv4 = await dualSourceResolve(cfBase, googleBase, 'A', 1);
+        const ipv6 = onlyIPv4 ? [] : await dualSourceResolve(cfBase, googleBase, 'AAAA', 28);
         return { ipv4, ipv6 };
     } catch (error) {
         throw new Error(`Error resolving DNS for ${domain}: ${safeErrorMessage(error)}`);
     }
+}
+
+/** Query Cloudflare + Google in parallel, return result data[] from first with results (对齐 edgetunnel 9958-9976) */
+async function dualSourceResolve(cfBase: string, googleBase: string, typeName: string, recordType: number): Promise<string[]> {
+    const results = await Promise.allSettled([
+        fetchDNSRecords(`${cfBase}&type=${typeName}`, recordType),
+        fetchDNSRecords(`${googleBase}&type=${typeName}`, recordType),
+    ]);
+    const first = results.find(r => r.status === 'fulfilled' && r.value.length > 0);
+    return first?.status === 'fulfilled' ? first.value : [];
 }
 
 export async function fetchDNSRecords(url: string, recordType: number): Promise<string[]> {
@@ -510,13 +521,14 @@ Object.prototype.omitEmpty = function <T>(): T | undefined {
 
 // ── Region matching for nearest proxy IP selection ──
 
-export const ALL_REGIONS = ['US', 'SG', 'JP', 'KR', 'DE', 'SE', 'NL', 'FI', 'GB'];
+export const ALL_REGIONS = ['US', 'SG', 'JP', 'KR', 'DE', 'SE', 'NL', 'FI', 'GB', 'HK', 'ORACLE', 'DIGITALOCEAN', 'VULTR', 'MULTACOM'];
 
 export const REGION_NEIGHBORS: Record<string, string[]> = {
     US: ['SG', 'JP', 'KR'],
     SG: ['JP', 'KR', 'US'],
     JP: ['SG', 'KR', 'US'],
     KR: ['JP', 'SG', 'US'],
+    HK: ['SG', 'JP', 'KR'],
     DE: ['NL', 'GB', 'SE', 'FI'],
     SE: ['DE', 'NL', 'FI', 'GB'],
     NL: ['DE', 'GB', 'SE', 'FI'],
@@ -534,6 +546,7 @@ const COUNTRY_TO_REGION: Record<string, string> = {
     NL: 'NL',
     FI: 'FI',
     GB: 'GB',
+    HK: 'HK',
     CN: 'SG',
     TW: 'JP',
     AU: 'SG',
@@ -588,7 +601,8 @@ export function normalizeRegionTag(tag: string): string | undefined {
     const code = alias[upper] || upper;
     if (COUNTRY_TO_REGION[code]) return COUNTRY_TO_REGION[code];
     if (ALL_REGIONS.includes(code)) return code;
-    return undefined;
+    // 宽松：未知后缀码原样返回（支持 Oracle/DigitalOcean/Vultr/Multacom 等云厂商码）
+    return upper;
 }
 
 /** Map CF country code (ISO 3166-1 alpha-2) to proxy region.
@@ -686,6 +700,167 @@ export async function filterReachableIPs(
     const reachable = results.filter(r => r.ok).map(r => r.ip);
     // 如果全部不通则回退原始列表（避免空列表导致完全不可用）
     return reachable.length > 0 ? reachable : ips;
+}
+
+// ── DoH query with dual-source + cache (for proxy pool resolution, 对齐 edgetunnel 9958-9993) ──
+
+/** Low-level DoH query returning raw answer records (no cache). */
+async function dohQueryRaw(domain: string, type: string, dohUrl = CF_DOH): Promise<any[]> {
+    try {
+        const response = await fetch(`${dohUrl}?name=${encodeURIComponent(domain)}&type=${type}`, {
+            headers: { accept: 'application/dns-json' },
+            signal: AbortSignal.timeout(10_000),
+        });
+        const data: any = await response.json();
+        return data.Answer || [];
+    } catch {
+        return [];
+    }
+}
+
+/** Dual-source DoH query: parallel Cloudflare + Google, return raw records from first with results. */
+async function dohQueryDual(domain: string, type: string): Promise<any[]> {
+    const results = await Promise.allSettled([
+        dohQueryRaw(domain, type, CF_DOH),
+        dohQueryRaw(domain, type, GOOGLE_DOH),
+    ]);
+    const first = results.find(r => r.status === 'fulfilled' && r.value.length > 0);
+    return first?.status === 'fulfilled' ? first.value : [];
+}
+
+// DoH result cache for proxy pool resolution
+const _dohResultCache = new Map<string, { result: any[]; time: number; empty: boolean }>();
+const DOH_CACHE_TTL = 10 * 60 * 1000;   // 有结果 10min
+const DOH_CACHE_EMPTY_TTL = 30 * 1000;   // 空结果 30s
+const DOH_CACHE_MAX = 200;
+
+/** DoH query with dual-source + cache (对齐 edgetunnel doh解析缓存 9949-9993) */
+async function dohQueryCached(domain: string, type: string): Promise<any[]> {
+    const cacheKey = `${domain}|${type}`;
+    const cached = _dohResultCache.get(cacheKey);
+    const effectiveTTL = cached?.empty ? DOH_CACHE_EMPTY_TTL : DOH_CACHE_TTL;
+    if (cached && Date.now() - cached.time < effectiveTTL) {
+        return cached.result;
+    }
+
+    const records = await dohQueryDual(domain, type);
+
+    _dohResultCache.set(cacheKey, { result: records, time: Date.now(), empty: records.length === 0 });
+
+    // Evict expired + cap size (对齐 edgetunnel 9984-9993)
+    if (_dohResultCache.size > DOH_CACHE_MAX) {
+        const now = Date.now();
+        for (const [key, value] of _dohResultCache) {
+            if (now - value.time >= DOH_CACHE_TTL) _dohResultCache.delete(key);
+        }
+        while (_dohResultCache.size > DOH_CACHE_MAX) {
+            _dohResultCache.delete(_dohResultCache.keys().next().value!);
+        }
+    }
+
+    return records;
+}
+
+// ── Proxy IP pool resolution cache (对齐 edgetunnel 缓存反代IP 9896) ──
+let _proxyPoolCacheIP: string | null = null;
+let _proxyPoolCacheResult: [string, number][] | null = null;
+
+/** Parse a "host:port" or "[ipv6]:port" entry into [host, port] tuple, default port 443 */
+function parseHostPortEntry(entry: string): [string, number] {
+    const { host, port } = parseHostPort(entry, true);
+    return [host, port || 443];
+}
+
+/**
+ * Resolve proxy IP string into a pool of [host, port] entries.
+ * Supports: .william domains (TXT prefix expansion), .tpN domains (port extraction),
+ * normal domains (DoH A/AAAA dual-source), and direct IPs.
+ * Results are cached; pool is sorted + deterministically shuffled + capped at 8.
+ * Aligns with edgetunnel `解析地址端口` (9895-10016).
+ */
+export async function resolveProxyIPPool(
+    proxyIP: string,
+    targetDomain: string,
+    uuid: string
+): Promise<[string, number][]> {
+    if (_proxyPoolCacheIP === proxyIP && _proxyPoolCacheResult) {
+        return _proxyPoolCacheResult;
+    }
+
+    const proxyIPNormalized = proxyIP.toLowerCase();
+    const entries = proxyIPNormalized.split(',').map(s => s.trim()).filter(Boolean);
+    const allEntries: [string, number][] = [];
+
+    for (const entry of entries) {
+        if (entry.includes('.william')) {
+            // .william domain: DoH TXT query to expand prefix list (对齐 edgetunnel 9918-9935)
+            try {
+                let txtRecords = await dohQueryCached(entry, 'TXT');
+                let txtData = txtRecords.filter((r: any) => r.type === 16).map((r: any) => r.data as string);
+                if (txtData.length === 0) {
+                    // Fallback to Google DoH
+                    txtRecords = await dohQueryRaw(entry, 'TXT', GOOGLE_DOH);
+                    txtData = txtRecords.filter((r: any) => r.type === 16).map((r: any) => r.data as string);
+                }
+                if (txtData.length > 0) {
+                    let data = txtData[0];
+                    if (data.startsWith('"') && data.endsWith('"')) data = data.slice(1, -1);
+                    const prefixes = data.replace(/\\010/g, ',').replace(/\n/g, ',')
+                        .split(',').map((s: string) => s.trim()).filter(Boolean);
+                    for (const prefix of prefixes) {
+                        allEntries.push(parseHostPortEntry(prefix));
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to resolve .william domain:', error);
+            }
+        } else {
+            let [host, port] = parseHostPortEntry(entry);
+
+            // .tpN domain: extract port from suffix (对齐 edgetunnel 9939-9942)
+            if (entry.includes('.tp')) {
+                const tpMatch = entry.match(/\.tp(\d+)/);
+                if (tpMatch) port = parseInt(tpMatch[1], 10);
+            }
+
+            // Domain (not IP literal): DoH A/AAAA dual-source (对齐 edgetunnel 9948-9999)
+            const ipv4Regex = /^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)$/;
+            const ipv6Regex = /^\[?([a-fA-F0-9:]+)\]?$/;
+
+            if (!ipv4Regex.test(host) && !ipv6Regex.test(host)) {
+                const [aRecords, aaaaRecords] = await Promise.all([
+                    dohQueryCached(host, 'A'),
+                    dohQueryCached(host, 'AAAA'),
+                ]);
+                const ipv4s = aRecords.filter((r: any) => r.type === 1).map((r: any) => r.data as string);
+                const ipv6s = aaaaRecords.filter((r: any) => r.type === 28).map((r: any) => `[${r.data}]`);
+                const ips = [...ipv4s, ...ipv6s];
+                if (ips.length > 0) {
+                    for (const ip of ips) {
+                        allEntries.push([ip, port]);
+                    }
+                } else {
+                    // 回退：域名本身 (对齐 edgetunnel 9998-9999)
+                    allEntries.push([host, port]);
+                }
+            } else {
+                allEntries.push([host, port]);
+            }
+        }
+    }
+
+    // Sort + deterministic LCG shuffle (对齐 edgetunnel 10006-10011)
+    const sorted = [...allEntries].sort((a, b) => a[0].localeCompare(b[0]));
+    const rootDomain = targetDomain.includes('.') ? targetDomain.split('.').slice(-2).join('.') : targetDomain;
+    let seed = [...(rootDomain + uuid)].reduce((a, c) => a + c.charCodeAt(0), 0);
+    const shuffled = [...sorted].sort(() =>
+        (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5
+    );
+
+    const result = shuffled.slice(0, 8);
+    _proxyPoolCacheIP = proxyIP;
+    _proxyPoolCacheResult = result;
+    return result;
 }
 
 /** Built-in fallback proxy IPs for all 14 regions (cfnew 备用地址列表 equivalent).

@@ -1,4 +1,4 @@
-import { Authenticate, generateJWTToken, resetPassword } from "@auth";
+﻿import { Authenticate, generateJWTToken, resetPassword } from "@auth";
 import { getDataset, updateDataset } from "@kv";
 import { setKvCache, clearKvCache } from "../kv-cache";
 import { setSettings } from "@init";
@@ -8,7 +8,7 @@ import { getXrCustomConfigs, getXrWarpConfigs } from "@xray/configs";
 import { fetchWarpAccounts } from "@warp";
 import { UnifiedWSHandler } from "@unified";
 import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
-import { buildEntryPortMap, countryToRegion, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
+import { buildEntryPortMap, countryToRegion, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, parseProxyIPWithRegion, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
 export async function handleWebsocket(request: Request, env: Env): Promise<Response> {
@@ -57,17 +57,21 @@ export async function handleWebsocket(request: Request, env: Env): Promise<Respo
     };
 
     // Detect worker region: manual wkRegion > cf.country
-    // 对齐 cfnew：自定义 proxyIP（用户通过面板手动设置）且未设 wkRegion 时，
-    // 不自动检测 cf.country（cfnew CUSTOM 语义），由用户显式指定地区或关闭匹配
+    // 自定义 proxyIP（面板手动设置）同样启用自动地区检测：列表带 @ 后缀码时
+    // 按访客地区匹配对应域名（对齐用户需求：自动地区匹配/指定地区按 @ 后缀码匹配）
     const cfCountry = request.cf?.country;
     globalThis.wsConfig.workerRegion = effectiveWkRegion
-        || (hasCustomProxyIPs ? '' : String(cfCountry ?? ''));
+        || String(cfCountry ?? '');
 
     // 对齐 cfnew：连接时按 workerRegion 动态选择 Proxy IP（服务端选择，不暴露给客户端）
+    // 仅当列表含 @ 地区标签时收敛到匹配域名（纯 IP/IP:port 列表不收敛，全部参与 IP 池轮询）
     if (effectiveRegionMatch && globalThis.wsConfig.workerRegion && effectivePanelIPs.length > 0) {
-        const selected = selectProxyIPByRegion(effectivePanelIPs, globalThis.wsConfig.workerRegion);
-        if (selected) {
-            globalThis.wsConfig.panelIPs = [selected];
+        const hasRegionTags = effectivePanelIPs.some(p => parseProxyIPWithRegion(p).region);
+        if (hasRegionTags) {
+            const selected = selectProxyIPByRegion(effectivePanelIPs, globalThis.wsConfig.workerRegion);
+            if (selected) {
+                globalThis.wsConfig.panelIPs = [selected];
+            }
         }
     }
 
