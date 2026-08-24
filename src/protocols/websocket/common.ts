@@ -489,6 +489,112 @@ export async function handleTCPOutBound(
     }
 }
 
+// --- Download batcher constants (aligned with cfnew 传输下载包大小/尾部/延迟/块大小) ---
+const DOWNLOAD_PACKET_SIZE = 32 * 1024;  // 传输下载包大小：批量缓冲满阈值
+const DOWNLOAD_TAIL = 512;                // 传输下载尾部：剩余空间阈值触发刷新
+const DOWNLOAD_DELAY = 0;                 // 传输下载延迟：0ms（用 queueMicrotask 刷新）
+const DOWNLOAD_BLOCK_SIZE = 64 * 1024;    // 传输块大小：BYOB reader 复用缓冲
+const FIRST_BYTE_TIMEOUT = 6000;          // 首字节超时 ms（触发 retry 降级）
+
+// --- Uint8Array helpers (aligned with cfnew 处理值值8数组 / 拼接值8数组) ---
+function toUint8Array(data: ArrayBufferView | ArrayBuffer | Uint8Array): Uint8Array {
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    return new Uint8Array(data);
+}
+
+function concatUint8Arrays(a: Uint8Array, b: Uint8Array): Uint8Array {
+    const out = new Uint8Array(a.byteLength + b.byteLength);
+    out.set(a);
+    out.set(b, a.byteLength);
+    return out;
+}
+
+// --- cfnew-style download batcher (aligned with cfnew 创建值值 L5013-5078) ---
+// Batches small TCP chunks into larger WebSocket frames for better throughput.
+function createDownloadBatcher(webSocket: WebSocket) {
+    const PACKET_SIZE = DOWNLOAD_PACKET_SIZE;   // 32KB
+    const TAIL = DOWNLOAD_TAIL;                 // 512
+    const LOW_WATER = Math.max(4096, TAIL << 3); // 4096
+    let buffer = new Uint8Array(PACKET_SIZE);
+    let buffered = 0;
+    let timer: ReturnType<typeof setTimeout> | 0 = 0;
+    let scheduled = false;
+    let writeCount = 0;
+    let lastWriteCount = 0;
+    let retryCount = 0;
+
+    function flush() {
+        if (timer) { clearTimeout(timer); timer = 0; }
+        scheduled = false;
+        if (!buffered) return;
+        if (webSocket.readyState === WS_READY_STATE_OPEN) {
+            webSocket.send(buffer.subarray(0, buffered).slice());
+        }
+        buffer = new Uint8Array(PACKET_SIZE);
+        buffered = 0;
+        retryCount = 0;
+    }
+
+    function schedule() {
+        if (timer || scheduled) return;
+        scheduled = true;
+        lastWriteCount = writeCount;
+        queueMicrotask(() => {
+            scheduled = false;
+            if (!buffered || timer) return;
+            if (PACKET_SIZE - buffered < TAIL) return flush();
+            timer = setTimeout(() => {
+                timer = 0;
+                if (!buffered) return;
+                if (PACKET_SIZE - buffered < TAIL) return flush();
+                // Adaptive: allow up to 2 retries if data is still trickling in
+                if (retryCount < 2 && (writeCount !== lastWriteCount || buffered < LOW_WATER)) {
+                    retryCount++;
+                    lastWriteCount = writeCount;
+                    return schedule();
+                }
+                flush();
+            }, Math.max(DOWNLOAD_DELAY, 1));
+        });
+    }
+
+    return {
+        send(chunk: Uint8Array) {
+            const data = toUint8Array(chunk);
+            let offset = 0;
+            const total = data.byteLength;
+            if (!total) return;
+            while (offset < total) {
+                // If buffer is empty and remaining data >= PACKET_SIZE, send directly (no copy)
+                if (!buffered && total - offset >= PACKET_SIZE) {
+                    const size = Math.min(PACKET_SIZE, total - offset);
+                    if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                        webSocket.send(offset || size !== total ? data.subarray(offset, offset + size) : data);
+                    }
+                    offset += size;
+                    continue;
+                }
+                // Copy into buffer
+                const size = Math.min(PACKET_SIZE - buffered, total - offset);
+                buffer.set(data.subarray(offset, offset + size), buffered);
+                buffered += size;
+                offset += size;
+                writeCount++;
+                if (buffered === PACKET_SIZE || PACKET_SIZE - buffered < TAIL) {
+                    flush();
+                } else {
+                    schedule();
+                }
+            }
+        },
+        flush,
+    };
+}
+
+// --- Rewritten remoteSocketToWS with BYOB reader + download batching ---
+// (aligned with cfnew 连接值279 L5256-5331)
 async function remoteSocketToWS(
     remoteSocket: Socket,
     webSocket: WebSocket,
@@ -498,40 +604,87 @@ async function remoteSocketToWS(
 ) {
     let vlHeader = VLResponseHeader;
     let hasIncomingData = false;
+    let hasRetryFired = false;
 
-    const writableStream = new WritableStream({
-        start() { },
-        async write(chunk, controller) {
-            hasIncomingData = true;
-            if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-                controller.error("webSocket.readyState is not open, maybe close");
+    // First-byte timeout: if no data arrives, fire retry (SOCKS5 fallback)
+    let firstByteTimer: ReturnType<typeof setTimeout> | null = null;
+    if (retry) {
+        firstByteTimer = setTimeout(() => {
+            if (!hasIncomingData && !hasRetryFired) {
+                hasRetryFired = true;
+                try { remoteSocket.close?.(); } catch {}
+                retry();
             }
-
-            if (vlHeader) {
-                webSocket.send(await new Blob([vlHeader, chunk]).arrayBuffer());
-                vlHeader = null;
-            } else {
-                webSocket.send(chunk);
-            }
-        },
-        close() {
-            log(`remoteConnection.readable is close with hasIncomingData is ${hasIncomingData}`);
-        },
-        abort(reason) {
-            console.error(`remoteConnection.readable abort`, reason);
-            safeCloseTcpSocket(remoteSocket);
-        }
-    });
-
-    try {
-        await remoteSocket.readable.pipeTo(writableStream);
-    } catch (error) {
-        console.error('VLRemoteSocketToWS has exception.', error);
-        safeCloseTcpSocket(remoteSocket);
-        safeCloseWebSocket(webSocket);
+        }, FIRST_BYTE_TIMEOUT);
     }
 
-    if (hasIncomingData === false && retry) {
+    const batcher = createDownloadBatcher(webSocket);
+    let reader: ReadableStreamDefaultReader<any> | null = null;
+    let isByob = true;
+    let byobBuffer = new ArrayBuffer(DOWNLOAD_BLOCK_SIZE);
+
+    try {
+        // Try BYOB reader first (zero-copy, reusable buffer)
+        try {
+            reader = (remoteSocket.readable as any).getReader({ mode: 'byob' });
+        } catch {
+            isByob = false;
+            reader = remoteSocket.readable.getReader();
+        }
+
+        for (;;) {
+            const result = isByob
+                ? await (reader as any).read(new Uint8Array(byobBuffer, 0, DOWNLOAD_BLOCK_SIZE))
+                : await reader!.read();
+            if (result.done) break;
+            const readValue = result.value;
+            let chunk = toUint8Array(readValue);
+            if (!chunk.byteLength) continue;
+
+            // Cancel first-byte retry timer on first real data
+            if (!hasIncomingData) {
+                hasIncomingData = true;
+                if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null; }
+            }
+
+            if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+                throw new Error('webSocket.readyState is not open, maybe close');
+            }
+
+            // Prepend VLResponseHeader on first chunk (Uint8Array concat, NOT slow Blob)
+            if (vlHeader) {
+                chunk = concatUint8Arrays(vlHeader, chunk);
+                vlHeader = null;
+            }
+
+            // Large chunk (>= 32KB): flush batcher + send directly
+            if (chunk.byteLength >= DOWNLOAD_BLOCK_SIZE >> 1) {
+                batcher.flush();
+                webSocket.send(chunk);
+                if (isByob) byobBuffer = new ArrayBuffer(DOWNLOAD_BLOCK_SIZE);
+            } else {
+                // Small chunk: go through batcher for frame coalescing
+                batcher.send(chunk.slice());
+                if (isByob) {
+                    // Track BYOB buffer reuse: if read filled the full block, buffer is safe to reuse
+                    byobBuffer = readValue?.buffer instanceof ArrayBuffer && readValue.buffer.byteLength >= DOWNLOAD_BLOCK_SIZE
+                        ? readValue.buffer
+                        : new ArrayBuffer(DOWNLOAD_BLOCK_SIZE);
+                }
+            }
+        }
+
+        batcher.flush();
+    } catch (error) {
+        // Don't close WS if retry is about to re-mount a new socket
+        if (!hasRetryFired) safeCloseWebSocket(webSocket);
+    } finally {
+        try { batcher.flush(); } catch {}
+        try { reader?.releaseLock(); } catch {}
+    }
+
+    if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null; }
+    if (!hasIncomingData && !hasRetryFired && retry) {
         log(`retry`);
         retry();
     }
