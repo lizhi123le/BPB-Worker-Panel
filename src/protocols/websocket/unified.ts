@@ -42,8 +42,61 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
     const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
 
     let remoteSocketWrapper: { value: Socket | null } = { value: null };
+    let remoteWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
     let udpStreamWrite: any = null;
     let isDns = false;
+
+    // ===== WS 本地测速模式（对齐 cfnew L4538-4542）=====
+    let wsLocalSpeedTestMode = false;
+    let wsLocalSpeedTestSocket: WebSocket | null = null;
+    let wsLocalSpeedTestBuffer = new Uint8Array(0);
+    let wsLocalSpeedTestFirstHeader: Uint8Array | null = null;
+    const WS_LOCAL_SPEED_TEST_MAX = 64 * 1024;
+
+    // ===== WS 本地测速模式（对齐 cfnew L4593-4631）=====
+    const findHttpHeaderEnd = (data: Uint8Array): number => {
+        for (let i = 0; i <= data.byteLength - 4; i++) {
+            if (data[i] === 0x0d && data[i + 1] === 0x0a && data[i + 2] === 0x0d && data[i + 3] === 0x0a) return i + 4;
+        }
+        return -1;
+    };
+
+    const sendWsLocalSpeedTestResponse = async () => {
+        if (!wsLocalSpeedTestSocket) return;
+        const respHeader = wsLocalSpeedTestFirstHeader;
+        wsLocalSpeedTestFirstHeader = null;
+        await webSocketSendAndWait(wsLocalSpeedTestSocket, buildWsLocal204Response(respHeader));
+    };
+
+    const processWsLocalSpeedTestData = async (data: ArrayBuffer): Promise<void> => {
+        const chunk = new Uint8Array(data);
+        if (!chunk.byteLength) return;
+        if (wsLocalSpeedTestBuffer.byteLength + chunk.byteLength > WS_LOCAL_SPEED_TEST_MAX) throw new Error('WS local speed-test request is too large');
+        const newBuf = new Uint8Array(wsLocalSpeedTestBuffer.byteLength + chunk.byteLength);
+        newBuf.set(wsLocalSpeedTestBuffer);
+        newBuf.set(chunk, wsLocalSpeedTestBuffer.byteLength);
+        wsLocalSpeedTestBuffer = newBuf;
+        while (wsLocalSpeedTestBuffer.byteLength) {
+            const headerEnd = findHttpHeaderEnd(wsLocalSpeedTestBuffer);
+            if (headerEnd === -1) return;
+            const headerText = new TextDecoder().decode(wsLocalSpeedTestBuffer.subarray(0, headerEnd));
+            const contentLengthMatch = headerText.match(/(?:^|\r\n)content-length\s*:\s*(\d+)/i);
+            const contentLength = contentLengthMatch ? Number(contentLengthMatch[1]) : 0;
+            const requestLength = headerEnd + contentLength;
+            if (!Number.isSafeInteger(contentLength) || requestLength > WS_LOCAL_SPEED_TEST_MAX) throw new Error('WS local speed-test request body is too large');
+            if (wsLocalSpeedTestBuffer.byteLength < requestLength) return;
+            wsLocalSpeedTestBuffer = wsLocalSpeedTestBuffer.slice(requestLength);
+            await sendWsLocalSpeedTestResponse();
+        }
+    };
+
+    const enableWsLocalSpeedTestMode = async (webSocket: WebSocket, respHeader: Uint8Array | null, firstData?: ArrayBuffer): Promise<void> => {
+        wsLocalSpeedTestMode = true;
+        wsLocalSpeedTestSocket = webSocket;
+        wsLocalSpeedTestBuffer = new Uint8Array(0);
+        wsLocalSpeedTestFirstHeader = respHeader;
+        if (firstData && firstData.byteLength > 0) await processWsLocalSpeedTestData(firstData);
+    };
 
     const writableStream = new WritableStream({
         async write(chunk) {
@@ -51,14 +104,21 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
             // 幂等：无魔数/异常 padLen 原样返回；剥离后数据供后续所有协议检测与解析使用
             chunk = stripPrivacyPadding(chunk);
 
+            // 测速拦截：WS 本地测速模式下直接处理请求（对齐 cfnew L4641-4644）
+            if (wsLocalSpeedTestMode) {
+                await processWsLocalSpeedTestData(chunk);
+                return;
+            }
+
             if (isDns && udpStreamWrite) {
                 return udpStreamWrite(chunk);
             }
 
             if (remoteSocketWrapper.value) {
-                const writer = remoteSocketWrapper.value.writable.getWriter();
-                await writer.write(chunk);
-                writer.releaseLock();
+                if (!remoteWriter) {
+                    remoteWriter = remoteSocketWrapper.value.writable.getWriter();
+                }
+                await remoteWriter.write(chunk);
                 return;
             }
 
@@ -95,6 +155,12 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                     } else {
                         throw new Error("UDP proxy only enable for DNS which is port 53");
                     }
+                }
+
+                // 测速拦截：无代理时本地 204 响应（对齐 cfnew L4679-4681）
+                if (isSpeedTestSite(addressRemote) && !globalThis.wsConfig.hasCustomProxyIPs) {
+                    await enableWsLocalSpeedTestMode(webSocket, VLResponseHeader, rawClientData);
+                    return;
                 }
 
                 await handleTCPOutBound(
@@ -134,6 +200,12 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                     } else {
                         throw new Error("UDP proxy only enable for DNS which is port 53");
                     }
+                }
+
+                // 测速拦截：无代理时本地 204 响应（对齐 cfnew L4703-4705）
+                if (isSpeedTestSite(addressRemote) && !globalThis.wsConfig.hasCustomProxyIPs) {
+                    await enableWsLocalSpeedTestMode(webSocket, null, rawClientData);
+                    return;
                 }
 
                 await handleTCPOutBound(
@@ -187,6 +259,12 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                         }
                     }
 
+                    // 测速拦截：无代理时本地 204 响应（对齐 cfnew L4679-4681）
+                    if (isSpeedTestSite(addressRemote) && !globalThis.wsConfig.hasCustomProxyIPs) {
+                        await enableWsLocalSpeedTestMode(webSocket, VLResponseHeader, rawClientData);
+                        return;
+                    }
+
                     await handleTCPOutBound(
                         remoteSocketWrapper,
                         addressRemote,
@@ -233,6 +311,12 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                         }
                     }
 
+                    // 测速拦截：无代理时本地 204 响应（对齐 cfnew L4703-4705）
+                    if (isSpeedTestSite(addressRemote) && !globalThis.wsConfig.hasCustomProxyIPs) {
+                        await enableWsLocalSpeedTestMode(webSocket, null, rawClientData);
+                        return;
+                    }
+
                     await handleTCPOutBound(
                         remoteSocketWrapper,
                         addressRemote,
@@ -250,6 +334,10 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
             }
         },
         close() {
+            if (remoteWriter) {
+                try { remoteWriter.releaseLock(); } catch (_) { /* already released */ }
+                remoteWriter = null;
+            }
             safeCloseTcpSocket(remoteSocketWrapper.value);
         },
         abort(reason) {
@@ -600,6 +688,33 @@ async function hashPassword(password: string): Promise<string> {
     const encoder = new TextEncoder();
     const data = encoder.encode(password);
     return sha224(data);
+}
+
+// ===== 测速站点检测 + 本地 204 响应（对齐 cfnew L4974-5008）=====
+
+function isSpeedTestSite(hostname: string): boolean {
+    const speedTestDomains = ['speed.cloudflare.com', 'cp.cloudflare.com'];
+    hostname = hostname.toLowerCase();
+    return speedTestDomains.some(domain => hostname === domain || hostname.endsWith('.' + domain));
+}
+
+function buildWsLocal204Response(respHeader: Uint8Array | null): Uint8Array {
+    const wsLocal204 = new TextEncoder().encode(
+        'HTTP/1.1 204 No Content\r\n' +
+        'Content-Length: 0\r\n' +
+        'Connection: keep-alive\r\n' +
+        '\r\n'
+    );
+    if (!respHeader || respHeader.byteLength === 0) return wsLocal204;
+    const response = new Uint8Array(respHeader.byteLength + wsLocal204.byteLength);
+    response.set(respHeader, 0);
+    response.set(wsLocal204, respHeader.byteLength);
+    return response;
+}
+
+async function webSocketSendAndWait(webSocket: WebSocket, payload: Uint8Array) {
+    const sendResult: unknown = webSocket.send(payload);
+    if (sendResult && typeof (sendResult as { then?: unknown }).then === 'function') await sendResult;
 }
 
 async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Array<ArrayBuffer> | null, log: Function, protocol: 'vless' | 'trojan', fetcher?: any) {
