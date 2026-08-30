@@ -22,7 +22,89 @@ function stripPrivacyPadding(data: ArrayBuffer): ArrayBuffer {
     return data.slice(4 + padLen); // 跳过 [魔数][长度][填充]
 }
 
+// ===== xPadding 抗指纹（对齐 cfnew 52143dccb，参考 cmliu/edgetunnel）=====
+// UUID 派生隐蔽的填充头名/键名，服务端宽松校验、响应回写随机填充，订阅链接带 extra 约定。
+// 与上方 0xED7F 隐私填充（数据层）不同，xPadding 是 HTTP 层抗指纹机制，两者互不冲突。
+// 霍夫曼码长表（RFC 7541，257 项，索引 0-256，256 为 EOS）
+const XPADDING_HUFFMAN_CODE_LENGTHS = [
+    13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
+    28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
+    5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
+    13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
+    15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5,
+    6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
+    20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23,
+    24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
+    22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23,
+    21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
+    26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25,
+    19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
+    20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23,
+    26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
+    30
+];
+
+// 从 UUID 派生隐蔽的头名/键名，与订阅侧 extra 约定一致
+export function getXPaddingIdentifier(uuid: string): { header: string; key: string } {
+    return { header: uuid.slice(1, 7), key: '_' + uuid.slice(25, 31) };
+}
+
+// 计算字符串按霍夫曼编码后的字节长度（用于填充长度校验）
+function calcXPaddingHuffmanByteLength(str: string): number {
+    const bytes = new TextEncoder().encode(str);
+    let totalBits = 0;
+    for (let i = 0; i < bytes.length; i++) totalBits += XPADDING_HUFFMAN_CODE_LENGTHS[bytes[i]];
+    return Math.ceil(totalBits / 8);
+}
+
+// 提取填充值：优先头（URL 编码形式），回退请求 URL 查询参数
+function extractXPaddingValue(request: Request, header: string, key: string): string {
+    const headerValue = request.headers.get(header);
+    if (headerValue) {
+        try {
+            const parsed = new URL(headerValue, 'https://x.invalid');
+            const queryValue = parsed.searchParams.get(key);
+            if (queryValue) return queryValue;
+        } catch (_) { /* ignore */ }
+        return headerValue;
+    }
+    try {
+        return new URL(request.url).searchParams.get(key) || '';
+    } catch (_) {
+        return '';
+    }
+}
+
+// 宽松校验：空填充放行（老客户端兼容），非空时霍夫曼字节长度须在 98..1002
+function validateXPadding(request: Request, header: string, key: string): boolean {
+    const padding = extractXPaddingValue(request, header, key);
+    if (!padding) return true;
+    const length = calcXPaddingHuffmanByteLength(padding);
+    return length >= 98 && length <= 1002;
+}
+
+const XPADDING_CHARSET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+// 生成随机填充串（纯噪声，服务端不回读校验）
+function generateXPaddingString(length: number): string {
+    const charsetLength = XPADDING_CHARSET.length;
+    let result = '';
+    for (let i = 0; i < length; i++) result += XPADDING_CHARSET[Math.floor(Math.random() * charsetLength)];
+    return result;
+}
+
 export async function UnifiedWSHandler(request: Request): Promise<Response> {
+    // 对齐 cfnew 52143dccb：xPadding 抗指纹 —— 入站宽松校验（空填充放行，非法返回 400）
+    const { userID: xPaddingUserID } = globalThis.globalConfig;
+    if (xPaddingUserID) {
+        const { header: xPaddingHeader, key: xPaddingKey } = getXPaddingIdentifier(xPaddingUserID);
+        if (!validateXPadding(request, xPaddingHeader, xPaddingKey)) {
+            return new Response('Bad Request', { status: 400 });
+        }
+    }
+
     // 对齐 cfnew d4b2b7f：优先用请求绑定的 fetcher 建连（新版 Workers 运行时可能缺全局 connect）
     const fetcher = request.fetcher;
     const webSocketPair = new WebSocketPair();
@@ -352,9 +434,22 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
             safeCloseTcpSocket(remoteSocketWrapper.value);
         });
 
+    // 对齐 cfnew 52143dccb：xPadding 抗指纹 —— 101 响应回写随机填充头（100-1000 字符纯噪声）
+    const responseHeaders = new Headers();
+    try {
+        const { userID: respUserID } = globalThis.globalConfig;
+        if (respUserID) {
+            const { header: respPaddingHeader, key: respPaddingKey } = getXPaddingIdentifier(respUserID);
+            const paddingUrl = new URL('https://x.invalid/');
+            paddingUrl.searchParams.set(respPaddingKey, generateXPaddingString(100 + Math.floor(Math.random() * 901)));
+            responseHeaders.set(respPaddingHeader, paddingUrl.toString());
+        }
+    } catch (_) { /* ignore */ }
+
     return new Response(null, {
         status: 101,
         webSocket: client,
+        headers: responseHeaders,
     });
 }
 

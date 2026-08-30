@@ -6,7 +6,7 @@ import { getClNormalConfig, getClWarpConfig } from "@clash/configs";
 import { getSbCustomConfig, getSbWarpConfig } from "@sing-box/configs";
 import { getXrCustomConfigs, getXrWarpConfigs } from "@xray/configs";
 import { fetchWarpAccounts } from "@warp";
-import { UnifiedWSHandler } from "@unified";
+import { UnifiedWSHandler, getXPaddingIdentifier } from "@unified";
 import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
 import { buildEntryPortMap, countryToRegion, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, parseProxyIPWithRegion, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
 import JSZip from "jszip";
@@ -672,6 +672,15 @@ export async function getURLConfigs() {
         if (protocol === _VL_) {
             config.username = userID;
             config.searchParams.append('encryption', 'none');
+            // 对齐 cfnew 52143dccb：xPadding 抗指纹 —— 订阅链接带 extra 约定
+            const { header: xPaddingHeader, key: xPaddingKey } = getXPaddingIdentifier(userID);
+            config.searchParams.append('extra', JSON.stringify({
+                xPaddingObfsMode: true,
+                xPaddingMethod: 'tokenish',
+                xPaddingPlacement: 'queryInHeader',
+                xPaddingHeader,
+                xPaddingKey
+            }));
         } else {
             config.username = TrPass;
         }
