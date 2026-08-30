@@ -8,8 +8,34 @@ import { getXrCustomConfigs, getXrWarpConfigs } from "@xray/configs";
 import { fetchWarpAccounts } from "@warp";
 import { UnifiedWSHandler, getXPaddingIdentifier } from "@unified";
 import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
-import { buildEntryPortMap, countryToRegion, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigAddresses, parseHostPort, parseProxyIPWithRegion, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
+import { buildEntryPortMap, countryToRegion, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigAddresses, OFFICIAL_DIRECT_IPS, parseHostPort, parseProxyIPWithRegion, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
 import JSZip from "jszip";
+
+/**
+ * 归一化官方直连 IP 条目：裸 IP（无端口）或未带 @CF 标签的条目，
+ * 统一补齐 :443 端口，使其与内置池语义（始终拨 443）完全兼容。
+ * 保留 @region 标签与 #comment 后缀。
+ */
+function normalizeOfficialIP(entry: string): string {
+    const hashIdx = entry.indexOf('#');
+    const addressPart = (hashIdx !== -1 ? entry.slice(0, hashIdx) : entry).trim();
+    const comment = hashIdx !== -1 ? entry.slice(hashIdx) : '';
+    if (!addressPart) return entry;
+
+    const atIdx = addressPart.lastIndexOf('@');
+    const clean = atIdx !== -1 ? addressPart.slice(0, atIdx).trim() : addressPart;
+    const regionSuffix = atIdx !== -1 ? addressPart.slice(atIdx) : '';
+
+    const { host, port } = parseHostPort(clean, true);
+    if (port) return entry; // 已有端口，原样返回
+
+    // IPv6 安全网：任何路径下若 host 含 ':' 但未加方括号，则补上
+    const normalizedHost = host.includes(':') && !host.startsWith('[')
+        ? `[${host}]`
+        : host;
+
+    return `${normalizedHost}:443${regionSuffix}${comment}`;
+}
 
 export async function handleWebsocket(request: Request, env: Env): Promise<Response> {
     // 对齐 cfnew：路径不包含协议信息，协议由首包内容自动识别
@@ -27,7 +53,7 @@ export async function handleWebsocket(request: Request, env: Env): Promise<Respo
     const rawProxyIPs = globalThis.settings.proxyIPs || [];
     const proxyIPs = await resolveUrlEntries(rawProxyIPs, env); // 连接时解析（带 KV 缓存）
 
-    // 1. wkRegion：URL query wk > KV wkRegion > 空（由 cf.country 自动检测）
+    // 1. wkRegion：URL query wk > KV wkRegion > 空（空 = 官方直连 CF，对齐 cfnew v3.0）
     const effectiveWkRegion = queryWk || kvWkRegion || '';
 
     // 2. regionMatch：URL query rm(no=关闭) > KV regionMatch > 默认开启
@@ -56,16 +82,26 @@ export async function handleWebsocket(request: Request, env: Env): Promise<Respo
         hasCustomProxyIPs
     };
 
-    // Detect worker region: manual wkRegion > cf.country
+    // Detect worker region: manual wkRegion > 官方直连（CF，对齐 cfnew v3.0）
+    // wk 为空时不再用 cf.country 自动检测，而是走官方直连（内置 10 个官方 Cloudflare IP）
     // 自定义 proxyIP（面板手动设置）同样启用自动地区检测：列表带 @ 后缀码时
     // 按访客地区匹配对应域名（对齐用户需求：自动地区匹配/指定地区按 @ 后缀码匹配）
-    const cfCountry = request.cf?.country;
-    globalThis.wsConfig.workerRegion = effectiveWkRegion
-        || String(cfCountry ?? '');
+    globalThis.wsConfig.workerRegion = effectiveWkRegion || 'CF';
+
+    // 官方直连（对齐 cfnew v3.0）：workerRegion = 'CF'（wk 留空）时，
+    // 出口语义 = 官方 Cloudflare IP（内置 10 个，或面板自定义 officialIPs），
+    // 与自定义反代 proxyIPs 无关 —— 反代仅在显式指定地区（wk 非空）时生效。
+    if (globalThis.wsConfig.workerRegion === 'CF') {
+        const officialIPs = globalThis.settings.officialIPs?.length
+            ? globalThis.settings.officialIPs
+            : OFFICIAL_DIRECT_IPS;
+        globalThis.wsConfig.panelIPs = officialIPs.map(normalizeOfficialIP);
+    }
 
     // 对齐 cfnew：连接时按 workerRegion 动态选择 Proxy IP（服务端选择，不暴露给客户端）
     // 仅当列表含 @ 地区标签时收敛到匹配域名（纯 IP/IP:port 列表不收敛，全部参与 IP 池轮询）
-    if (effectiveRegionMatch && globalThis.wsConfig.workerRegion && effectivePanelIPs.length > 0) {
+    // CF 为 anycast，无地区选择概念：跳过收敛，避免 countryToRegion('CF')→'SG' 把 10 IP 池塌缩成 1 个
+    if (effectiveRegionMatch && globalThis.wsConfig.workerRegion !== 'CF' && globalThis.wsConfig.workerRegion && effectivePanelIPs.length > 0) {
         const hasRegionTags = effectivePanelIPs.some(p => parseProxyIPWithRegion(p).region);
         if (hasRegionTags) {
             const selected = selectProxyIPByRegion(effectivePanelIPs, globalThis.wsConfig.workerRegion);
@@ -380,7 +416,8 @@ async function getRegionInfo(request: Request, env: Env): Promise<Response> {
         }
 
         const manualRegion = (globalThis.settings?.wkRegion || '').trim();
-        const resolvedProxyRegion = countryToRegion(country) || '';
+        // 对齐 cfnew v3.0：wk 为空时走官方直连（CF）；显式设置时按手动地区映射
+        const resolvedProxyRegion = manualRegion ? countryToRegion(manualRegion) : 'CF';
 
         return respond(true, HttpStatus.OK, '', {
             workerRegion: country,

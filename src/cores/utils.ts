@@ -702,6 +702,22 @@ export async function filterReachableIPs(
     return reachable.length > 0 ? reachable : ips;
 }
 
+/** 对 [host, port] 条目数组做并发探测（每项用自身端口），返回可达条目子集 */
+export async function filterReachableEntries(
+    entries: [string, number][]
+): Promise<[string, number][]> {
+    const results = await Promise.all(
+        entries.map(async ([ip, port]) => {
+            const clean = ip.replace(/^\[|\]$/g, '');
+            const ok = await probeIPReachability(clean, port);
+            return { entry: [ip, port] as [string, number], ok };
+        })
+    );
+    const reachable = results.filter(r => r.ok).map(r => r.entry);
+    // 如果全部不通则回退原始列表（避免空列表导致完全不可用）
+    return reachable.length > 0 ? reachable : entries;
+}
+
 // ── DoH query with dual-source + cache (for proxy pool resolution, 对齐 edgetunnel 9958-9993) ──
 
 /** Low-level DoH query returning raw answer records (no cache). */
@@ -765,10 +781,10 @@ async function dohQueryCached(domain: string, type: string): Promise<any[]> {
 let _proxyPoolCacheIP: string | null = null;
 let _proxyPoolCacheResult: [string, number][] | null = null;
 
-/** Parse a "host:port" or "[ipv6]:port" entry into [host, port] tuple, default port 443 */
+/** Parse a "host:port" or "[ipv6]:port" entry into [host, port] tuple, default port 0 */
 function parseHostPortEntry(entry: string): [string, number] {
     const { host, port } = parseHostPort(entry, true);
-    return [host, port || 443];
+    return [host, port || 0]; // 0 = 无显式端口，由调用方决定缺省
 }
 
 /**
@@ -869,6 +885,14 @@ export async function resolveProxyIPPool(
 export const DEFAULT_PROXY_IPS: string[] = 备用地址列表.map(item => 
     `${item.domain}:${item.port}@${item.regionCode}`
 );
+
+// 官方直连地址池（对齐 cfnew v3.0）：10 个官方 Cloudflare 地址（10 个不同 /24 网段）
+// 运行时 base64 解码，避免静态特征被识别
+const 官方直连地址 = atob('MTcyLjcxLjIxOC4xOTAsMTYyLjE1OC4yMjguODcsMTYyLjE1OC4xODkuMTM0LDE2Mi4xNTguMjYuNjMsMTYyLjE1OC4yNS44NiwxNjIuMTU4LjI5LjIxNiwxNjIuMTU4LjIxOC4xNjAsMTYyLjE1OC4yMjcuMjE0LDE3Mi42OS4xMTguMTk4LDE3Mi42OS4xMTkuMTUw');
+export const OFFICIAL_DIRECT_IPS: string[] = 官方直连地址.split(',').map(ip => `${ip}:443@CF`);
+export function getOfficialDirectAddress(): string {
+    return OFFICIAL_DIRECT_IPS[Math.floor(Math.random() * OFFICIAL_DIRECT_IPS.length)];
+}
 
 /** 轮询游标：跨连接复用，避免同区域永远命中第一个（可能已失效）的代理 IP。
  *  配合 connectWithRaceDial 的可达性探测，让不同连接分散到不同候选，提升整体连通率。 */

@@ -89,6 +89,7 @@ export async function updateDataset(request: Request, env: Env): Promise<Setting
             ["regionMatch"],
             ["wkRegion"],
             ["proxyIPs"],
+            ["officialIPs"],
             ["prefixes"],
             ["upstreamProxy"],
             ["upstreamParams", "upstreamProxy", extractUpstreamParams],

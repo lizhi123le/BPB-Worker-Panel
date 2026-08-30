@@ -87,6 +87,7 @@ declare global {
         regionMatch: boolean;
         wkRegion?: string;
         proxyIPs: string[];
+        officialIPs?: string[];
         prefixes: string[];
         upstreamProxy: string;
         upstreamParams: UpstreamProxy;

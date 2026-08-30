@@ -33,6 +33,7 @@ globalThis.settings = {
     regionMatch: true,
     wkRegion: '',
     proxyIPs: [],
+    officialIPs: [],
     prefixes: [],
     upstreamProxy: "",
     upstreamParams: {
@@ -122,9 +123,8 @@ export async function setSettings(request: Request, env: Env) {
     // 合并而非替换，确保新字段（alpn, hostSniList, regionMatch 等）不会被旧 KV 数据覆盖
     Object.assign(globalThis.settings, settings);
 
-    // 对齐 cfnew：订阅生成时记录 Worker 所在地，用于静态预选 Proxy IP
-    const cf = (request as any).cf || {};
-    globalThis.workerRegion = cf.country || '';
+    // 对齐 cfnew v3.0：wk 为空时走官方直连（CF），不再记录 Worker 所在地
+    globalThis.workerRegion = 'CF';
 }
 
 export function init(request: Request, env: Env) {

@@ -1336,7 +1336,7 @@ async function fetchSystemStatus() {
 
         const update = (id, val) => document.getElementById(id).textContent = val || '-';
 
-        const effectiveRegion = body.wkRegion || body.workerRegion;
+        const effectiveRegion = body.wkRegion || body.resolvedProxyRegion || body.workerRegion;
         update('status-worker-region', effectiveRegion);
         update('status-cf-edge', body.workerColo);
         update('status-cf-country', body.workerRegion);

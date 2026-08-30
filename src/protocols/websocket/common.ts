@@ -1,4 +1,4 @@
-import { resolveDNS, resolveProxyIPPool, filterReachableIPs, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS } from '@utils';
+import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS } from '@utils';
 import { safeErrorMessage } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
@@ -76,57 +76,63 @@ async function connectWithRaceDial(
     const poolInput: string[] = proxyIPs.map(e => stripRegionTag(e));
 
     const firstClean = stripRegionTag(poolInput[0]);
-    const { host: proxyHost, port: proxyPort } = parseHostPort(firstClean, true);
+    const { host: proxyHost } = parseHostPort(firstClean, true);
     const proxyAddr = proxyHost || targetAddress;
-    const proxyPortNum = proxyPort || targetPort;
 
     log(`selected proxy IP: ${poolInput[0]} for ${targetAddress}:${targetPort}`);
 
     // 3. 解析 IP 池（对齐 edgetunnel 解析地址端口 9895-10016）：
     //    逐项分流——IP 字面量直接入池（不 DoH），域名走 DoH 双源解析；
     //    整体排序 + LCG 确定性洗牌 + 取前 8；带缓存
+    //    每项携带自身端口（显式端口 / .tpN 端口），无端口条目回退 targetPort（保持既有语义）
     log(`resolving proxy pool via DoH...`);
     const pool = await resolveProxyIPPool(poolInput.join(','), targetAddress, '');
-    const allIps = pool.map(([host]) => host);
+    const poolEntries: [string, number][] = pool.map(([host, port]) => [host, port || targetPort]);
 
-    if (allIps.length === 0) {
+    if (poolEntries.length === 0) {
         throw new Error(`DNS resolution failed for proxy ${proxyAddr}`);
     }
 
-    log(`got ${allIps.length} IPs for proxy ${proxyAddr}, probing reachability...`);
+    log(`got ${poolEntries.length} IPs for proxy ${proxyAddr}, probing reachability...`);
 
-    // 4. 并发探测前 8 个 IP 的可达性（BPB 独有，兼容保留）
-    const probeIps = allIps.slice(0, 8);
-    const reachableIps = await filterReachableIPs(probeIps, proxyPortNum);
+    // 4. 并发探测前 8 个条目的可达性（每项用自身端口，BPB 独有，兼容保留）
+    const probeEntries = poolEntries.slice(0, 8);
+    const reachableEntries = await filterReachableEntries(probeEntries);
 
-    log(`reachable proxy IPs: ${reachableIps.join(', ')}`);
+    log(`reachable proxy IPs: ${reachableEntries.map(([h, p]) => `${h}:${p}`).join(', ')}`);
+
+    // 对齐 cfnew 取官方直连地址（每次连接随机取一个官方 IP）：
+    // 每次连接随机起点，让不同连接从池中不同位置开始竞速拨号，
+    // 分散负载到全部候选 IP，避免所有连接从同一游标位置起步；
+    // 可达性探测/黑名单/分批兜底逻辑不变
+    const raceStartOffset = Math.floor(Math.random() * reachableEntries.length);
 
     // 6. 分批竞速拨号（IP 级游标轮询，对齐 edgetunnel 5779/5800）
     const dialConcurrency = RACE_DIAL_CONCURRENCY;
     let offset = 0;
 
-    for (let batch = 0; batch < RACE_DIAL_MAX_BATCHES && offset < reachableIps.length; batch++) {
-        // 游标轮询取候选：索引 = (游标 + 偏移) % 池长度（对齐 edgetunnel 5779）
-        const poolLen = reachableIps.length;
-        const batchIps: string[] = [];
+    for (let batch = 0; batch < RACE_DIAL_MAX_BATCHES && offset < reachableEntries.length; batch++) {
+        // 游标轮询取候选：索引 = (游标 + 随机起点 + 偏移) % 池长度（对齐 edgetunnel 5779 + cfnew 随机起点）
+        const poolLen = reachableEntries.length;
+        const batchEntries: [string, number][] = [];
         const batchIndexes: number[] = [];
         for (let j = 0; j < dialConcurrency && offset + j < poolLen; j++) {
-            const idx = (proxyIpPoolCursor + offset + j) % poolLen;
-            batchIps.push(reachableIps[idx]);
+            const idx = (proxyIpPoolCursor + raceStartOffset + offset + j) % poolLen;
+            batchEntries.push(reachableEntries[idx]);
             batchIndexes.push(idx);
         }
         offset += dialConcurrency;
 
-        if (batchIps.length === 0) continue;
+        if (batchEntries.length === 0) continue;
 
-        log(`race dialing batch ${batch + 1}: ${batchIps.join(', ')}`);
+        log(`race dialing batch ${batch + 1}: ${batchEntries.map(([h, p]) => `${h}:${p}`).join(', ')}`);
 
-        // 并发拨号，取最快成功的（黑名单预检跳过已知不通的 IP，对齐 edgetunnel 5782-5786）
-        const dialPromises = batchIps.map(async (ip, j) => {
+        // 并发拨号，取最快成功的（黑名单预检跳过已知不通的 IP:port，对齐 edgetunnel 5782-5786）
+        const dialPromises = batchEntries.map(async ([ip, entryPort], j) => {
             const cleanIp = ip.replace(/^\[|\]$/g, '');
-            const key = `${cleanIp}:${proxyPortNum}`;
-            if (blacklistCheck(key)) return { socket: null, ip: cleanIp, index: batchIndexes[j] };
-            const socket = connectSocket({ hostname: cleanIp, port: proxyPortNum }, fetcher);
+            const key = `${cleanIp}:${entryPort}`;
+            if (blacklistCheck(key)) return { socket: null, ip: cleanIp, port: entryPort, index: batchIndexes[j] };
+            const socket = connectSocket({ hostname: cleanIp, port: entryPort }, fetcher);
             // 等待连接建立
             await Promise.race([
                 socket.opened,
@@ -134,7 +140,7 @@ async function connectWithRaceDial(
                     setTimeout(() => reject(new Error('timeout')), PROXY_DIAL_TIMEOUT)
                 )
             ]);
-            return { socket, ip: cleanIp, index: batchIndexes[j] };
+            return { socket, ip: cleanIp, port: entryPort, index: batchIndexes[j] };
         });
 
         const results = await Promise.allSettled(dialPromises);
@@ -145,7 +151,7 @@ async function connectWithRaceDial(
         // 继续尝试本批下一个候选。
         for (const result of results) {
             if (result.status !== 'fulfilled' || !result.value || !result.value.socket) continue;
-            const { socket, ip, index } = result.value;
+            const { socket, ip, port: entryPort, index } = result.value;
             try {
                 // 先写首包再关闭其余候选，避免连接被重置（对齐 cfnew 连接值发送 L4766-4768：
                 // if (值数据378.byteLength) await 写入器.write(值数据378)）
@@ -161,13 +167,13 @@ async function connectWithRaceDial(
                     }
                 }
                 // 成功：清除黑名单 + 游标推进到成功候选（对齐 edgetunnel 5799-5800）
-                blacklistClear(`${ip}:${proxyPortNum}`);
+                blacklistClear(`${ip}:${entryPort}`);
                 proxyIpPoolCursor = index;
-                log(`race dial winner: ${ip}:${proxyPortNum} (proxy: ${proxyAddr})`);
+                log(`race dial winner: ${ip}:${entryPort} (proxy: ${proxyAddr})`);
                 return { socket, usedIp: ip };
             } catch (writeError) {
-                log(`race dial write failed for ${ip}:${proxyPortNum}: ${safeErrorMessage(writeError)}`);
-                blacklistRecord(`${ip}:${proxyPortNum}`);
+                log(`race dial write failed for ${ip}:${entryPort}: ${safeErrorMessage(writeError)}`);
+                blacklistRecord(`${ip}:${entryPort}`);
                 try { socket.close(); } catch {}
             }
         }
@@ -175,14 +181,14 @@ async function connectWithRaceDial(
         // 本批次全部失败，记录黑名单并关闭已建立的连接（如果有）
         for (const result of results) {
             if (result.status === 'fulfilled' && result.value && result.value.socket) {
-                blacklistRecord(`${result.value.ip}:${proxyPortNum}`);
+                blacklistRecord(`${result.value.ip}:${result.value.port}`);
                 try { result.value.socket.close(); } catch {}
             }
         }
     }
 
     // 所有批次都失败，抛出错误让上层处理兜底
-    throw new Error(`All race dial attempts failed for proxy ${proxyAddr}:${proxyPortNum}`);
+    throw new Error(`All race dial attempts failed for proxy ${proxyAddr}`);
 }
 
 /** 判断地址是否为 IP 字面量（IPv4 或含冒号的 IPv6），而非域名（对齐 cfnew 是IP地址） */
