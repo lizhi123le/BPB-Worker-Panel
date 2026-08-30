@@ -1,4 +1,3 @@
-localStorage.getItem('darkMode') === 'enabled' && document.body.classList.add('dark-mode');
 const form = document.getElementById("configForm");
 const [
     selectElements,
@@ -150,11 +149,6 @@ function closeQR() {
     const qrcodeContainer = document.getElementById('qrcode-container');
     qrModal.style.display = "none";
     qrcodeContainer.lastElementChild.remove();
-}
-
-function darkModeToggle() {
-    const isDarkMode = document.body.classList.toggle('dark-mode');
-    localStorage.setItem('darkMode', isDarkMode ? 'enabled' : 'disabled');
 }
 
 async function getIpDetails(ip) {

@@ -6,13 +6,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>BPB Panel v__VERSION__</title>
     <link rel="icon" href="/favicon.ico" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Ubuntu:ital,wght@0,300;0,400;0,500;0,700;1,300;1,400;1,500;1,700&display=swap"
+        rel="stylesheet">
     <style>
         :root {
-            --color: black;
-            --header-color: #09639f;
-            --background-color: #fff;
-            --border-color: #ddd;
-            --header-shadow: 2px 2px 4px rgba(0, 0, 0, 0.25);
+            --color-bg-main: linear-gradient(90deg, #000328, #00458E);
+            --color-text-primary: #f1f5f9;
+            --color-text-secondary: #aec4e2;
+            --shadow-header: 0.125rem 0.125rem 0.25rem #000328;
+            --space-sm: 0.5rem;
         }
 
         body,
@@ -23,31 +28,25 @@
             display: flex;
             justify-content: center;
             align-items: center;
-            font-family: system-ui;
-            color: var(--color);
-            background-color: var(--background-color);
+            font-family: "Ubuntu", system-ui;
+            color: var(--color-text-secondary);
+            background: var(--color-bg-main);
             text-align: center;
-        }
-
-        body.dark-mode {
-            --color: white;
-            --header-color: #3498DB;
-            --background-color: #121212;
-            --header-shadow: 2px 2px 4px rgba(255, 255, 255, 0.25);
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
         }
 
         h1 {
-            color: var(--header-color);
-            text-shadow: var(--header-shadow);
-        }
-
-        a {
-            color: var(--header-color);
+            color: var(--color-text-primary);
+            text-shadow: var(--shadow-header);
+            display: flex;
+            justify-content: center;
+            align-items: stretch;
+            gap: var(--space-sm);
         }
 
         .icon {
-            vertical-align: middle;
-            height: 3rem;
+            height: 2.5rem;
         }
     </style>
 </head>
@@ -67,9 +66,6 @@
             </p>
         </div>
     </div>
-    <script>
-        localStorage.getItem('darkMode') === 'enabled' && document.body.classList.add('dark-mode');
-    </script>
 </body>
 
 </html>

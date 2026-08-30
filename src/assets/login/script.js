@@ -1,4 +1,3 @@
-localStorage.getItem('darkMode') === 'enabled' && document.body.classList.add('dark-mode');
 document.getElementById('loginForm').addEventListener('submit', async (event) => {
     event.preventDefault();
     const password = document.getElementById('password').value;
