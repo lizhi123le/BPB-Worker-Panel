@@ -973,6 +973,10 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
         };
     } else {
         // Trojan UDP DNS: Parse Trojan UDP packets, forward to 8.8.4.4:53 via TCP, reconstruct responses
+        // 对齐 cfnew：共享 DNS 缓存（VLESS + Trojan 复用），键 = DNS查询ID(前2字节) + 长度
+        const dnsCache = new Map<string, Uint8Array>();
+        const DNS_CACHE_MAX = 1024;
+
         let dnsBuffer = new Uint8Array(0);
         const DNS_MAX_BUF = 65536;
         let currentRequestHeader: Uint8Array | null = null; // Stores addrType + addr + port + CR LF from request
@@ -1007,6 +1011,30 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
 
                         const dnsPayload = dnsBuffer.slice(dnsStart, dnsEnd);
 
+                        // 对齐 cfnew：DNS 缓存查询/存储（键 = DNS查询ID + 长度）
+                        let cacheKey = '';
+                        if (dnsPayload.length >= 2) {
+                            cacheKey = `${dnsPayload[0]}${dnsPayload[1]}:${dnsPayload.length}`;
+                            const cached = dnsCache.get(cacheKey);
+                            if (cached) {
+                                // 缓存命中：直接发送缓存的响应
+                                const frame = new Uint8Array(
+                                    currentRequestHeader!.length + 2 + cached.length + 2
+                                );
+                                frame.set(currentRequestHeader!, 0);
+                                frame[currentRequestHeader!.length] = (cached.length >> 8) & 0xff;
+                                frame[currentRequestHeader!.length + 1] = cached.length & 0xff;
+                                frame.set(cached, currentRequestHeader!.length + 2);
+                                frame[frame.length - 2] = 0x0d;
+                                frame[frame.length - 1] = 0x0a;
+                                if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                                    webSocket.send(frame.buffer);
+                                }
+                                offset = dnsEnd;
+                                continue;
+                            }
+                        }
+
                         // Build Trojan UDP response frame:
                         // addrType + addr + port + CR LF + 2-byte length + payload + CR LF
                         if (currentRequestHeader) {
@@ -1022,6 +1050,11 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
                             if (webSocket.readyState === WS_READY_STATE_OPEN) {
                                 webSocket.send(frame.buffer);
                             }
+                        }
+
+                        // 存入缓存
+                        if (cacheKey && dnsCache.size < DNS_CACHE_MAX) {
+                            dnsCache.set(cacheKey, dnsPayload);
                         }
 
                         offset = dnsEnd;
