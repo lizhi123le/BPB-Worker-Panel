@@ -82,6 +82,9 @@ function initiatePanel(proxySettings) {
 function populatePanel(proxySettings) {
     document.getElementById("doh").textContent = `${window.origin}/dns-query/${decodeURIComponent(globalThis.subPath)}`;
     selectElements.forEach(elm => elm.value = proxySettings[elm.id]);
+    // 出站方式 (qj)：由 proxyOnly/proxyDegrade 反推下拉值
+    const outboundMode = proxySettings.proxyOnly ? 'only' : proxySettings.proxyDegrade ? 'no' : 'default';
+    document.getElementById('outboundMode').value = outboundMode;
     checkboxElements.forEach(elm => elm.checked = proxySettings[elm.id]);
     inputElements.forEach(elm => elm.value = proxySettings[elm.id] || "");
     textareaElements.forEach(elm => {
@@ -1066,6 +1069,12 @@ function validateSettings() {
         if (value === 'false') value = false;
         form[elm.id] = value;
     });
+
+    // 出站方式 (qj)：映射为 proxyOnly/proxyDegrade（对齐后端 qj 参数语义）
+    const outboundMode = form.outboundMode || 'default';
+    form.proxyOnly = outboundMode === 'only';
+    form.proxyDegrade = outboundMode === 'no';
+    delete form.outboundMode;
 
     inputElements.forEach(elm => {
         if (typeof form[elm.id] === 'string') {

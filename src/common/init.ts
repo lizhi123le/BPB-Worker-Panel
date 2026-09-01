@@ -32,6 +32,8 @@ globalThis.settings = {
     proxyIPMode: "proxyip",
     regionMatch: true,
     wkRegion: '',
+    proxyOnly: false,
+    proxyDegrade: false,
     proxyIPs: [],
     officialIPs: [],
     prefixes: [],

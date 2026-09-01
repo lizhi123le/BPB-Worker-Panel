@@ -812,12 +812,64 @@ async function webSocketSendAndWait(webSocket: WebSocket, payload: Uint8Array) {
     if (sendResult && typeof (sendResult as { then?: unknown }).then === 'function') await sendResult;
 }
 
+function parseDNSQueryInfo(packet: Uint8Array): { domain: string; qtype: number; qclass: number } | null {
+    if (packet.length < 12) return null;
+    let offset = 12; // skip DNS header
+    let domain = '';
+    while (offset < packet.length) {
+        const labelLen = packet[offset];
+        if (labelLen === 0) { offset++; break; }
+        if ((labelLen & 0xC0) === 0xC0) { offset += 2; break; } // compression pointer
+        offset++;
+        if (offset + labelLen > packet.length) return null;
+        if (domain) domain += '.';
+        domain += String.fromCharCode(...packet.slice(offset, offset + labelLen));
+        offset += labelLen;
+    }
+    if (offset + 4 > packet.length) return null;
+    const qtype = (packet[offset] << 8) | packet[offset + 1];
+    const qclass = (packet[offset + 2] << 8) | packet[offset + 3];
+    return { domain, qtype, qclass };
+}
+
+function parseDNSResponseTTL(packet: Uint8Array): number {
+    if (packet.length < 12) return 300;
+    let offset = 12;
+    const qdcount = (packet[4] << 8) | packet[5];
+    const ancount = (packet[6] << 8) | packet[7];
+    // Skip question section
+    for (let i = 0; i < qdcount; i++) {
+        while (offset < packet.length && packet[offset] !== 0) {
+            if ((packet[offset] & 0xC0) === 0xC0) { offset += 2; break; }
+            offset += packet[offset] + 1;
+        }
+        if (offset < packet.length && packet[offset] === 0) offset++;
+        offset += 4; // qtype + qclass
+    }
+    // Parse answer section — find min TTL
+    let minTTL = 86400;
+    for (let i = 0; i < ancount; i++) {
+        if (offset >= packet.length) break;
+        if ((packet[offset] & 0xC0) === 0xC0) offset += 2;
+        else { while (offset < packet.length && packet[offset] !== 0) offset += packet[offset] + 1; offset++; }
+        if (offset + 10 > packet.length) break;
+        offset += 2; // type
+        offset += 2; // class
+        const ttl = (packet[offset] << 24) | (packet[offset + 1] << 16) | (packet[offset + 2] << 8) | packet[offset + 3];
+        if (ttl > 0) minTTL = Math.min(minTTL, ttl);
+        offset += 4; // ttl
+        const rdlength = (packet[offset] << 8) | packet[offset + 1];
+        offset += 2 + rdlength;
+    }
+    return minTTL;
+}
+
 async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Array<ArrayBuffer> | null, log: Function, protocol: 'vless' | 'trojan', fetcher?: any) {
     if (protocol === 'vless') {
         // VLESS UDP DNS: TCP socket to 8.8.4.4:53 with caching (cfnew style)
         let isVLHeaderSent = false;
 
-        const cache = new Map<string, Uint8Array>();
+        const cache = new Map<string, { response: Uint8Array; expiresAt: number }>();
         const CACHE_MAX = 1024;
 
         const transformStream = new TransformStream({
@@ -830,12 +882,16 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
                     const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPacketLength));
                     index = index + 2 + udpPacketLength;
                     
-                    // Use DNS query ID as cache key
-                    if (udpData.length >= 2) {
-                        const key = `${udpData[0]}${udpData[1]}:${udpData.length}`;
-                        if (cache.has(key)) {
-                            controller.enqueue(cache.get(key)!);
+                    // Cache by domain|qtype|qclass
+                    const info = parseDNSQueryInfo(udpData);
+                    const key = info ? `${info.domain}|${info.qtype}|${info.qclass}` : null;
+                    if (key) {
+                        const cached = cache.get(key);
+                        if (cached && Date.now() < cached.expiresAt) {
+                            controller.enqueue(cached.response);
                             continue;
+                        } else if (cached) {
+                            cache.delete(key); // expired
                         }
                     }
                     controller.enqueue(udpData);
@@ -908,36 +964,39 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
 
                         const dnsPayload = dnsBuffer.slice(dnsStart, dnsEnd);
 
-                        // Build VLESS UDP frame: VLResponseHeader (if first) + 2-byte length + payload
+                        // Build VLESS UDP frame: VLResponseHeader (first only) + raw DNS payload
                         if (isVLHeaderSent) {
-                            const frame = new Uint8Array(2 + dnsPayload.length);
-                            frame[0] = (dnsPayload.length >> 8) & 0xff;
-                            frame[1] = dnsPayload.length & 0xff;
-                            frame.set(dnsPayload, 2);
                             if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                                webSocket.send(frame.buffer);
+                                webSocket.send(dnsPayload.buffer);
                             }
                         } else {
                             // First response includes VL header
-                            const frame = new Uint8Array(VLResponseHeader!.length + 2 + dnsPayload.length);
+                            const frame = new Uint8Array(VLResponseHeader!.length + dnsPayload.length);
                             frame.set(VLResponseHeader!, 0);
-                            frame[VLResponseHeader!.length] = (dnsPayload.length >> 8) & 0xff;
-                            frame[VLResponseHeader!.length + 1] = dnsPayload.length & 0xff;
-                            frame.set(dnsPayload, VLResponseHeader!.length + 2);
+                            frame.set(dnsPayload, VLResponseHeader!.length);
                             if (webSocket.readyState === WS_READY_STATE_OPEN) {
                                 webSocket.send(frame.buffer);
                             }
                             isVLHeaderSent = true;
                         }
 
-                        // Cache by DNS query ID
-                        if (dnsPayload.length >= 2) {
-                            const key = `${dnsPayload[0]}${dnsPayload[1]}:${dnsPayload.length}`;
+                        // Cache by domain|qtype|qclass with TTL expiry
+                        const ancount = (dnsPayload[6] << 8) | dnsPayload[7];
+                        if (ancount === 0) {
+                            // NXDOMAIN or empty — don't cache
+                            offset = dnsEnd;
+                            continue;
+                        }
+                        const cacheInfo = parseDNSQueryInfo(dnsPayload);
+                        if (cacheInfo && dnsPayload.length >= 2) {
+                            const key = `${cacheInfo.domain}|${cacheInfo.qtype}|${cacheInfo.qclass}`;
                             if (cache.size >= CACHE_MAX) {
                                 const firstKey = cache.keys().next().value;
                                 if (firstKey) cache.delete(firstKey);
                             }
-                            cache.set(key, dnsPayload);
+                            const ttl = parseDNSResponseTTL(dnsPayload);
+                            const expiresAt = Date.now() + Math.min(86400, Math.max(60, ttl)) * 1000;
+                            cache.set(key, { response: dnsPayload, expiresAt });
                         }
 
                         offset = dnsEnd;

@@ -44,11 +44,14 @@ export async function handleWebsocket(request: Request, env: Env): Promise<Respo
     const reqUrl = new URL(request.url);
     const queryWk = (reqUrl.searchParams.get('wk') || '').toUpperCase();
     const queryRm = reqUrl.searchParams.get('rm');
+    const queryQj = (reqUrl.searchParams.get('qj') || '').toLowerCase();
 
     const {
         regionMatch: kvRegionMatch,
         wkRegion: kvWkRegion,
-        proxyIPMode
+        proxyIPMode,
+        proxyOnly: kvProxyOnly,
+        proxyDegrade: kvProxyDegrade
     } = globalThis.settings;
     const rawProxyIPs = globalThis.settings.proxyIPs || [];
     const proxyIPs = await resolveUrlEntries(rawProxyIPs, env); // 连接时解析（带 KV 缓存）
@@ -60,6 +63,14 @@ export async function handleWebsocket(request: Request, env: Env): Promise<Respo
     const effectiveRegionMatch = queryRm !== null
         ? queryRm.toLowerCase() !== 'no'
         : (kvRegionMatch ?? true);
+
+    // 3. proxyMode：URL query qj(only=仅走代理/no=代理降级) > KV proxyOnly/proxyDegrade > 默认两者皆 false
+    const effectiveProxyOnly = queryQj === 'only'
+        ? true
+        : (queryQj === 'no' ? false : (kvProxyOnly ?? false));
+    const effectiveProxyDegrade = queryQj === 'only'
+        ? false
+        : (queryQj === 'no' ? true : (kvProxyDegrade ?? false));
 
     // 3. proxyIPs：KV proxyIPs > envProxyIPs > DEFAULT_PROXY_IPS（对齐 cfnew 备用地址列表）
     const envFallbackIPs = globalThis.wsConfig?.envProxyIPs
@@ -79,7 +90,9 @@ export async function handleWebsocket(request: Request, env: Env): Promise<Respo
         panelIPs: effectivePanelIPs,
         regionMatch: effectiveRegionMatch,
         wkRegion: effectiveWkRegion,
-        hasCustomProxyIPs
+        hasCustomProxyIPs,
+        proxyOnly: effectiveProxyOnly,
+        proxyDegrade: effectiveProxyDegrade
     };
 
     // Detect worker region: manual wkRegion > 官方直连（CF，对齐 cfnew v3.0）

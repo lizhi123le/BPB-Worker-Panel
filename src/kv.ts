@@ -88,6 +88,8 @@ export async function updateDataset(request: Request, env: Env): Promise<Setting
             ["proxyIPMode"],
             ["regionMatch"],
             ["wkRegion"],
+            ["proxyOnly"],
+            ["proxyDegrade"],
             ["proxyIPs"],
             ["officialIPs"],
             ["prefixes"],

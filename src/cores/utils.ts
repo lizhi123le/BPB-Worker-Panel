@@ -612,10 +612,13 @@ export function countryToRegion(countryCode: string): string {
     return COUNTRY_TO_REGION[countryCode.toUpperCase()] || 'SG';
 }
 
-/** Build region priority list: own region → neighbors → all remaining */
+// 对齐 cfnew 获取值值值值：剩余地区仅含 9 个标准地区（US/SG/JP/KR/DE/SE/NL/FI/GB）
+const CFNEW_STANDARD_REGIONS = ['US', 'SG', 'JP', 'KR', 'DE', 'SE', 'NL', 'FI', 'GB'];
+
+/** Build region priority list: own region → neighbors → 9 standard regions (cfnew alignment) */
 export function getRegionPriorityList(region: string): string[] {
     const neighbors = REGION_NEIGHBORS[region] || [];
-    const otherRegions = ALL_REGIONS.filter(r => r !== region && !neighbors.includes(r));
+    const otherRegions = CFNEW_STANDARD_REGIONS.filter(r => r !== region && !neighbors.includes(r));
     return [region, ...neighbors, ...otherRegions];
 }
 
@@ -900,8 +903,11 @@ let proxyIpRoundRobin = 0;
 const RR_MOD = 1000003; // 大素数，防止游标在长生命周期 isolate 中无限增长
 
 /** Pick a proxy IP from the list, preferring those matching the worker's region.
- *  同区域存在多个候选时采用轮询（round-robin），不再永远取 matches[0]。 */
+ *  同区域存在多个候选时采用轮询（round-robin），不再永远取 matches[0]。
+ *  对齐 cfnew：空列表 → 官方直连。 */
 export function selectProxyIPByRegion(proxyIPs: string[], workerRegion: string): string | undefined {
+    // 对齐 cfnew 获取值备用地址：备用地址列表为空时走官方直连
+    if (proxyIPs.length === 0) return getOfficialDirectAddress();
     const region = countryToRegion(workerRegion);
 
     const parsed = proxyIPs.map(ip => ({

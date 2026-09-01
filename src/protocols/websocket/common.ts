@@ -413,8 +413,8 @@ export async function handleTCPOutBound(
         return tcpSocket;
     }
 
-    // 获取 proxyMode（hasCustomProxyIPs 保留在 wsConfig 供面板/未来使用，当前无读取方）
-    const { proxyMode } = globalThis.wsConfig as WsConfig;
+    // 获取 proxyMode 与首跳决策配置（对齐 cfnew 处理值值384 首跳决策）
+    const { proxyMode, proxyOnly, proxyDegrade, hasCustomProxyIPs } = globalThis.wsConfig as WsConfig;
 
     // 模式 1: prefix (NAT64) - 仅前端显式选择时使用（原逻辑不变，失败不回退）
     if (proxyMode === 'prefix') {
@@ -440,7 +440,43 @@ export async function handleTCPOutBound(
         }
     }
 
-    // 直连优先（对齐 edgetunnel 默认策略）：无论是否配置自定义代理 IP，都先直连目标；直连失败才回退代理竞速与兜底直连
+    // 对齐 cfnew 首跳决策（处理值值384 L4873）：
+    //   首跳走代理 = 仅走代理 && 代理已启用 ? true : 代理降级 ? false : 代理已启用
+    // 仅走代理（proxyOnly）→ 必走代理，失败即关闭（防 IP 泄漏，不回退直连）
+    // 代理降级（proxyDegrade）→ 直连优先，代理作为回退
+    // 默认 → 有自定义代理 IP（前端指定地区）时代理优先，直连回退；无代理则直连优先（对齐 edgetunnel）
+    const hasProxyIPs = hasCustomProxyIPs === true;
+    const firstHopProxy = proxyOnly && hasProxyIPs ? true : proxyDegrade ? false : hasProxyIPs;
+
+    // 首跳走代理：代理竞速拨号优先（对齐 cfnew 连接值发送 值代理=true 路径）
+    if (firstHopProxy) {
+        try {
+            log(`proxy-first: attempting proxy race dial for ${originalAddress}:${originalPort}`);
+            const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
+            
+            tcpSocket.closed
+                .catch(error => console.log('proxy race dial TCP socket closed error', error))
+                .finally(() => safeCloseWebSocket(webSocket));
+            
+            log(`proxy race dial connected via ${usedIp}:${originalPort}`);
+            // 首包写入已在 connectWithRaceDial 内完成（对齐 cfnew 连接值发送直连路径：竞速胜出后直接写载荷），
+            // 此处只需登记 remoteSocket 供后续数据转发。
+            remoteSocket.value = tcpSocket;
+            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+            return;
+        } catch (proxyError) {
+            log(`proxy race dial failed: ${safeErrorMessage(proxyError)}`);
+            console.warn(`Proxy race dial failed: ${proxyError}`);
+            // 仅走代理模式：失败即关闭，不回退直连（防 IP 泄漏，对齐 cfnew 处理重试连接 L4816-4819）
+            if (proxyOnly) {
+                webSocket.close(1011, `Proxy-only mode failed: ${safeErrorMessage(proxyError)}`);
+                return;
+            }
+            // 默认模式（有代理）：代理失败后回退直连竞速与兜底直连
+        }
+    }
+
+    // 直连优先（对齐 edgetunnel 默认策略 / cfnew 代理降级首跳）：直连竞速拨号
     try {
         log(`attempting direct race dial for ${originalAddress}:${originalPort}`);
         const { socket: tcpSocket, usedIp } = await connectWithDirectRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
@@ -461,24 +497,24 @@ export async function handleTCPOutBound(
         // 直连失败后继续走代理竞速与直连兜底，不能直接 close
     }
 
-    // 模式 2: proxyip - cfnew 风格竞速拨号（用户显式配置自定义代理 IP 时优先，或直连失败后的回退）
+    // 代理竞速回退（cfnew 风格竞速拨号）：直连失败后，或默认模式代理首跳失败后的回退
     try {
-        log(`attempting race dial for ${originalAddress}:${originalPort}`);
+        log(`attempting proxy race dial fallback for ${originalAddress}:${originalPort}`);
         const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
         
         tcpSocket.closed
-            .catch(error => console.log('race dial TCP socket closed error', error))
+            .catch(error => console.log('proxy race dial fallback TCP socket closed error', error))
             .finally(() => safeCloseWebSocket(webSocket));
         
-        log(`race dial connected via ${usedIp}:${originalPort}`);
+        log(`proxy race dial fallback connected via ${usedIp}:${originalPort}`);
         // 首包写入已在 connectWithRaceDial 内完成（对齐 cfnew 连接值发送直连路径：竞速胜出后直接写载荷），
         // 此处只需登记 remoteSocket 供后续数据转发。
         remoteSocket.value = tcpSocket;
         remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
         return;
     } catch (error) {
-        log(`race dial failed: ${safeErrorMessage(error)}`);
-        console.warn(`Race dial failed: ${error}`);
+        log(`proxy race dial fallback failed: ${safeErrorMessage(error)}`);
+        console.warn(`Proxy race dial fallback failed: ${error}`);
         
         // 直连兜底（最后策略）
         try {

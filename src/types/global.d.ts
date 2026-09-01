@@ -31,6 +31,12 @@ declare global {
         // 用户是否显式配置了自定义代理 IP（settings.proxyIPs 或 env PROXY_IP），
         // 区别于 DEFAULT_PROXY_IPS 公共备用中继。false 时连接走直连优先策略（对齐 cfnew）。
         hasCustomProxyIPs?: boolean;
+        // 对齐 cfnew 首跳决策（env qj）：仅走代理 / 代理降级
+        // proxyOnly=true  → 首跳必走代理，失败即关闭（防 IP 泄漏，不回退直连）
+        // proxyDegrade=true → 首跳直连优先，代理作为回退
+        // 两者皆 false（默认）→ 有自定义代理 IP 时代理优先，直连回退
+        proxyOnly?: boolean;
+        proxyDegrade?: boolean;
     }
 
     interface Env {
@@ -135,6 +141,8 @@ declare global {
         blockMalware: boolean;
         blockPhishing: boolean;
         blockCryptominers: boolean;
+        proxyOnly: boolean;
+        proxyDegrade: boolean;
         customBypassRules: string[];
         customBlockRules: string[];
         customBypassSanctionRules: string[];
