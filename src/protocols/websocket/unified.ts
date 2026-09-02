@@ -872,34 +872,6 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
         const cache = new Map<string, { response: Uint8Array; expiresAt: number }>();
         const CACHE_MAX = 1024;
 
-        const transformStream = new TransformStream({
-            start(_controller) { },
-            transform(chunk, controller) {
-                // Parse UDP packets: 2-byte length + payload
-                for (let index = 0; index < chunk.byteLength;) {
-                    const lengthBuffer = chunk.slice(index, index + 2);
-                    const udpPacketLength = new DataView(lengthBuffer).getUint16(0);
-                    const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPacketLength));
-                    index = index + 2 + udpPacketLength;
-                    
-                    // Cache by domain|qtype|qclass
-                    const info = parseDNSQueryInfo(udpData);
-                    const key = info ? `${info.domain}|${info.qtype}|${info.qclass}` : null;
-                    if (key) {
-                        const cached = cache.get(key);
-                        if (cached && Date.now() < cached.expiresAt) {
-                            controller.enqueue(cached.response);
-                            continue;
-                        } else if (cached) {
-                            cache.delete(key); // expired
-                        }
-                    }
-                    controller.enqueue(udpData);
-                }
-            },
-            flush(_controller) { },
-        });
-
         const socket = connectSocket({ hostname: '8.8.4.4', port: 53 }, fetcher);
         await Promise.race([
             socket.opened,
@@ -909,27 +881,6 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
 
         const writer = socket.writable.getWriter();
         
-        // Send initial data from transform
-        const pumpReader = transformStream.readable.getReader();
-        const pumpToSocket = async () => {
-            try {
-                while (true) {
-                    const { done, value } = await pumpReader.read();
-                    if (done) break;
-                    // Add 2-byte TCP DNS length prefix
-                    const data = value as Uint8Array;
-                    const prefixed = new Uint8Array(data.length + 2);
-                    prefixed[0] = (data.length >> 8) & 0xff;
-                    prefixed[1] = data.length & 0xff;
-                    prefixed.set(data, 2);
-                    await writer.write(prefixed);
-                }
-            } catch (e) {
-                log('VLESS DNS pump error: ' + e);
-            }
-        };
-        pumpToSocket();
-
         // Response handling with caching
         let dnsBuffer = new Uint8Array(0);
         const DNS_MAX_BUF = 65536;
@@ -964,16 +915,24 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
 
                         const dnsPayload = dnsBuffer.slice(dnsStart, dnsEnd);
 
-                        // Build VLESS UDP frame: VLResponseHeader (first only) + raw DNS payload
+                        // Build VLESS UDP frame: VLResponseHeader (first only) + [2B length BE] + raw DNS payload
+                        const lenHi = (dnsPayload.length >> 8) & 0xff;
+                        const lenLo = dnsPayload.length & 0xff;
                         if (isVLHeaderSent) {
+                            const frame = new Uint8Array(2 + dnsPayload.length);
+                            frame[0] = lenHi;
+                            frame[1] = lenLo;
+                            frame.set(dnsPayload, 2);
                             if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                                webSocket.send(dnsPayload.buffer);
+                                webSocket.send(frame.buffer);
                             }
                         } else {
                             // First response includes VL header
-                            const frame = new Uint8Array(VLResponseHeader!.length + dnsPayload.length);
+                            const frame = new Uint8Array(VLResponseHeader!.length + 2 + dnsPayload.length);
                             frame.set(VLResponseHeader!, 0);
-                            frame.set(dnsPayload, VLResponseHeader!.length);
+                            frame[VLResponseHeader!.length] = lenHi;
+                            frame[VLResponseHeader!.length + 1] = lenLo;
+                            frame.set(dnsPayload, VLResponseHeader!.length + 2);
                             if (webSocket.readyState === WS_READY_STATE_OPEN) {
                                 webSocket.send(frame.buffer);
                             }
@@ -1022,12 +981,46 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
         return {
             async write(chunk: ArrayBuffer) {
                 const data = new Uint8Array(chunk);
-                // Add 2-byte TCP DNS length prefix
-                const prefixed = new Uint8Array(data.length + 2);
-                prefixed[0] = (data.length >> 8) & 0xff;
-                prefixed[1] = data.length & 0xff;
-                prefixed.set(data, 2);
-                await writer.write(prefixed);
+                // data = [2B length BE][DNS message] (VLESS UDP payload). Strip the 2-byte
+                // length prefix so parseDNSQueryInfo parses the DNS header at offset 0.
+                const dnsPacket = data.length >= 2 ? data.subarray(2) : data;
+                // Cache lookup: parse DNS query to get domain|qtype|qclass
+                const info = parseDNSQueryInfo(dnsPacket);
+                const key = info ? `${info.domain}|${info.qtype}|${info.qclass}` : null;
+                if (key) {
+                    const cached = cache.get(key);
+                    if (cached && Date.now() < cached.expiresAt) {
+                        // Cache hit: send cached response directly to client (align cfnew L5495)
+                        // Frame: VLResponseHeader (first only) + [2B length BE] + cachedResponse
+                        const lenHi = (cached.response.length >> 8) & 0xff;
+                        const lenLo = cached.response.length & 0xff;
+                        if (isVLHeaderSent) {
+                            const frame = new Uint8Array(2 + cached.response.length);
+                            frame[0] = lenHi;
+                            frame[1] = lenLo;
+                            frame.set(cached.response, 2);
+                            if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                                webSocket.send(frame.buffer);
+                            }
+                        } else {
+                            const frame = new Uint8Array(VLResponseHeader!.length + 2 + cached.response.length);
+                            frame.set(VLResponseHeader!, 0);
+                            frame[VLResponseHeader!.length] = lenHi;
+                            frame[VLResponseHeader!.length + 1] = lenLo;
+                            frame.set(cached.response, VLResponseHeader!.length + 2);
+                            if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                                webSocket.send(frame.buffer);
+                            }
+                            isVLHeaderSent = true;
+                        }
+                        return; // cache hit — do NOT forward to DNS socket
+                    } else if (cached) {
+                        cache.delete(key); // expired
+                    }
+                }
+                // Cache miss: forward to DNS socket. data already carries the 2-byte
+                // TCP DNS length prefix (VLESS UDP payload), so write it directly (align cfnew L5506).
+                await writer.write(data);
             },
         };
     } else {

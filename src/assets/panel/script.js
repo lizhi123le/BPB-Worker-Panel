@@ -995,15 +995,103 @@ function validateHostSniList() {
     return true;
 }
 
+function isValidUpstreamProxyURL(value) {
+    // Mirror backend parseUpstreamProxyConfig (common.ts L390-447)
+    const lower = value.toLowerCase();
+    let addr = value;
+    let kind; // 'socks5' | 'tunnel' | 'secure-tunnel'
+
+    if (lower.startsWith('https://')) {
+        kind = 'secure-tunnel';
+        addr = value.slice('https://'.length);
+    } else if (lower.startsWith('http://')) {
+        kind = 'tunnel';
+        addr = value.slice('http://'.length);
+    } else if (lower.startsWith('socks5://')) {
+        kind = 'socks5';
+        addr = value.slice('socks5://'.length);
+    } else if (lower.startsWith('socks://')) {
+        kind = 'socks5';
+        addr = value.slice('socks://'.length);
+    } else {
+        return false;
+    }
+
+    // Strip trailing path — backend L407-408
+    const pathIdx = addr.indexOf('/');
+    if (pathIdx >= 0) addr = addr.slice(0, pathIdx);
+    if (!addr) return false;
+
+    // Strip user:pass@ — backend L414-420
+    const atIdx = addr.lastIndexOf('@');
+    if (atIdx >= 0) {
+        const authPart = addr.slice(0, atIdx);
+        if (!authPart || authPart.indexOf(':') < 0) return false;
+        addr = addr.slice(atIdx + 1);
+    }
+
+    // Parse host:port — backend L432-444
+    const parts = addr.split(':');
+    const lastPart = parts.pop();
+    let port = Number(lastPart);
+
+    if (isNaN(port)) {
+        // Tunnel allows omitted port — defaults 80/443 (backend L436-439)
+        if (kind === 'socks5') return false;
+        parts.push(lastPart);
+        port = kind === 'secure-tunnel' ? 443 : 80;
+    }
+
+    const hostname = parts.join(':');
+    if (!hostname) return false;
+
+    // IPv6 must be bracketed — backend L443-444
+    if (hostname.indexOf(':') >= 0 && !/^\[.*\]$/.test(hostname)) return false;
+
+    // Validate host: strip brackets for IPv6 check
+    const hostClean = hostname.replace(/^\[|\]$/g, '');
+    if (!isIPv4(hostClean) && !isIPv6(hostname) && !isDomain(hostClean)) return false;
+
+    // Validate port range
+    if (port < 1 || port > 65535) return false;
+
+    return true;
+}
+
 function validateUpstreamProxy() {
     const upstreamProxy = getElmValue('upstreamProxy');
+    if (!upstreamProxy || !upstreamProxy.trim()) return true;
 
-    if (upstreamProxy && !isValidHostName(upstreamProxy, true)) {
-        alert(
-            '⛔ Invalid Upstream proxy!\n' +
-            '💡 It can be either IP:Port or Domain:Port'
-        );
-        return false;
+    const value = upstreamProxy.trim();
+
+    // Check if input has a URL scheme prefix
+    if (/^(socks5?|https?):\/\//i.test(value)) {
+        if (!isValidUpstreamProxyURL(value)) {
+            alert(
+                '⛔ Invalid Upstream proxy URL!\n' +
+                '💡 Supported formats:\n' +
+                '  socks5://host:port\n' +
+                '  socks5://user:pass@host:port\n' +
+                '  http://host:port\n' +
+                '  https://host:port\n' +
+                '  host:port (legacy)'
+            );
+            return false;
+        }
+    } else {
+        // Legacy bare host:port format
+        if (!isValidHostName(value, true)) {
+            alert(
+                '⛔ Invalid Upstream proxy!\n' +
+                '💡 Supported formats:\n' +
+                '  socks5://host:port\n' +
+                '  socks5://user:pass@host:port\n' +
+                '  http://host:port\n' +
+                '  https://host:port\n' +
+                '  host:port (legacy)'
+            );
+            return false;
+        }
     }
 
     return true;

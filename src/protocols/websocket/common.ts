@@ -375,6 +375,313 @@ async function connectWithPrefixFallback(
     return { socket: tcpSocket, usedIp: nat64IP };
 }
 
+// --- Upstream Proxy (SOCKS5 / HTTP CONNECT) ---
+// Aligned with cfnew: 处理值代理连接, 处理值隧道连接, 解析代理配置, 包装残留套接字
+
+interface UpstreamProxyConfig {
+    kind: 'socks5' | 'tunnel' | 'secure-tunnel';
+    hostname: string;
+    port: number;
+    username?: string;
+    password?: string;
+}
+
+/** Parse upstream proxy URL — aligned with cfnew 解析代理配置 (L5686-5731) */
+function parseUpstreamProxyConfig(upstreamProxy: string): UpstreamProxyConfig | null {
+    if (!upstreamProxy || !upstreamProxy.trim()) return null;
+    let addr = upstreamProxy.trim();
+    let kind: UpstreamProxyConfig['kind'] = 'socks5';
+    const lower = addr.toLowerCase();
+    if (lower.startsWith('https://')) {
+        kind = 'secure-tunnel';
+        addr = addr.slice('https://'.length);
+    } else if (lower.startsWith('http://')) {
+        kind = 'tunnel';
+        addr = addr.slice('http://'.length);
+    } else if (lower.startsWith('socks5://')) {
+        addr = addr.slice('socks5://'.length);
+    } else if (lower.startsWith('socks://')) {
+        addr = addr.slice('socks://'.length);
+    }
+    // Strip trailing path — aligned with cfnew L5703-5704
+    const pathIdx = addr.indexOf('/');
+    if (pathIdx >= 0) addr = addr.slice(0, pathIdx);
+    if (!addr) throw new Error('Invalid SOCKS address format');
+
+    // Parse user:pass@host:port — aligned with cfnew L5706-5711
+    let authPart: string | undefined;
+    let hostPort: string;
+    const atIdx = addr.lastIndexOf('@');
+    if (atIdx >= 0) {
+        authPart = addr.slice(0, atIdx);
+        hostPort = addr.slice(atIdx + 1);
+    } else {
+        hostPort = addr;
+    }
+
+    let username: string | undefined;
+    let password: string | undefined;
+    if (authPart) {
+        const colonIdx = authPart.indexOf(':');
+        if (colonIdx < 0) throw new Error('Invalid SOCKS address format');
+        username = authPart.slice(0, colonIdx);
+        password = authPart.slice(colonIdx + 1);
+    }
+
+    // Parse host:port — aligned with cfnew L5713-5724
+    const parts = hostPort.split(':');
+    const lastPart = parts.pop()!;
+    let port = Number(lastPart);
+    if (isNaN(port)) {
+        // Tunnel allows omitted port — cfnew: secure→443, http→80
+        if (kind === 'socks5') throw new Error('Invalid SOCKS address format');
+        parts.push(lastPart);
+        port = kind === 'secure-tunnel' ? 443 : 80;
+    }
+    const hostname = parts.join(':');
+    if (!hostname) throw new Error('Invalid SOCKS address format');
+    // IPv6 without brackets is invalid — cfnew L5724
+    if (hostname.includes(':') && !/^\[.*\]$/.test(hostname)) throw new Error('Invalid SOCKS address format');
+
+    return { kind, hostname, port, username, password };
+}
+
+/** Strip brackets from IPv6 address for SOCKS5 domain addressing — cfnew 规范化目标地址 L5591-5593 */
+function normalizeTargetAddress(addr: string): string {
+    const s = String(addr || '');
+    return /^\[.*\]$/.test(s) ? s.slice(1, -1) : s;
+}
+
+/** Wrap leftover bytes from handshake response back into readable stream head — cfnew 包装残留套接字 L5662-5684 */
+function wrapLeftoverSocket(socket: Socket, leftover: Uint8Array): Socket {
+    let upstreamReader: ReadableStreamDefaultReader<any> | null = null;
+    const newReadable = new ReadableStream({
+        start(controller) {
+            controller.enqueue(leftover);
+            upstreamReader = socket.readable.getReader();
+        },
+        async pull(controller) {
+            const { value, done } = await upstreamReader!.read();
+            if (done) { controller.close(); return; }
+            controller.enqueue(value);
+        },
+        cancel(reason) {
+            try { upstreamReader?.cancel(reason); } catch {}
+        }
+    });
+    return {
+        readable: newReadable,
+        writable: socket.writable,
+        closed: socket.closed,
+        opened: socket.opened,
+        close: () => socket.close()
+    } as Socket;
+}
+
+/** SOCKS5 handshake + CONNECT — aligned with cfnew 处理值代理连接 L5516-5588 */
+async function socks5Connect(
+    targetAddress: string,
+    targetPort: number,
+    proxyConfig: UpstreamProxyConfig,
+    rawClientData: ArrayBuffer | undefined,
+    fetcher?: any
+): Promise<Socket> {
+    const { username, password, hostname: proxyHost, port: proxyPort } = proxyConfig;
+
+    // Connect to SOCKS5 proxy — aligned with cfnew 处理打开值套接字 L5528
+    const socket = connectSocket({ hostname: proxyHost, port: proxyPort }, fetcher);
+
+    const writer = socket.writable.getWriter();
+    const reader = socket.readable.getReader();
+
+    // Accumulated leftover bytes across reads — aligned with cfnew 残留字节 L5533
+    let leftover: Uint8Array<ArrayBuffer> = new Uint8Array(0);
+
+    async function readAtLeast(need: number): Promise<Uint8Array<ArrayBuffer>> {
+        while (leftover.length < need) {
+            const { value, done } = await reader.read();
+            if (done || !value) throw new Error('fail to open socks connection');
+            leftover = concatUint8Arrays(leftover, toUint8Array(value)) as Uint8Array<ArrayBuffer>;
+        }
+        return leftover;
+    }
+
+    function take(len: number): Uint8Array<ArrayBuffer> {
+        const result = leftover.subarray(0, len);
+        leftover = leftover.subarray(len);
+        return result;
+    }
+
+    // Step 1: Greeting — cfnew L5530
+    await writer.write(new Uint8Array(username ? [5, 2, 0, 2] : [5, 1, 0]));
+
+    // Step 2: Method selection response — cfnew L5547-5550
+    let response = await readAtLeast(2);
+    if (response[0] !== 5 || response[1] === 255) throw new Error('no acceptable methods');
+    const selectedMethod = response[1];
+    take(2);
+
+    // Step 3: Username/password auth (method 2) — cfnew L5551-5558
+    if (selectedMethod === 2) {
+        if (!username || !password) throw new Error('socks server needs auth');
+        const encoder = new TextEncoder();
+        const authRequest = new Uint8Array([
+            1, username.length, ...encoder.encode(username),
+            password.length, ...encoder.encode(password)
+        ]);
+        await writer.write(authRequest);
+        response = await readAtLeast(2);
+        if (response[0] !== 1 || response[1] !== 0) throw new Error('fail to auth socks server');
+        take(2);
+    }
+
+    // Step 4: CONNECT request — always domain-type (ATYP=3) — cfnew L5560-5565
+    // Comment from cfnew: 统一用域名型寻址：交给代理自己解析更稳妥
+    const encoder = new TextEncoder();
+    const targetBytes = encoder.encode(normalizeTargetAddress(targetAddress));
+    await writer.write(new Uint8Array([
+        5, 1, 0, 3, targetBytes.length, ...targetBytes,
+        targetPort >> 8, targetPort & 255
+    ]));
+
+    // Step 5: Read CONNECT response — cfnew L5567-5581
+    response = await readAtLeast(4);
+    if (response[1] !== 0) throw new Error('fail to open socks connection');
+    const bindAddrType = response[3];
+    let replyLen: number;
+    if (bindAddrType === 1) {
+        replyLen = 10; // IPv4: 4 header + 4 addr + 2 port
+    } else if (bindAddrType === 4) {
+        replyLen = 22; // IPv6: 4 header + 16 addr + 2 port
+    } else if (bindAddrType === 3) {
+        replyLen = 7 + (await readAtLeast(5))[4]; // Domain: 4 header + 1 len + domain + 2 port
+    } else {
+        throw new Error('invalid proxy response');
+    }
+    await readAtLeast(replyLen);
+    take(replyLen);
+
+    // Step 6: Write first packet before releasing writer — cfnew L5582-5584
+    if (rawClientData && rawClientData.byteLength) await writer.write(rawClientData);
+    writer.releaseLock();
+    reader.releaseLock();
+
+    // Step 7: Wrap leftover if proxy already sent target data — cfnew L5587
+    if (leftover.length) return wrapLeftoverSocket(socket, leftover);
+    return socket;
+}
+
+/** HTTP/HTTPS CONNECT tunnel — aligned with cfnew 处理值隧道连接 L5595-5659 */
+async function httpConnectTunnel(
+    targetAddress: string,
+    targetPort: number,
+    proxyConfig: UpstreamProxyConfig,
+    rawClientData: ArrayBuffer | undefined,
+    fetcher?: any
+): Promise<Socket> {
+    const { kind, username, password, hostname: proxyHost, port: proxyPort } = proxyConfig;
+
+    // For HTTPS tunnels, use secureTransport — cfnew L5603-5606
+    const connectOpts = kind === 'secure-tunnel' ? { secureTransport: 'on', allowHalfOpen: false } : undefined;
+    const target = { hostname: proxyHost, port: proxyPort };
+
+    // Connect to proxy — cfnew L5612
+    const socket = (fetcher && typeof fetcher.connect === 'function')
+        ? (connectOpts ? fetcher.connect(target, connectOpts) : fetcher.connect(target))
+        : (connectOpts ? (globalThis as any).connect(target, connectOpts) : (globalThis as any).connect(target));
+
+    if (socket.opened) await socket.opened;
+
+    // IPv6 targets need brackets in request line — cfnew L5615
+    const targetHost = targetAddress.includes(':') && !/^\[.*\]$/.test(targetAddress) ? `[${targetAddress}]` : targetAddress;
+    const targetAddr = `${targetHost}:${targetPort}`;
+
+    // Build CONNECT request — cfnew L5617-5621
+    let requestText = `CONNECT ${targetAddr} HTTP/1.1\r\n`
+        + `Host: ${targetAddr}\r\n`
+        + `User-Agent: Mozilla/5.0\r\n`
+        + `Proxy-Connection: Keep-Alive\r\n`;
+    if (username) {
+        requestText += `Proxy-Authorization: Basic ${btoa(`${username}:${password || ''}`)}\r\n`;
+    }
+    requestText += '\r\n';
+
+    const writer = socket.writable.getWriter();
+    const reader = socket.readable.getReader();
+
+    try {
+        await writer.write(new TextEncoder().encode(requestText));
+
+        // Read until \r\n\r\n — cfnew L5627-5640
+        const separator = [13, 10, 13, 10];
+        let buffer: Uint8Array<ArrayBuffer> = new Uint8Array(0);
+        let headerEnd = -1;
+        while (headerEnd < 0) {
+            const { value, done } = await reader.read();
+            if (done || !value) throw new Error('fail to open proxy tunnel');
+            buffer = concatUint8Arrays(buffer, toUint8Array(value)) as Uint8Array<ArrayBuffer>;
+            for (let pos = 0; pos + 3 < buffer.length; pos++) {
+                if (buffer[pos] === separator[0] && buffer[pos + 1] === separator[1]
+                    && buffer[pos + 2] === separator[2] && buffer[pos + 3] === separator[3]) {
+                    headerEnd = pos + 4;
+                    break;
+                }
+            }
+            if (headerEnd < 0 && buffer.length > 8192) throw new Error('invalid proxy response');
+        }
+
+        // Validate status line — cfnew L5642-5645
+        const statusLine = new TextDecoder().decode(buffer.subarray(0, Math.min(headerEnd, 128)));
+        if (!statusLine.startsWith('HTTP/')) throw new Error('invalid proxy response');
+        const statusCode = Number(statusLine.split(' ')[1]);
+        if (!(statusCode >= 200 && statusCode < 300)) throw new Error('fail to open proxy tunnel');
+
+        // Leftover data after headers — cfnew L5647
+        const leftoverData = buffer.subarray(headerEnd);
+
+        // Write first packet before releasing writer — cfnew L5648-5649
+        if (rawClientData && rawClientData.byteLength) await writer.write(rawClientData);
+        writer.releaseLock();
+        reader.releaseLock();
+
+        // Wrap leftover — cfnew L5652
+        if (leftoverData.byteLength) return wrapLeftoverSocket(socket, leftoverData);
+        return socket;
+    } catch (err) {
+        // Clean up on error — cfnew L5654-5658
+        try { writer.releaseLock(); } catch {}
+        try { reader.releaseLock(); } catch {}
+        try { socket.close(); } catch {}
+        throw err;
+    }
+}
+
+/** Connect through upstream SOCKS5/HTTP CONNECT proxy — returns socket or null if no proxy configured */
+async function connectThroughUpstreamProxy(
+    targetAddress: string,
+    targetPort: number,
+    rawClientData: ArrayBuffer | undefined,
+    fetcher?: any
+): Promise<Socket | null> {
+    const upstreamProxy = globalThis.settings?.upstreamProxy;
+    if (!upstreamProxy) return null;
+
+    let proxyConfig: UpstreamProxyConfig;
+    try {
+        const parsed = parseUpstreamProxyConfig(upstreamProxy);
+        if (!parsed) return null;
+        proxyConfig = parsed;
+    } catch {
+        return null;
+    }
+
+    if (proxyConfig.kind === 'socks5') {
+        return socks5Connect(targetAddress, targetPort, proxyConfig, rawClientData, fetcher);
+    } else {
+        return httpConnectTunnel(targetAddress, targetPort, proxyConfig, rawClientData, fetcher);
+    }
+}
+
 export async function handleTCPOutBound(
     remoteSocket: { value: Socket | null },
     addressRemote: string,
@@ -413,6 +720,40 @@ export async function handleTCPOutBound(
         return tcpSocket;
     }
 
+    // Helper: attempt direct race dial → fallback to local direct connect → stream to WS.
+    // Used by firstHopProxy retry (broken-proxy failover) and reusable for future paths.
+    async function connectDirectAndStream(): Promise<void> {
+        // Try direct race dial first
+        try {
+            log(`retry-direct: attempting direct race dial for ${originalAddress}:${originalPort}`);
+            const { socket: tcpSocket, usedIp } = await connectWithDirectRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
+
+            tcpSocket.closed
+                .catch(error => console.log('retry-direct race dial TCP socket closed error', error))
+                .finally(() => safeCloseWebSocket(webSocket));
+
+            log(`retry-direct race dial connected via ${usedIp}:${originalPort}`);
+            remoteSocket.value = tcpSocket;
+            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+            return;
+        } catch (directError) {
+            log(`retry-direct race dial failed: ${safeErrorMessage(directError)}`);
+        }
+
+        // Final fallback: local direct connect
+        try {
+            log(`retry-direct: falling back to direct connection for ${originalAddress}:${originalPort}`);
+            const tcpSocket = await connectAndWriteLocal(originalAddress, originalPort, fetcher);
+            tcpSocket.closed
+                .catch(error => console.log('retry-direct TCP socket closed error', error))
+                .finally(() => safeCloseWebSocket(webSocket));
+            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+        } catch (directError) {
+            console.error('retry-direct: All direct connection strategies failed:', directError);
+            webSocket.close(1011, `Retry direct connection failed: ${safeErrorMessage(directError)}`);
+        }
+    }
+
     // 获取 proxyMode 与首跳决策配置（对齐 cfnew 处理值值384 首跳决策）
     const { proxyMode, proxyOnly, proxyDegrade, hasCustomProxyIPs } = globalThis.wsConfig as WsConfig;
 
@@ -440,6 +781,29 @@ export async function handleTCPOutBound(
         }
     }
 
+    // Upstream proxy (SOCKS5/HTTP CONNECT) — primary strategy when configured
+    // Falls through to existing fallback chain (firstHopProxy → direct → proxy race → direct fallback) on failure
+    if (globalThis.settings?.upstreamProxy) {
+        try {
+            log(`upstream-proxy: attempting SOCKS5/HTTP CONNECT for ${originalAddress}:${originalPort}`);
+            const upstreamSocket = await connectThroughUpstreamProxy(originalAddress, originalPort, rawClientData, fetcher);
+            if (upstreamSocket) {
+                upstreamSocket.closed
+                    .catch(error => console.log('upstream-proxy TCP socket closed error', error))
+                    .finally(() => safeCloseWebSocket(webSocket));
+
+                log(`upstream-proxy connected to ${originalAddress}:${originalPort}`);
+                remoteSocket.value = upstreamSocket;
+                remoteSocketToWS(upstreamSocket, webSocket, VLResponseHeader, null, log);
+                return;
+            }
+        } catch (upstreamError) {
+            log(`upstream-proxy failed: ${safeErrorMessage(upstreamError)}`);
+            console.warn(`Upstream proxy failed: ${upstreamError}`);
+            // Fall through to existing fallback chain
+        }
+    }
+
     // 对齐 cfnew 首跳决策（处理值值384 L4873）：
     //   首跳走代理 = 仅走代理 && 代理已启用 ? true : 代理降级 ? false : 代理已启用
     // 仅走代理（proxyOnly）→ 必走代理，失败即关闭（防 IP 泄漏，不回退直连）
@@ -462,7 +826,17 @@ export async function handleTCPOutBound(
             // 首包写入已在 connectWithRaceDial 内完成（对齐 cfnew 连接值发送直连路径：竞速胜出后直接写载荷），
             // 此处只需登记 remoteSocket 供后续数据转发。
             remoteSocket.value = tcpSocket;
-            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+            // Pass retry to enable FIRST_BYTE_TIMEOUT: if proxy is reachable but broken
+            // (TCP connects but no data forwarded), retry fires and falls back to direct connection.
+            // Guarded by local flag + remoteSocketToWS's hasRetryFired to prevent double-fire.
+            let proxyRetryFired = false;
+            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, () => {
+                if (proxyRetryFired) return;
+                proxyRetryFired = true;
+                log(`proxy-first: no data within FIRST_BYTE_TIMEOUT, closing broken proxy socket and falling back to direct`);
+                try { tcpSocket.close?.(); } catch {}
+                connectDirectAndStream();
+            }, log);
             return;
         } catch (proxyError) {
             log(`proxy race dial failed: ${safeErrorMessage(proxyError)}`);
