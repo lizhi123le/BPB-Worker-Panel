@@ -612,13 +612,10 @@ export function countryToRegion(countryCode: string): string {
     return COUNTRY_TO_REGION[countryCode.toUpperCase()] || 'SG';
 }
 
-// 对齐 cfnew 获取值值值值：剩余地区仅含 9 个标准地区（US/SG/JP/KR/DE/SE/NL/FI/GB）
-const CFNEW_STANDARD_REGIONS = ['US', 'SG', 'JP', 'KR', 'DE', 'SE', 'NL', 'FI', 'GB'];
-
-/** Build region priority list: own region → neighbors → 9 standard regions (cfnew alignment) */
+/** Build region priority list: own region → neighbors → all remaining */
 export function getRegionPriorityList(region: string): string[] {
     const neighbors = REGION_NEIGHBORS[region] || [];
-    const otherRegions = CFNEW_STANDARD_REGIONS.filter(r => r !== region && !neighbors.includes(r));
+    const otherRegions = ALL_REGIONS.filter(r => r !== region && !neighbors.includes(r));
     return [region, ...neighbors, ...otherRegions];
 }
 
