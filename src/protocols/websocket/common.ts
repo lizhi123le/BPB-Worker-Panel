@@ -15,8 +15,8 @@ export const connectSocket = (options: { hostname: string; port: number }, fetch
 
 export const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
-const DIRECT_DIAL_TIMEOUT = 1000; // 直连竞速与兜底直连连接超时（对齐 edgetunnel 连接超时毫秒 = 1000）
-const PROXY_DIAL_TIMEOUT = 1000; // 代理竞速连接超时（对齐 edgetunnel 连接超时毫秒 = 1000）
+const DIRECT_DIAL_TIMEOUT = 5000; // 直连竞速与兜底直连连接超时（对齐 cfnew 连接超时值 = 5000）
+const PROXY_DIAL_TIMEOUT = 5000; // 代理竞速连接超时（对齐 cfnew 连接超时值 = 5000）
 const RACE_DIAL_CONCURRENCY = 3; // 并发拨号数量，参考 cfnew
 const RACE_DIAL_MAX_BATCHES = 5; // 最大重试批次
 
@@ -248,7 +248,7 @@ async function connectWithDirectRaceDial(
 
         log(`direct race dialing batch ${attemptedBatches}: ${batchCandidates.map(c => c.key).join(', ')}`);
 
-        // 并发拨号，每个候选独立超时保护
+        // 并发拨号，取最快成功的（对齐 cfnew 并发连接候选 Promise.any）
         const dialPromises = batchCandidates.map(async (candidate) => {
             const socket = connectSocket({ hostname: candidate.hostname, port: candidate.port }, fetcher);
             await Promise.race([
@@ -260,42 +260,33 @@ async function connectWithDirectRaceDial(
             return { socket, candidate };
         });
 
-        const results = await Promise.allSettled(dialPromises);
+        try {
+            const { socket, candidate } = await Promise.any(dialPromises);
+            // 写入首包载荷（对齐 cfnew L4759: if (值数据.byteLength) await 写入器.write(值数据)）
+            const writer = socket.writable.getWriter();
+            if (rawClientData && rawClientData.byteLength) {
+                await writer.write(rawClientData);
+            }
+            writer.releaseLock();
 
-        // 4. 取首个竞速成功的 socket，写首包后关闭其余候选，避免连接被重置
-        for (const result of results) {
-            if (result.status !== 'fulfilled' || !result.value || !result.value.socket) continue;
-            const { socket, candidate } = result.value;
-            try {
-                const writer = socket.writable.getWriter();
-                if (rawClientData && rawClientData.byteLength) {
-                    await writer.write(rawClientData);
-                }
-                writer.releaseLock();
-                // 关闭其余已建立的候选 socket，避免泄漏
-                for (const other of results) {
-                    if (other.status === 'fulfilled' && other.value && other.value.socket && other.value.socket !== socket) {
-                        try { other.value.socket.close(); } catch {}
+            // 关闭其余候选 socket（对齐 cfnew 并发连接候选关闭败者）
+            for (const p of dialPromises) {
+                p.then(({ socket: otherSocket }) => {
+                    if (otherSocket !== socket) {
+                        try { otherSocket.close(); } catch {}
                     }
-                }
-                blacklistClear(candidate.key); // 胜出候选清除黑名单
-                directPoolRoundRobin = candidate.index; // 轮询偏移指向胜出候选，下一轮优先尝试
-                log(`direct race dial winner: ${candidate.key}`);
-                return { socket, usedIp: candidate.hostname };
-            } catch (writeError) {
-                log(`direct race dial write failed for ${candidate.key}: ${safeErrorMessage(writeError)}`);
-                try { socket.close(); } catch {}
+                }).catch(() => {});
             }
-        }
 
-        // 5. 整批失败：关闭已建立的连接并记录黑名单（自动递增 failCount）
-        for (const result of results) {
-            if (result.status === 'fulfilled' && result.value && result.value.socket) {
-                try { result.value.socket.close(); } catch {}
+            blacklistClear(candidate.key);
+            directPoolRoundRobin = candidate.index;
+            log(`direct race dial winner: ${candidate.key}`);
+            return { socket, usedIp: candidate.hostname };
+        } catch (batchError) {
+            // 本批全部失败 → 记录黑名单（对齐 cfnew L4763）
+            for (const candidate of batchCandidates) {
+                blacklistRecord(candidate.key);
             }
-        }
-        for (const candidate of batchCandidates) {
-            blacklistRecord(candidate.key);
         }
     }
 
@@ -720,42 +711,74 @@ export async function handleTCPOutBound(
         return tcpSocket;
     }
 
-    // Helper: attempt direct race dial → fallback to local direct connect → stream to WS.
-    // Used by firstHopProxy retry (broken-proxy failover) and reusable for future paths.
-    async function connectDirectAndStream(): Promise<void> {
-        // Try direct race dial first
+    let hasRetryTriggered = false;
+
+    async function handleRetryConnection(): Promise<void> {
+        if (hasRetryTriggered) return;
+        hasRetryTriggered = true;
+
+        // 1. 只走代理模式（proxyOnly）且配置了上游代理：失败即关闭，不回退直连（防 IP 泄漏，对齐 cfnew 处理重试连接 L4816-4819）
+        if (proxyOnly && hasUpstreamProxy) {
+            safeCloseWebSocket(webSocket);
+            return;
+        }
+
+        // 2. 代理降级模式（proxyDegrade）且配置了上游代理：直连失败后回退上游代理（对齐 cfnew L4820-4827）
+        if (proxyDegrade && hasUpstreamProxy) {
+            try {
+                log(`retry: attempting upstream proxy for ${originalAddress}:${originalPort}`);
+                const upstreamSocket = await connectThroughUpstreamProxy(originalAddress, originalPort, rawClientData, fetcher);
+                if (upstreamSocket) {
+                    upstreamSocket.closed
+                        .catch(error => console.log('retry upstream-proxy TCP socket closed error', error))
+                        .finally(() => safeCloseWebSocket(webSocket));
+
+                    log(`retry upstream-proxy connected to ${originalAddress}:${originalPort}`);
+                    remoteSocket.value = upstreamSocket;
+                    remoteSocketToWS(upstreamSocket, webSocket, VLResponseHeader, null, log);
+                    return;
+                }
+            } catch (upstreamErr) {
+                log(`retry upstream proxy failed: ${safeErrorMessage(upstreamErr)}`);
+            }
+        }
+
+        // 3. 代理竞速回退（对齐 cfnew 回退地址 / 备用地址回退 L4829-4869）：直连失败后回退代理 IP 池
         try {
-            log(`retry-direct: attempting direct race dial for ${originalAddress}:${originalPort}`);
-            const { socket: tcpSocket, usedIp } = await connectWithDirectRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
+            log(`retry: attempting proxy race dial fallback for ${originalAddress}:${originalPort}`);
+            const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
 
             tcpSocket.closed
-                .catch(error => console.log('retry-direct race dial TCP socket closed error', error))
+                .catch(error => console.log('proxy race dial fallback TCP socket closed error', error))
                 .finally(() => safeCloseWebSocket(webSocket));
 
-            log(`retry-direct race dial connected via ${usedIp}:${originalPort}`);
+            log(`proxy race dial fallback connected via ${usedIp}:${originalPort}`);
             remoteSocket.value = tcpSocket;
             remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
             return;
-        } catch (directError) {
-            log(`retry-direct race dial failed: ${safeErrorMessage(directError)}`);
+        } catch (proxyErr) {
+            log(`retry: proxy race dial fallback failed: ${safeErrorMessage(proxyErr)}`);
+            console.warn(`Proxy race dial fallback failed: ${proxyErr}`);
         }
 
-        // Final fallback: local direct connect
+        // 4. 直连兜底（最后策略）
         try {
-            log(`retry-direct: falling back to direct connection for ${originalAddress}:${originalPort}`);
+            log(`retry: falling back to direct connection for ${originalAddress}:${originalPort}`);
             const tcpSocket = await connectAndWriteLocal(originalAddress, originalPort, fetcher);
             tcpSocket.closed
-                .catch(error => console.log('retry-direct TCP socket closed error', error))
+                .catch(error => console.log('direct TCP socket closed error', error))
                 .finally(() => safeCloseWebSocket(webSocket));
+            remoteSocket.value = tcpSocket;
             remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
-        } catch (directError) {
-            console.error('retry-direct: All direct connection strategies failed:', directError);
-            webSocket.close(1011, `Retry direct connection failed: ${safeErrorMessage(directError)}`);
+            return;
+        } catch (finalDirectError) {
+            console.error('retry: All connection strategies failed:', finalDirectError);
+            webSocket.close(1011, `All connection strategies failed: ${safeErrorMessage(finalDirectError)}`);
         }
     }
 
     // 获取 proxyMode 与首跳决策配置（对齐 cfnew 处理值值384 首跳决策）
-    const { proxyMode, proxyOnly, proxyDegrade, hasCustomProxyIPs } = globalThis.wsConfig as WsConfig;
+    const { proxyMode, proxyOnly, proxyDegrade } = globalThis.wsConfig as WsConfig;
 
     // 模式 1: prefix (NAT64) - 仅前端显式选择时使用（原逻辑不变，失败不回退）
     if (proxyMode === 'prefix') {
@@ -768,24 +791,31 @@ export async function handleTCPOutBound(
                 .finally(() => safeCloseWebSocket(webSocket));
             
             log(`prefix fallback connected via ${usedIp}:${originalPort}`);
-            // 修复：与竞速拨号分支一致，登记 remoteSocket 以便后续数据转发
             remoteSocket.value = tcpSocket;
             remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
             return;
         } catch (error) {
             log(`prefix fallback failed: ${safeErrorMessage(error)}`);
             console.warn(`Prefix fallback failed: ${error}`);
-            // prefix 模式失败直接报错，不回退到其他策略
             webSocket.close(1011, `Prefix fallback failed: ${safeErrorMessage(error)}`);
             return;
         }
     }
 
-    // Upstream proxy (SOCKS5/HTTP CONNECT) — primary strategy when configured
-    // Falls through to existing fallback chain (firstHopProxy → direct → proxy race → direct fallback) on failure
-    if (globalThis.settings?.upstreamProxy) {
+    // 对齐 cfnew 首跳决策（处理值值384 L4873）：
+    //   首跳走代理 = 仅走代理 && 实际代理已启用 ? true : 代理降级 ? false : 实际代理已启用
+    // 在 cfnew 中，“代理已启用”严格指代 SOCKS5 / HTTP 上游代理（参数 s / settings.upstreamProxy）。
+    // p（自定义反代 IP / 备用地址池）为回退备用，首跳直连失败或超时才走 p。
+    // 仅走代理（proxyOnly）→ 必走上游代理，失败即关闭（防 IP 泄漏，不回退直连）
+    // 代理降级（proxyDegrade）→ 首跳直连优先，失败回退上游代理，再回退反代 IP
+    // 默认（无代理/未配置上游代理）→ 首跳直连优先，直连失败或无响应超时（6s）回退反代 IP
+    const hasUpstreamProxy = Boolean(globalThis.settings?.upstreamProxy);
+    const firstHopProxy = proxyOnly && hasUpstreamProxy ? true : proxyDegrade ? false : hasUpstreamProxy;
+
+    // 首跳走代理（配置了上游代理，且非代理降级模式）
+    if (firstHopProxy) {
         try {
-            log(`upstream-proxy: attempting SOCKS5/HTTP CONNECT for ${originalAddress}:${originalPort}`);
+            log(`proxy-first: attempting upstream proxy for ${originalAddress}:${originalPort}`);
             const upstreamSocket = await connectThroughUpstreamProxy(originalAddress, originalPort, rawClientData, fetcher);
             if (upstreamSocket) {
                 upstreamSocket.closed
@@ -794,118 +824,49 @@ export async function handleTCPOutBound(
 
                 log(`upstream-proxy connected to ${originalAddress}:${originalPort}`);
                 remoteSocket.value = upstreamSocket;
-                remoteSocketToWS(upstreamSocket, webSocket, VLResponseHeader, null, log);
+                // 传 retry 回调以便 FIRST_BYTE_TIMEOUT 超时触发回退
+                remoteSocketToWS(upstreamSocket, webSocket, VLResponseHeader, () => {
+                    log(`upstream-proxy: no data within FIRST_BYTE_TIMEOUT, retrying fallback`);
+                    try { upstreamSocket.close?.(); } catch {}
+                    handleRetryConnection();
+                }, log);
                 return;
             }
         } catch (upstreamError) {
             log(`upstream-proxy failed: ${safeErrorMessage(upstreamError)}`);
             console.warn(`Upstream proxy failed: ${upstreamError}`);
-            // Fall through to existing fallback chain
-        }
-    }
-
-    // 对齐 cfnew 首跳决策（处理值值384 L4873）：
-    //   首跳走代理 = 仅走代理 && 代理已启用 ? true : 代理降级 ? false : 代理已启用
-    // 对齐 cfnew 的"直连"语义（处理值套接字 调用 配置.connect(目标)）：
-    //   首跳连接的目标 = 代理 IP（p，指定地区解析出的代理 IP 池），通过 Worker 地区 IP 连接 p，p 再转发到真正目标。
-    //   对应 BPB 的 connectWithRaceDial（连接 panelIPs 代理 IP 池）。
-    //   因此 firstHopProxy 由 p（hasCustomProxyIPs）决定：配置 p → 首跳走 connectWithRaceDial（通过代理 IP）。
-    // 仅走代理（proxyOnly）→ 必走代理，失败即关闭（防 IP 泄漏，不回退直连）
-    // 代理降级（proxyDegrade）→ 直连优先，代理作为回退
-    // 默认 → 有自定义代理 IP（前端指定地区）时代理优先，直连回退；无代理则直连优先
-    const hasProxyIPs = hasCustomProxyIPs === true;
-    const firstHopProxy = proxyOnly && hasProxyIPs ? true : proxyDegrade ? false : hasProxyIPs;
-
-    // 首跳走代理：代理竞速拨号优先（对齐 cfnew 连接值发送 值代理=true 路径）
-    if (firstHopProxy) {
-        try {
-            log(`proxy-first: attempting proxy race dial for ${originalAddress}:${originalPort}`);
-            const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
-            
-            tcpSocket.closed
-                .catch(error => console.log('proxy race dial TCP socket closed error', error))
-                .finally(() => safeCloseWebSocket(webSocket));
-            
-            log(`proxy race dial connected via ${usedIp}:${originalPort}`);
-            // 首包写入已在 connectWithRaceDial 内完成（对齐 cfnew 连接值发送直连路径：竞速胜出后直接写载荷），
-            // 此处只需登记 remoteSocket 供后续数据转发。
-            remoteSocket.value = tcpSocket;
-            // Pass retry to enable FIRST_BYTE_TIMEOUT: if proxy is reachable but broken
-            // (TCP connects but no data forwarded), retry fires and falls back to direct connection.
-            // Guarded by local flag + remoteSocketToWS's hasRetryFired to prevent double-fire.
-            let proxyRetryFired = false;
-            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, () => {
-                if (proxyRetryFired) return;
-                proxyRetryFired = true;
-                log(`proxy-first: no data within FIRST_BYTE_TIMEOUT, closing broken proxy socket and falling back to direct`);
-                try { tcpSocket.close?.(); } catch {}
-                connectDirectAndStream();
-            }, log);
-            return;
-        } catch (proxyError) {
-            log(`proxy race dial failed: ${safeErrorMessage(proxyError)}`);
-            console.warn(`Proxy race dial failed: ${proxyError}`);
-            // 仅走代理模式：失败即关闭，不回退直连（防 IP 泄漏，对齐 cfnew 处理重试连接 L4816-4819）
             if (proxyOnly) {
-                webSocket.close(1011, `Proxy-only mode failed: ${safeErrorMessage(proxyError)}`);
+                webSocket.close(1011, `Proxy-only mode failed: ${safeErrorMessage(upstreamError)}`);
                 return;
             }
-            // 默认模式（有代理）：代理失败后回退直连竞速与兜底直连
+            await handleRetryConnection();
+            return;
         }
     }
 
-    // 直连优先（对齐 edgetunnel 默认策略 / cfnew 代理降级首跳）：直连竞速拨号
+    // 首跳走直连（默认策略 / 代理降级首跳）：直连竞速拨号
     try {
         log(`attempting direct race dial for ${originalAddress}:${originalPort}`);
         const { socket: tcpSocket, usedIp } = await connectWithDirectRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
-        
+
         tcpSocket.closed
             .catch(error => console.log('direct race dial TCP socket closed error', error))
             .finally(() => safeCloseWebSocket(webSocket));
-        
+
         log(`direct race dial connected via ${usedIp}:${originalPort}`);
-        // 首包写入已在 connectWithDirectRaceDial 内完成（对齐 edgetunnel 直连路径：竞速胜出后直接写载荷），
-        // 此处只需登记 remoteSocket 供后续数据转发。
         remoteSocket.value = tcpSocket;
-        remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+        // 关键对齐 cfnew：传 retry 回调，直连握手成功但 6s 首字节超时无数据时触发回退重试！
+        remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, () => {
+            log(`direct race dial: no data within FIRST_BYTE_TIMEOUT, retrying fallback`);
+            try { tcpSocket.close?.(); } catch {}
+            handleRetryConnection();
+        }, log);
         return;
     } catch (directError) {
         log(`direct race dial failed: ${safeErrorMessage(directError)}`);
         console.warn(`Direct race dial failed: ${directError}`);
-        // 直连失败后继续走代理竞速与直连兜底，不能直接 close
-    }
-
-    // 代理竞速回退（cfnew 风格竞速拨号）：直连失败后，或默认模式代理首跳失败后的回退
-    try {
-        log(`attempting proxy race dial fallback for ${originalAddress}:${originalPort}`);
-        const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
-        
-        tcpSocket.closed
-            .catch(error => console.log('proxy race dial fallback TCP socket closed error', error))
-            .finally(() => safeCloseWebSocket(webSocket));
-        
-        log(`proxy race dial fallback connected via ${usedIp}:${originalPort}`);
-        // 首包写入已在 connectWithRaceDial 内完成（对齐 cfnew 连接值发送直连路径：竞速胜出后直接写载荷），
-        // 此处只需登记 remoteSocket 供后续数据转发。
-        remoteSocket.value = tcpSocket;
-        remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+        await handleRetryConnection();
         return;
-    } catch (error) {
-        log(`proxy race dial fallback failed: ${safeErrorMessage(error)}`);
-        console.warn(`Proxy race dial fallback failed: ${error}`);
-        
-        // 直连兜底（最后策略）
-        try {
-            log(`falling back to direct connection for ${originalAddress}:${originalPort}`);
-            const tcpSocket = await connectAndWriteLocal(originalAddress, originalPort, fetcher);
-            tcpSocket.closed
-                .catch(error => console.log('direct TCP socket closed error', error))
-                .finally(() => safeCloseWebSocket(webSocket));
-            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
-        } catch (directError) {
-            console.error('Direct connection failed:', directError);
-            webSocket.close(1011, `All connection strategies failed: ${safeErrorMessage(directError)}`);
-        }
     }
 }
 
@@ -914,7 +875,7 @@ const DOWNLOAD_PACKET_SIZE = 32 * 1024;  // 传输下载包大小：批量缓冲
 const DOWNLOAD_TAIL = 512;                // 传输下载尾部：剩余空间阈值触发刷新
 const DOWNLOAD_DELAY = 0;                 // 传输下载延迟：0ms（用 queueMicrotask 刷新）
 const DOWNLOAD_BLOCK_SIZE = 64 * 1024;    // 传输块大小：BYOB reader 复用缓冲
-const FIRST_BYTE_TIMEOUT = 2000;          // 首字节超时 ms（触发 retry 降级）
+const FIRST_BYTE_TIMEOUT = 6000;          // 首字节超时 ms（触发 retry 降级）
 
 // --- Uint8Array helpers (aligned with cfnew 处理值值8数组 / 拼接值8数组) ---
 function toUint8Array(data: ArrayBufferView | ArrayBuffer | Uint8Array): Uint8Array {

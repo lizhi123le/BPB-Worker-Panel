@@ -239,8 +239,8 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                     }
                 }
 
-                // 测速拦截：无代理时本地 204 响应（对齐 cfnew L4679-4681）
-                if (isSpeedTestSite(addressRemote) && !globalThis.wsConfig.hasCustomProxyIPs) {
+                // 测速拦截：无上游代理时本地 204 响应（对齐 cfnew L4679-4681）
+                if (isSpeedTestSite(addressRemote) && !globalThis.settings?.upstreamProxy) {
                     await enableWsLocalSpeedTestMode(webSocket, VLResponseHeader, rawClientData);
                     return;
                 }
@@ -284,8 +284,8 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                     }
                 }
 
-                // 测速拦截：无代理时本地 204 响应（对齐 cfnew L4703-4705）
-                if (isSpeedTestSite(addressRemote) && !globalThis.wsConfig.hasCustomProxyIPs) {
+                // 测速拦截：无上游代理时本地 204 响应（对齐 cfnew L4703-4705）
+                if (isSpeedTestSite(addressRemote) && !globalThis.settings?.upstreamProxy) {
                     await enableWsLocalSpeedTestMode(webSocket, null, rawClientData);
                     return;
                 }
@@ -341,8 +341,8 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                         }
                     }
 
-                    // 测速拦截：无代理时本地 204 响应（对齐 cfnew L4679-4681）
-                    if (isSpeedTestSite(addressRemote) && !globalThis.wsConfig.hasCustomProxyIPs) {
+                    // 测速拦截：无上游代理时本地 204 响应（对齐 cfnew L4679-4681）
+                    if (isSpeedTestSite(addressRemote) && !globalThis.settings?.upstreamProxy) {
                         await enableWsLocalSpeedTestMode(webSocket, VLResponseHeader, rawClientData);
                         return;
                     }
@@ -393,8 +393,8 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                         }
                     }
 
-                    // 测速拦截：无代理时本地 204 响应（对齐 cfnew L4703-4705）
-                    if (isSpeedTestSite(addressRemote) && !globalThis.wsConfig.hasCustomProxyIPs) {
+                    // 测速拦截：无上游代理时本地 204 响应（对齐 cfnew L4703-4705）
+                    if (isSpeedTestSite(addressRemote) && !globalThis.settings?.upstreamProxy) {
                         await enableWsLocalSpeedTestMode(webSocket, null, rawClientData);
                         return;
                     }
@@ -864,13 +864,55 @@ function parseDNSResponseTTL(packet: Uint8Array): number {
     return minTTL;
 }
 
+// ===== 模块级 DNS 响应缓存（对齐 cfnew 域名系统缓存映射）=====
+interface DNSCacheEntry {
+    response: Uint8Array;
+    expiresAt: number;
+}
+const globalDNSCache = new Map<string, DNSCacheEntry>();
+const DNS_CACHE_MAX = 1024;
+
+function setDNSCache(dnsPayload: Uint8Array) {
+    const ancount = (dnsPayload[6] << 8) | dnsPayload[7];
+    if (ancount === 0) return; // NXDOMAIN or empty — don't cache
+    const cacheInfo = parseDNSQueryInfo(dnsPayload);
+    if (cacheInfo && dnsPayload.length >= 2) {
+        const key = `${cacheInfo.domain}|${cacheInfo.qtype}|${cacheInfo.qclass}`;
+        if (globalDNSCache.size >= DNS_CACHE_MAX) {
+            const firstKey = globalDNSCache.keys().next().value;
+            if (firstKey) globalDNSCache.delete(firstKey);
+        }
+        const ttl = parseDNSResponseTTL(dnsPayload);
+        const expiresAt = Date.now() + Math.min(86400, Math.max(60, ttl)) * 1000;
+        globalDNSCache.set(key, { response: dnsPayload, expiresAt });
+    }
+}
+
+function getDNSCache(dnsQueryPacket: Uint8Array): Uint8Array | null {
+    const info = parseDNSQueryInfo(dnsQueryPacket);
+    if (!info) return null;
+    const key = `${info.domain}|${info.qtype}|${info.qclass}`;
+    const cached = globalDNSCache.get(key);
+    if (cached && Date.now() < cached.expiresAt) {
+        // 对齐 cfnew L5425：复制缓存响应并将事务 ID 替换为当前查询的 ID
+        const resp = new Uint8Array(cached.response.length);
+        resp.set(cached.response);
+        if (dnsQueryPacket.length >= 2) {
+            resp[0] = dnsQueryPacket[0];
+            resp[1] = dnsQueryPacket[1];
+        }
+        return resp;
+    }
+    if (cached) {
+        globalDNSCache.delete(key);
+    }
+    return null;
+}
+
 async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Array<ArrayBuffer> | null, log: Function, protocol: 'vless' | 'trojan', fetcher?: any) {
     if (protocol === 'vless') {
         // VLESS UDP DNS: TCP socket to 8.8.4.4:53 with caching (cfnew style)
         let isVLHeaderSent = false;
-
-        const cache = new Map<string, { response: Uint8Array; expiresAt: number }>();
-        const CACHE_MAX = 1024;
 
         const socket = connectSocket({ hostname: '8.8.4.4', port: 53 }, fetcher);
         await Promise.race([
@@ -939,24 +981,8 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
                             isVLHeaderSent = true;
                         }
 
-                        // Cache by domain|qtype|qclass with TTL expiry
-                        const ancount = (dnsPayload[6] << 8) | dnsPayload[7];
-                        if (ancount === 0) {
-                            // NXDOMAIN or empty — don't cache
-                            offset = dnsEnd;
-                            continue;
-                        }
-                        const cacheInfo = parseDNSQueryInfo(dnsPayload);
-                        if (cacheInfo && dnsPayload.length >= 2) {
-                            const key = `${cacheInfo.domain}|${cacheInfo.qtype}|${cacheInfo.qclass}`;
-                            if (cache.size >= CACHE_MAX) {
-                                const firstKey = cache.keys().next().value;
-                                if (firstKey) cache.delete(firstKey);
-                            }
-                            const ttl = parseDNSResponseTTL(dnsPayload);
-                            const expiresAt = Date.now() + Math.min(86400, Math.max(60, ttl)) * 1000;
-                            cache.set(key, { response: dnsPayload, expiresAt });
-                        }
+                        // Save to global DNS cache
+                        setDNSCache(dnsPayload);
 
                         offset = dnsEnd;
                     }
@@ -976,8 +1002,6 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
         };
         handleVLESSDNSResponse();
 
-        log('VLESS DNS TCP connected to 8.8.4.4:53');
-
         return {
             async write(chunk: ArrayBuffer) {
                 const data = new Uint8Array(chunk);
@@ -985,38 +1009,31 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
                 // length prefix so parseDNSQueryInfo parses the DNS header at offset 0.
                 const dnsPacket = data.length >= 2 ? data.subarray(2) : data;
                 // Cache lookup: parse DNS query to get domain|qtype|qclass
-                const info = parseDNSQueryInfo(dnsPacket);
-                const key = info ? `${info.domain}|${info.qtype}|${info.qclass}` : null;
-                if (key) {
-                    const cached = cache.get(key);
-                    if (cached && Date.now() < cached.expiresAt) {
-                        // Cache hit: send cached response directly to client (align cfnew L5495)
-                        // Frame: VLResponseHeader (first only) + [2B length BE] + cachedResponse
-                        const lenHi = (cached.response.length >> 8) & 0xff;
-                        const lenLo = cached.response.length & 0xff;
-                        if (isVLHeaderSent) {
-                            const frame = new Uint8Array(2 + cached.response.length);
-                            frame[0] = lenHi;
-                            frame[1] = lenLo;
-                            frame.set(cached.response, 2);
-                            if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                                webSocket.send(frame.buffer);
-                            }
-                        } else {
-                            const frame = new Uint8Array(VLResponseHeader!.length + 2 + cached.response.length);
-                            frame.set(VLResponseHeader!, 0);
-                            frame[VLResponseHeader!.length] = lenHi;
-                            frame[VLResponseHeader!.length + 1] = lenLo;
-                            frame.set(cached.response, VLResponseHeader!.length + 2);
-                            if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                                webSocket.send(frame.buffer);
-                            }
-                            isVLHeaderSent = true;
+                const cachedResp = getDNSCache(dnsPacket);
+                if (cachedResp) {
+                    // Cache hit: send cached response directly to client (align cfnew L5495)
+                    const lenHi = (cachedResp.length >> 8) & 0xff;
+                    const lenLo = cachedResp.length & 0xff;
+                    if (isVLHeaderSent) {
+                        const frame = new Uint8Array(2 + cachedResp.length);
+                        frame[0] = lenHi;
+                        frame[1] = lenLo;
+                        frame.set(cachedResp, 2);
+                        if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                            webSocket.send(frame.buffer);
                         }
-                        return; // cache hit — do NOT forward to DNS socket
-                    } else if (cached) {
-                        cache.delete(key); // expired
+                    } else {
+                        const frame = new Uint8Array(VLResponseHeader!.length + 2 + cachedResp.length);
+                        frame.set(VLResponseHeader!, 0);
+                        frame[VLResponseHeader!.length] = lenHi;
+                        frame[VLResponseHeader!.length + 1] = lenLo;
+                        frame.set(cachedResp, VLResponseHeader!.length + 2);
+                        if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                            webSocket.send(frame.buffer);
+                        }
+                        isVLHeaderSent = true;
                     }
+                    return; // cache hit — do NOT forward to DNS socket
                 }
                 // Cache miss: forward to DNS socket. data already carries the 2-byte
                 // TCP DNS length prefix (VLESS UDP payload), so write it directly (align cfnew L5506).
@@ -1025,13 +1042,9 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
         };
     } else {
         // Trojan UDP DNS: Parse Trojan UDP packets, forward to 8.8.4.4:53 via TCP, reconstruct responses
-        // 对齐 cfnew：共享 DNS 缓存（VLESS + Trojan 复用），键 = DNS查询ID(前2字节) + 长度
-        const dnsCache = new Map<string, Uint8Array>();
-        const DNS_CACHE_MAX = 1024;
-
         let dnsBuffer = new Uint8Array(0);
         const DNS_MAX_BUF = 65536;
-        let currentRequestHeader: Uint8Array | null = null; // Stores addrType + addr + port + CR LF from request
+        let currentRequestHeader: Uint8Array | null = null; // Stores addrType + addr + port from request
 
         async function handleTrojanUDPResponse(socket: Socket) {
             const reader = socket.readable.getReader();
@@ -1063,51 +1076,25 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
 
                         const dnsPayload = dnsBuffer.slice(dnsStart, dnsEnd);
 
-                        // 对齐 cfnew：DNS 缓存查询/存储（键 = DNS查询ID + 长度）
-                        let cacheKey = '';
-                        if (dnsPayload.length >= 2) {
-                            cacheKey = `${dnsPayload[0]}${dnsPayload[1]}:${dnsPayload.length}`;
-                            const cached = dnsCache.get(cacheKey);
-                            if (cached) {
-                                // 缓存命中：直接发送缓存的响应
-                                const frame = new Uint8Array(
-                                    currentRequestHeader!.length + 2 + cached.length + 2
-                                );
-                                frame.set(currentRequestHeader!, 0);
-                                frame[currentRequestHeader!.length] = (cached.length >> 8) & 0xff;
-                                frame[currentRequestHeader!.length + 1] = cached.length & 0xff;
-                                frame.set(cached, currentRequestHeader!.length + 2);
-                                frame[frame.length - 2] = 0x0d;
-                                frame[frame.length - 1] = 0x0a;
-                                if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                                    webSocket.send(frame.buffer);
-                                }
-                                offset = dnsEnd;
-                                continue;
-                            }
-                        }
-
                         // Build Trojan UDP response frame:
-                        // addrType + addr + port + CR LF + 2-byte length + payload + CR LF
+                        // [addrType + addr + port] + [2B length BE] + [0x0d, 0x0a] + [payload]
                         if (currentRequestHeader) {
                             const frame = new Uint8Array(
-                                currentRequestHeader.length + 2 + dnsPayload.length + 2
+                                currentRequestHeader.length + 4 + dnsPayload.length
                             );
                             frame.set(currentRequestHeader, 0);
                             frame[currentRequestHeader.length] = (dnsPayload.length >> 8) & 0xff;
                             frame[currentRequestHeader.length + 1] = dnsPayload.length & 0xff;
-                            frame.set(dnsPayload, currentRequestHeader.length + 2);
-                            frame[frame.length - 2] = 0x0d; // CR
-                            frame[frame.length - 1] = 0x0a; // LF
+                            frame[currentRequestHeader.length + 2] = 0x0d;
+                            frame[currentRequestHeader.length + 3] = 0x0a;
+                            frame.set(dnsPayload, currentRequestHeader.length + 4);
                             if (webSocket.readyState === WS_READY_STATE_OPEN) {
                                 webSocket.send(frame.buffer);
                             }
                         }
 
-                        // 存入缓存
-                        if (cacheKey && dnsCache.size < DNS_CACHE_MAX) {
-                            dnsCache.set(cacheKey, dnsPayload);
-                        }
+                        // Save to global DNS cache
+                        setDNSCache(dnsPayload);
 
                         offset = dnsEnd;
                     }
@@ -1141,41 +1128,52 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
             async write(chunk: ArrayBuffer) {
                 const data = new Uint8Array(chunk);
                 
-                // Parse incoming Trojan UDP packet to extract address/port header
-                // Format: addrType + addr + port + CR LF + 2-byte length + payload + CR LF
-                if (data.length >= 3) {
-                    const addrType = data[0];
-                    let addrLen = 0;
-                    let headerEnd = 1;
-                    
-                    if (addrType === 1) { // IPv4
-                        addrLen = 4;
-                        headerEnd = 1 + 4;
-                    } else if (addrType === 4) { // IPv6
-                        addrLen = 16;
-                        headerEnd = 1 + 16;
-                    } else if (addrType === 3) { // Domain
-                        if (data.length >= 2) {
-                            addrLen = data[1];
-                            headerEnd = 2 + addrLen;
-                        }
+                // Parse incoming Trojan UDP packet:
+                // Format: addrType (1B) + addr + port (2B) + payloadLen (2B) + CRLF (2B) + payload
+                if (data.length < 7) return;
+                const atype = data[0];
+                let addrLen = 0;
+                if (atype === 1) addrLen = 4;
+                else if (atype === 4) addrLen = 16;
+                else if (atype === 3) {
+                    addrLen = 1 + data[1];
+                } else return;
+
+                const portIdx = 1 + addrLen;
+                if (data.length < portIdx + 6) return;
+
+                const addrHeader = data.slice(0, portIdx + 2); // addrType + addr + port
+                currentRequestHeader = addrHeader;
+
+                const payloadLen = (data[portIdx + 2] << 8) | data[portIdx + 3];
+                const payloadStart = portIdx + 6; // skips port(2B) + length(2B) + CRLF(2B)
+                const payloadEnd = payloadStart + payloadLen;
+                if (data.length < payloadEnd) return;
+
+                const dnsQuery = data.slice(payloadStart, payloadEnd);
+
+                // Check global DNS cache
+                const cachedResp = getDNSCache(dnsQuery);
+                if (cachedResp) {
+                    // Cache hit: send Trojan UDP response frame directly
+                    const frame = new Uint8Array(addrHeader.length + 4 + cachedResp.length);
+                    frame.set(addrHeader, 0);
+                    frame[addrHeader.length] = (cachedResp.length >> 8) & 0xff;
+                    frame[addrHeader.length + 1] = cachedResp.length & 0xff;
+                    frame[addrHeader.length + 2] = 0x0d;
+                    frame[addrHeader.length + 3] = 0x0a;
+                    frame.set(cachedResp, addrHeader.length + 4);
+                    if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                        webSocket.send(frame.buffer);
                     }
-                    
-                    if (data.length >= headerEnd + 2) {
-                        // Check for CR LF after address+port
-                        if (data[headerEnd] === 0x0d && data[headerEnd + 1] === 0x0a) {
-                            // Found complete header: addrType + addr + port + CR LF
-                            // Save for response framing
-                            currentRequestHeader = data.slice(0, headerEnd + 2);
-                        }
-                    }
+                    return;
                 }
-                
-                // Add 2-byte TCP DNS length prefix and forward
-                const prefixed = new Uint8Array(data.length + 2);
-                prefixed[0] = (data.length >> 8) & 0xff;
-                prefixed[1] = data.length & 0xff;
-                prefixed.set(data, 2);
+
+                // Cache miss: add 2-byte TCP DNS length prefix and forward to 8.8.4.4:53
+                const prefixed = new Uint8Array(dnsQuery.length + 2);
+                prefixed[0] = (dnsQuery.length >> 8) & 0xff;
+                prefixed[1] = dnsQuery.length & 0xff;
+                prefixed.set(dnsQuery, 2);
                 await writer.write(prefixed);
             },
         };
