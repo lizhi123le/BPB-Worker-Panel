@@ -755,7 +755,7 @@ export async function handleTCPOutBound(
     }
 
     // 获取 proxyMode 与首跳决策配置（对齐 cfnew 处理值值384 首跳决策）
-    const { proxyMode, proxyOnly, proxyDegrade, hasCustomProxyIPs } = globalThis.wsConfig as WsConfig;
+    const { proxyMode, proxyOnly, proxyDegrade } = globalThis.wsConfig as WsConfig;
 
     // 模式 1: prefix (NAT64) - 仅前端显式选择时使用（原逻辑不变，失败不回退）
     if (proxyMode === 'prefix') {
@@ -806,11 +806,13 @@ export async function handleTCPOutBound(
 
     // 对齐 cfnew 首跳决策（处理值值384 L4873）：
     //   首跳走代理 = 仅走代理 && 代理已启用 ? true : 代理降级 ? false : 代理已启用
+    // 严格对齐 cfnew 的"是否启用代理"语义：代理已启用 只由 SOCKS5（s/upstreamProxy）决定，
+    // p（代理 IP）不参与。配置 p 无 SOCKS5 → 代理未启用 → 首跳走直连（connectWithDirectRaceDial）。
     // 仅走代理（proxyOnly）→ 必走代理，失败即关闭（防 IP 泄漏，不回退直连）
     // 代理降级（proxyDegrade）→ 直连优先，代理作为回退
-    // 默认 → 有自定义代理 IP（前端指定地区）时代理优先，直连回退；无代理则直连优先（对齐 edgetunnel）
-    const hasProxyIPs = hasCustomProxyIPs === true;
-    const firstHopProxy = proxyOnly && hasProxyIPs ? true : proxyDegrade ? false : hasProxyIPs;
+    // 默认 → 有 SOCKS5 时代理优先，直连回退；无 SOCKS5 则直连优先（对齐 cfnew）
+    const hasUpstreamProxy = !!globalThis.settings?.upstreamProxy;
+    const firstHopProxy = proxyOnly && hasUpstreamProxy ? true : proxyDegrade ? false : hasUpstreamProxy;
 
     // 首跳走代理：代理竞速拨号优先（对齐 cfnew 连接值发送 值代理=true 路径）
     if (firstHopProxy) {
