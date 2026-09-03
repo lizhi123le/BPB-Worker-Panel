@@ -914,7 +914,7 @@ const DOWNLOAD_PACKET_SIZE = 32 * 1024;  // 传输下载包大小：批量缓冲
 const DOWNLOAD_TAIL = 512;                // 传输下载尾部：剩余空间阈值触发刷新
 const DOWNLOAD_DELAY = 0;                 // 传输下载延迟：0ms（用 queueMicrotask 刷新）
 const DOWNLOAD_BLOCK_SIZE = 64 * 1024;    // 传输块大小：BYOB reader 复用缓冲
-const FIRST_BYTE_TIMEOUT = 6000;          // 首字节超时 ms（触发 retry 降级）
+const FIRST_BYTE_TIMEOUT = 2000;          // 首字节超时 ms（触发 retry 降级）
 
 // --- Uint8Array helpers (aligned with cfnew 处理值值8数组 / 拼接值8数组) ---
 function toUint8Array(data: ArrayBufferView | ArrayBuffer | Uint8Array): Uint8Array {
