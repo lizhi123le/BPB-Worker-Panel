@@ -499,9 +499,17 @@ function updateSettings(event, data) {
 }
 
 function parseElmValues(id) {
-    return document.getElementById(id).value?.split('\n')
+    const val = document.getElementById(id)?.value;
+    if (!val) return [];
+    return val.split('\n')
         .map(value => value.trim())
-        .filter(Boolean) || [];
+        .filter(Boolean)
+        .flatMap(line => {
+            if (line.includes(',') && !line.startsWith('#') && !line.startsWith('//')) {
+                return line.split(',').map(s => s.trim()).filter(Boolean);
+            }
+            return [line];
+        });
 }
 
 function getElmValue(id) {
@@ -713,7 +721,8 @@ function parseAddressEntry(value) {
 
 function validateMultipleHostNames() {
     const invalidValues = [
-        'cleanIPs'
+        'cleanIPs',
+        'customCdnAddrs'
     ].flatMap(parseElmValues)
         .filter(v => !v.startsWith('http://') && !v.startsWith('https://'))
         .map(parseAddressEntry)
@@ -1177,7 +1186,26 @@ function validateSettings() {
     textareaElements.forEach(elm => {
         const key = elm.id;
         const value = form[key];
-        form[key] = value?.split('\n').map(val => val.trim()).filter(Boolean) || [];
+        let items = value?.split('\n').map(val => val.trim()).filter(Boolean) || [];
+        if (['cleanIPs', 'proxyIPs', 'customCdnAddrs', 'hostSniList'].includes(key)) {
+            items = items.flatMap(line => {
+                if (line.includes(',') && !line.startsWith('#') && !line.startsWith('//')) {
+                    return line.split(',').map(s => s.trim()).filter(Boolean);
+                }
+                return [line];
+            });
+            // 去重（保持先后顺序），URL 或普通条目归一化防重
+            const seen = new Set();
+            items = items.filter(item => {
+                const norm = (item.startsWith('http://') || item.startsWith('https://'))
+                    ? item.toLowerCase()
+                    : item;
+                if (seen.has(norm)) return false;
+                seen.add(norm);
+                return true;
+            });
+        }
+        form[key] = items;
     });
 
     return form;

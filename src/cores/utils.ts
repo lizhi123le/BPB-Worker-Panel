@@ -104,71 +104,227 @@ function fnv1aHash(str: string): string {
     return hash.toString(16).padStart(8, '0');
 }
 
-/** Parse fetched text into cleaned address lines (comment-stripped, IPv6 bracket-wrapped) */
-function parseUrlLines(text: string): string[] {
-    return text.split('\n')
-        .map(l => l.trim())
-        .filter(l => l && !l.startsWith('#') && !l.startsWith('//'))
-        .map(l => {
-            const hashIdx = l.indexOf('#');
-            const addrPart = (hashIdx >= 0 ? l.slice(0, hashIdx) : l).trim();
-            const namePart = hashIdx >= 0 ? l.slice(hashIdx) : '';
-            if ((addrPart.match(/:/g) || []).length >= 2 && !addrPart.startsWith('[')) {
-                return `[${addrPart}]${namePart}`;
-            }
-            return l;
-        });
+/**
+ * ★ 节点去重键归一化（对齐 cfnew 提取节点去重键 / edgetunnel 提取IP键）
+ * 消除同地址因格式差异（IPv6 是否带括号、是否缺省 443 端口、大小写、@区域标签）导致的漏去重
+ */
+export function extractNodeDedupKey(entry: string, defaultPort = '443'): string {
+    const noComment = entry.split('#')[0].trim();
+    const atIdx = noComment.lastIndexOf('@');
+    const bare = atIdx !== -1 ? noComment.slice(0, atIdx).trim() : noComment;
+    const lastColon = bare.lastIndexOf(':');
+    let host = bare;
+    let port = defaultPort;
+
+    if (lastColon === -1) {
+        // 无冒号（IPv4 / 域名）→ 补缺省端口
+        host = bare;
+    } else if (bare.includes('[') && lastColon < bare.lastIndexOf(']')) {
+        // 带括号 IPv6 且冒号全部在括号内（[2606::1] 缺端口）→ 补端口
+        host = bare;
+    } else if (/^[0-9a-fA-F:]+$/.test(bare)) {
+        // 裸 IPv6（纯十六进制+冒号，无括号）→ 补括号 + 端口
+        host = `[${bare}]`;
+    } else {
+        // 已带端口（1.1.1.1:8443 / [2606::1]:8443 / host:port）
+        host = bare.slice(0, lastColon);
+        port = bare.slice(lastColon + 1) || defaultPort;
+    }
+    return `${host.toLowerCase()}:${port}`;
 }
 
-/** Resolve URL entries in an array — fetches http/https URLs and replaces them with their content lines.
- *  When an Env with a KV binding is provided, fetched results are cached in KV under a
- *  per-URL key with a TTL to avoid repeated network calls within the cache window. */
-export async function resolveUrlEntries(entries: string[], env?: Env): Promise<string[]> {
-    const resolved: string[] = [];
-    for (const entry of entries) {
-        if (entry.startsWith('http://') || entry.startsWith('https://')) {
-            const cacheKey = `urlResolved:${fnv1aHash(entry)}`;
-
-            // Try KV cache first
-            if (env?.kv) {
-                try {
-                    const cached = await env.kv.get(cacheKey);
-                    if (cached) {
-                        const parsed: { ts: number; lines: string[] } = JSON.parse(cached);
-                        if (Date.now() - parsed.ts < URL_RESOLVE_TTL) {
-                            resolved.push(...parsed.lines);
-                            continue;
-                        }
-                    }
-                } catch {
-                    // KV read failure — fall through to live fetch
-                }
-            }
-
-            // Cache miss or expired — fetch from network
+/** 对齐 cfnew 字符集智能探测与解码（utf-8 / gb2312 / gbk） */
+async function fetchTextWithEncoding(res: Response): Promise<string> {
+    try {
+        const buffer = await res.arrayBuffer();
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
+        const charset = contentType.match(/charset=([^\s;]+)/i)?.[1]?.toLowerCase() || '';
+        let decoders = ['utf-8', 'gb2312'];
+        if (charset.includes('gb') || charset.includes('gbk') || charset.includes('gb2312')) {
+            decoders = ['gb2312', 'utf-8'];
+        }
+        for (const encoding of decoders) {
             try {
-                const res = await fetch(entry, { signal: AbortSignal.timeout(10_000) });
-                if (!res.ok) continue;
-                const text = await res.text();
-                const lines = parseUrlLines(text);
-                resolved.push(...lines);
-
-                // Store in KV cache (fire-and-forget with guard)
-                if (env?.kv) {
-                    try {
-                        await env.kv.put(cacheKey, JSON.stringify({ ts: Date.now(), lines }));
-                    } catch {
-                        // KV write failure — non-fatal, proceed without caching
-                    }
+                const decoded = new TextDecoder(encoding).decode(buffer);
+                if (decoded && decoded.length > 0 && !decoded.includes('\ufffd')) {
+                    return decoded;
                 }
             } catch {
                 continue;
             }
-        } else {
-            resolved.push(entry);
+        }
+        return new TextDecoder('utf-8').decode(buffer);
+    } catch {
+        return await res.text();
+    }
+}
+
+/** Parse fetched text into cleaned address lines with CSV & multi-format support (对齐 cfnew 获取优选接口) */
+function parseUrlLines(text: string, url = ''): string[] {
+    const lines = text.trim().split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#') && !l.startsWith('//'));
+    if (!lines.length) return [];
+
+    let defaultPort = '443';
+    if (url) {
+        try {
+            const parsedUrl = new URL(url);
+            defaultPort = parsedUrl.searchParams.get('port') || '443';
+        } catch {}
+    }
+
+    const isCsv = lines.length > 1 && lines[0].includes(',');
+    const ipv6Pattern = /^[^\[\]]*:[^\[\]]*:[^\[\]]/;
+    const result: string[] = [];
+
+    if (isCsv) {
+        const headers = lines[0].split(',').map(h => h.trim());
+        const dataRows = lines.slice(1);
+
+        if (headers.includes('IP地址') && headers.includes('端口') && headers.includes('数据中心')) {
+            const ipIdx = headers.indexOf('IP地址');
+            const portIdx = headers.indexOf('端口');
+            const remarkIdx = headers.indexOf('国家') > -1 ? headers.indexOf('国家') : (headers.indexOf('城市') > -1 ? headers.indexOf('城市') : headers.indexOf('数据中心'));
+            const tlsIdx = headers.indexOf('TLS');
+
+            dataRows.forEach(row => {
+                const cols = row.split(',').map(c => c.trim());
+                if (tlsIdx !== -1 && cols[tlsIdx]?.toLowerCase() !== 'true') return;
+                const rawIp = cols[ipIdx];
+                if (!rawIp) return;
+                const wrappedIp = ipv6Pattern.test(rawIp) ? `[${rawIp}]` : rawIp;
+                const p = cols[portIdx] || defaultPort;
+                const remark = cols[remarkIdx] ? `#${cols[remarkIdx]}` : '';
+                result.push(`${wrappedIp}:${p}${remark}`);
+            });
+            return result;
+        } else if (headers.some(h => h.includes('IP')) && headers.some(h => h.includes('延迟')) && headers.some(h => h.includes('下载速度'))) {
+            const ipIdx = headers.findIndex(h => h.includes('IP'));
+            const latencyIdx = headers.findIndex(h => h.includes('延迟'));
+            const speedIdx = headers.findIndex(h => h.includes('下载速度'));
+
+            dataRows.forEach(row => {
+                const cols = row.split(',').map(c => c.trim());
+                const rawIp = cols[ipIdx];
+                if (!rawIp) return;
+                const wrappedIp = ipv6Pattern.test(rawIp) ? `[${rawIp}]` : rawIp;
+                result.push(`${wrappedIp}:${defaultPort}#CF优选 ${cols[latencyIdx]}ms ${cols[speedIdx]}MB/s`);
+            });
+            return result;
         }
     }
-    return resolved;
+
+    // 普通文本行（支持单行逗号分隔多个 IP，兼容“多行 + 逗号分隔”两种格式）
+    lines.forEach(line => {
+        const items = line.includes(',') ? line.split(',').map(s => s.trim()).filter(Boolean) : [line];
+        items.forEach(item => {
+            const hashIdx = item.indexOf('#');
+            const addrPart = (hashIdx >= 0 ? item.slice(0, hashIdx) : item).trim();
+            const namePart = hashIdx >= 0 ? item.slice(hashIdx) : '';
+
+            if (!addrPart) return;
+
+            let host = addrPart;
+            let hasPort = false;
+
+            if (addrPart.startsWith('[')) {
+                hasPort = /\]:(\d+)$/.test(addrPart);
+            } else {
+                const lastColon = addrPart.lastIndexOf(':');
+                hasPort = lastColon > -1 && /^\d+$/.test(addrPart.substring(lastColon + 1));
+                if (!hasPort && (addrPart.match(/:/g) || []).length >= 2) {
+                    host = `[${addrPart}]`;
+                }
+            }
+
+            result.push(hasPort ? item : `${host}:${defaultPort}${namePart}`);
+        });
+    });
+
+    return result;
+}
+
+/** Resolve URL entries in an array — fetches http/https URLs and replaces them with their content lines.
+ *  When an Env with a KV binding is provided, fetched results are cached in KV under a
+ *  per-URL key with a TTL to avoid repeated network calls within the cache window.
+ *  Applies IP:Port deduplication aligned with cfnew across all sources. */
+export async function resolveUrlEntries(entries: string[], env?: Env): Promise<string[]> {
+    // 1. 展开可能包含逗号分隔的多 URL / 多 IP 条目
+    const expandedEntries: string[] = [];
+    for (const e of entries) {
+        if (!e) continue;
+        if (e.includes(',') && !e.startsWith('#') && !e.startsWith('//')) {
+            expandedEntries.push(...e.split(',').map(s => s.trim()).filter(Boolean));
+        } else {
+            expandedEntries.push(e.trim());
+        }
+    }
+
+    // 2. 提取所有唯一 URL，并发拉取或读取 KV 缓存
+    const urlSet = new Set<string>();
+    expandedEntries.forEach(e => {
+        if (e.startsWith('http://') || e.startsWith('https://')) {
+            urlSet.add(e);
+        }
+    });
+
+    const urlCacheMap = new Map<string, string[]>();
+
+    await Promise.all(Array.from(urlSet).map(async (url) => {
+        const cacheKey = `urlResolved:${fnv1aHash(url)}`;
+
+        // 尝试从 KV 缓存中读取
+        if (env?.kv) {
+            try {
+                const cached = await env.kv.get(cacheKey);
+                if (cached) {
+                    const parsed: { ts: number; lines: string[] } = JSON.parse(cached);
+                    if (Date.now() - parsed.ts < URL_RESOLVE_TTL) {
+                        urlCacheMap.set(url, parsed.lines);
+                        return;
+                    }
+                }
+            } catch {}
+        }
+
+        // 缓存未命中或过期，并发发起网络请求
+        try {
+            const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+            if (!res.ok) return;
+            const text = await fetchTextWithEncoding(res);
+            const lines = parseUrlLines(text, url);
+            urlCacheMap.set(url, lines);
+
+            if (env?.kv) {
+                try {
+                    await env.kv.put(cacheKey, JSON.stringify({ ts: Date.now(), lines }));
+                } catch {}
+            }
+        } catch {}
+    }));
+
+    // 3. 按原始顺序装配，将 URL 替换为解析后的结果
+    const rawResolved: string[] = [];
+    for (const entry of expandedEntries) {
+        if (entry.startsWith('http://') || entry.startsWith('https://')) {
+            const lines = urlCacheMap.get(entry) || [];
+            rawResolved.push(...lines);
+        } else {
+            rawResolved.push(entry);
+        }
+    }
+
+    // 4. ★ 对齐 cfnew 去重逻辑：使用 extractNodeDedupKey 按 IP:Port 归一化去重
+    const seenKeys = new Set<string>();
+    const deduplicated: string[] = [];
+    for (const item of rawResolved) {
+        const key = extractNodeDedupKey(item);
+        if (!seenKeys.has(key)) {
+            seenKeys.add(key);
+            deduplicated.push(item);
+        }
+    }
+
+    return deduplicated;
 }
 
 // ── DoH dual-source constants (对齐 edgetunnel DoH 双源: Cloudflare + Google) ──
@@ -248,7 +404,14 @@ export async function getConfigAddresses(isFragment: boolean): Promise<string[]>
         ...entryAddresses(cleanIPs)
     ];
 
-    return addrs.concatIf(!isFragment, entryAddresses(customCdnAddrs));
+    const allAddrs = addrs.concatIf(!isFragment, entryAddresses(customCdnAddrs));
+    const seen = new Set<string>();
+    return allAddrs.filter(addr => {
+        const key = addr.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 }
 
 const remarkCounter: Record<string, number> = {};
