@@ -341,7 +341,7 @@ export async function getXrWarpConfigs(
         const wowOutbound = buildWarpOutbound(warpAccounts[1], endpoint, true, isPro, isKnocker);
 
         const warpConfig = await buildConfig(
-            `Warp-${String(index + 1).padStart(2, '0')}${proIndicator}🇮🇷`,
+            `Warp_${String(index + 1).padStart(2, '0')}${proIndicator}🇮🇷`,
             [warpOutbound],
             false,
             false,
@@ -352,7 +352,7 @@ export async function getXrWarpConfigs(
         );
 
         const wowConfig = await buildConfig(
-            `WoW-${String(index + 1).padStart(2, '0')}${proIndicator}🌍`,
+            `WoW_${String(index + 1).padStart(2, '0')}${proIndicator}🌍`,
             [wowOutbound, warpOutbound],
             false,
             true,

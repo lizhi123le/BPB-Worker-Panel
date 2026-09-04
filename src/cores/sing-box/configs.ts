@@ -158,10 +158,10 @@ export async function getSbWarpConfig(request: Request, env: Env): Promise<Respo
     ];
 
     warpEndpoints.forEach((endpoint, index) => {
-        const warpTag = `Warp-${String(index + 1).padStart(2, '0')} 🇮🇷`;
+        const warpTag = `Warp_${String(index + 1).padStart(2, '0')} 🇮🇷`;
         proxyTags.push(warpTag);
 
-        const wowTag = `WoW-${String(index + 1).padStart(2, '0')} 🌍`;
+        const wowTag = `WoW_${String(index + 1).padStart(2, '0')} 🌍`;
         chainTags.push(wowTag);
 
         selectorTags.push(warpTag, wowTag);

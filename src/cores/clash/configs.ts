@@ -157,10 +157,10 @@ export async function getClWarpConfig(request: Request, env: Env, isPro: boolean
     ];
 
     warpEndpoints.forEach((endpoint, index) => {
-        const warpTag = `Warp-${String(index + 1).padStart(2, '0')} ${proSign}🇮🇷`;
+        const warpTag = `Warp_${String(index + 1).padStart(2, '0')} ${proSign}🇮🇷`;
         proxyTags.push(warpTag);
 
-        const wowTag = `WoW-${String(index + 1).padStart(2, '0')} ${proSign}🌍`;
+        const wowTag = `WoW_${String(index + 1).padStart(2, '0')} ${proSign}🌍`;
         chainTags.push(wowTag);
 
         selectorTags.push(warpTag, wowTag);

@@ -293,12 +293,12 @@ export function generateRemark(
     if (isChain) {
         const currentCount = remarkCounter[baseName] || 0;
         if (currentCount === 0) return `${chainPrefix}${baseName}`;
-        return `${chainPrefix}${baseName}-${String(currentCount).padStart(2, '0')}`;
+        return `${chainPrefix}${baseName}_${String(currentCount).padStart(2, '0')}`;
     }
 
     remarkCounter[baseName] = (remarkCounter[baseName] || 0) + 1;
     const suffix = String(remarkCounter[baseName]).padStart(2, '0');
-    return `${chainPrefix}${baseName}-${suffix}`;
+    return `${chainPrefix}${baseName}_${suffix}`;
 }
 
 export function randomUpperCase(str: string): string {
