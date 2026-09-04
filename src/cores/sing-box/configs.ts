@@ -99,7 +99,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
 
     for (const protocol of protocols) {
         for (const host of hosts) {
-            const addrPorts = entryPortMap[host] ? [entryPortMap[host]] : totalPorts;
+            const addrPorts = entryPortMap[host]?.length ? entryPortMap[host] : totalPorts;
 
             for (const port of addrPorts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;

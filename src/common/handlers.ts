@@ -1,4 +1,4 @@
-﻿import { Authenticate, generateJWTToken, resetPassword } from "@auth";
+import { Authenticate, generateJWTToken, resetPassword } from "@auth";
 import { getDataset, updateDataset } from "@kv";
 import { setKvCache, clearKvCache } from "../kv-cache";
 import { setSettings } from "@init";
@@ -715,7 +715,7 @@ export async function getURLConfigs() {
     } = globalThis;
 
     const buildConfig = (protocol: string, addr: string, port: number, host: string, sni: string, remark: string) => {
-        const isTLS = defaultHttpsPorts.includes(port) || addr === upstreamServer || Object.values(entryPortMap).includes(port);
+        const isTLS = defaultHttpsPorts.includes(port) || addr === upstreamServer || Object.values(entryPortMap).some(ports => ports.includes(port));
         const security = isTLS ? 'tls' : 'none';
         const config = new URL(`${protocol}://config`);
 
@@ -775,7 +775,7 @@ export async function getURLConfigs() {
     const entryPortMap = buildEntryPortMap();
 
     for (const addr of addrs) {
-        const addrPorts = entryPortMap[addr] ? [entryPortMap[addr]] : ports;
+        const addrPorts = entryPortMap[addr]?.length ? entryPortMap[addr] : ports;
 
         for (const port of addrPorts) {
             const { host, sni } = selectSniHost(addr, pickRandomEch(hostSniList));

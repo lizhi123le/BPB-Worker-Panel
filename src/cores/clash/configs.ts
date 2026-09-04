@@ -95,7 +95,7 @@ export async function getClNormalConfig(): Promise<Response> {
 
     for (const protocol of protocols) {
         for (const host of hosts) {
-            const addrPorts = entryPortMap[host] ? [entryPortMap[host]] : ports;
+            const addrPorts = entryPortMap[host]?.length ? entryPortMap[host] : ports;
 
             for (const port of addrPorts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;

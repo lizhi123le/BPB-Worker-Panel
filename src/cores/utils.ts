@@ -65,21 +65,33 @@ export function entryAddresses(entries: string[]): string[] {
     return entries.map(entryAddress).filter(Boolean);
 }
 
-/** Build port map from entry lists — maps bare address → explicit port */
-export function buildEntryPortMap(): Record<string, number> {
+/** Build port map from entry lists — maps bare address → array of explicit ports */
+export function buildEntryPortMap(): Record<string, number[]> {
     const { settings: { cleanIPs, customCdnAddrs } } = globalThis;
-    const map: Record<string, number> = {};
+    const map: Record<string, number[]> = {};
     for (const e of [...cleanIPs, ...customCdnAddrs]) {
         const port = entryPort(e);
         if (port) {
-            map[entryAddress(e)] = port;
+            const addr = entryAddress(e);
+            if (addr) {
+                if (!map[addr]) map[addr] = [];
+                if (!map[addr].includes(port)) map[addr].push(port);
+            }
         }
     }
     return map;
 }
 
-/** Find custom name for an address across multiple entry lists */
-export function findNameForAddress(entries: string[], address: string): string | undefined {
+/** Find custom name for an address across multiple entry lists, with optional port matching */
+export function findNameForAddress(entries: string[], address: string, port?: number): string | undefined {
+    if (port) {
+        for (const e of entries) {
+            if (entryAddress(e) === address && entryPort(e) === port) {
+                const name = entryName(e);
+                if (name) return name;
+            }
+        }
+    }
     for (const e of entries) {
         if (entryAddress(e) === address) {
             const name = entryName(e);
@@ -433,7 +445,7 @@ export function generateRemark(
         settings: { cleanIPs, customCdnAddrs, upstreamParams: { upstreamServer } }
     } = globalThis;
 
-    const customName = findNameForAddress([...cleanIPs, ...customCdnAddrs], address);
+    const customName = findNameForAddress([...cleanIPs, ...customCdnAddrs], address, port);
 
     let baseName: string;
 
