@@ -1464,7 +1464,15 @@ async function fetchSystemStatus() {
         update('status-wk-region', body.wkRegion || body.resolvedProxyRegion || '(detected)');
 
         const regionMatch = document.getElementById('regionMatch')?.value === 'true';
-        update('status-region-match', regionMatch ? '✅ Enabled' : 'Disabled');
+        const isOfficialDirect = !body.wkRegion;
+        const regionMatchEl = document.getElementById('status-region-match');
+        if (isOfficialDirect) {
+            update('status-region-match', 'N/A (Official Direct / 官方直连)');
+            regionMatchEl.style.opacity = '0.45';
+        } else {
+            update('status-region-match', regionMatch ? '✅ Enabled' : 'Disabled');
+            regionMatchEl.style.opacity = '';
+        }
 
         const echSelect = document.getElementById('enableECH');
         const echEnabled = echSelect?.value === 'true';
