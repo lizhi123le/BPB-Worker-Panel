@@ -1467,7 +1467,7 @@ async function fetchSystemStatus() {
         const isOfficialDirect = !body.wkRegion;
         const regionMatchEl = document.getElementById('status-region-match');
         if (isOfficialDirect) {
-            update('status-region-match', 'N/A (Official Direct / 官方直连)');
+            update('status-region-match', '❌ Disabled(Official Direct)');
             regionMatchEl.style.opacity = '0.45';
         } else {
             update('status-region-match', regionMatch ? '✅ Enabled' : 'Disabled');
