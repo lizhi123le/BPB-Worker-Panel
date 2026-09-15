@@ -7,7 +7,7 @@ import { getSbCustomConfig, getSbWarpConfig } from "@sing-box/configs";
 import { getXrCustomConfigs, getXrWarpConfigs } from "@xray/configs";
 import { fetchWarpAccounts } from "@warp";
 import { UnifiedWSHandler, getXPaddingIdentifier } from "@unified";
-import { base64DecodeUtf8, base64EncodeUtf8, HttpStatus, respond, safeErrorMessage } from "@common";
+import { base64DecodeUtf8, base64EncodeUtf8, escapeHtml, HttpStatus, respond, safeErrorMessage } from "@common";
 import { buildEntryPortMap, countryToRegion, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigAddresses, OFFICIAL_DIRECT_IPS, parseHostPort, parseProxyIPWithRegion, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
@@ -188,7 +188,7 @@ export async function handleProxyIPs(request: Request, env: Env): Promise<Respon
 
 export async function renderError(error: any): Promise<Response> {
     const html = await decompressHtml(__ERROR_HTML_CONTENT__, true) as string;
-    const errorPage = html.replace('__ERROR_MESSAGE__', safeErrorMessage(error));
+    const errorPage = html.replace('__ERROR_MESSAGE__', escapeHtml(safeErrorMessage(error)));
 
     return new Response(errorPage, {
         status: HttpStatus.OK,

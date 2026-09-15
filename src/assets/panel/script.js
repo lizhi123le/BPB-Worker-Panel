@@ -1315,7 +1315,6 @@ function addUdpNoise(isManual, noiseIndex, udpNoise) {
         type: 'rand',
         packet: '50-100',
         delay: '1-5',
-        applyTo: 'ip',
         count: 5
     };
 

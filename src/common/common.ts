@@ -54,6 +54,20 @@ export function safeErrorMessage(error: any): string {
 /** Alias for safeErrorMessage — matches upstream naming */
 export const safeError = safeErrorMessage;
 
+/**
+ * Escape a string for safe insertion into HTML text content.
+ * Guards against reflected XSS when error messages (which may echo
+ * user-controlled input) are rendered into the error page.
+ */
+export function escapeHtml(value: string): string {
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 /** Decompress gzip-compressed base64-encoded data */
 export async function decompressGzipBase64(base64: string): Promise<string> {
     const binaryStr = atob(base64);
