@@ -12,10 +12,15 @@ import {
 	handleDoH,
 	handleProxyIPs
 } from '@handlers';
+import { guardNonBuiltinPath } from './common/firstCheck';
 
 export default {
-	async fetch(request: Request, env: Env) {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
 		try {
+			// 挂到全局，供伪装反代 / 限流 / 黑名单读取（对齐 cfnew 的 执行上下文 语义）
+			(globalThis as any).env = env;
+			(globalThis as any).ctx = ctx;
+
 			const upgradeHeader = request.headers.get('Upgrade');
 			init(request, env);
 
@@ -39,7 +44,7 @@ export default {
 						return await handleLogin(request, env);
 
 					case 'logout':
-						return logout();
+						return await logout();
 
 					case 'secrets':
 						return await renderSecrets();
@@ -54,6 +59,9 @@ export default {
 						return await handleProxyIPs(request, env);
 
 					default:
+						// 非内置路径：永久黑名单 → 限流 → 全路径伪装反代（对齐 cfnew）
+						const guarded = await guardNonBuiltinPath(request, env, ctx);
+						if (guarded) return guarded;
 						return await fallback(request);
 				}
 			}

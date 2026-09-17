@@ -379,7 +379,14 @@ async function getSettings(request: Request, env: Env): Promise<Response> {
 }
 
 export async function fallback(request: Request): Promise<Response> {
-    const { fallbackDomain } = globalThis.globalConfig;
+    // 伪装地址来源：FALLBACK 环境变量，支持 `a|b|c` 多地址随机（与 camouflage 伪装反代链路一致）
+    const raw = String(globalThis.globalConfig?.fallbackDomain || '')
+        .split('|')
+        .map(s => s.trim())
+        .filter(s => s && s.toLowerCase() !== 'nginx');
+    const fallbackDomain = (raw.length > 0 ? raw[Math.floor(Math.random() * raw.length)] : 'www.hcaptcha.com')
+        .replace(/^https?:\/\//i, '')
+        .replace(/\/+$/, '');
     const { url, method, headers, body } = request;
 
     const newURL = new URL(url);
