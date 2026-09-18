@@ -13,6 +13,7 @@ import {
 	handleProxyIPs
 } from '@handlers';
 import { guardNonBuiltinPath } from './common/firstCheck';
+import { camouflageProxy } from './common/camouflage';
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
@@ -59,6 +60,10 @@ export default {
 						return await handleProxyIPs(request, env);
 
 					default:
+						// 根路径 /：从设置的 URL 伪装地址池随机抽一个，图片则全屏拉伸显示
+						if (pathName === '/' || pathName === '') {
+							return await camouflageProxy(request, env);
+						}
 						// 非内置路径：永久黑名单 → 限流 → 全路径伪装反代（对齐 cfnew）
 						const guarded = await guardNonBuiltinPath(request, env, ctx);
 						if (guarded) return guarded;
