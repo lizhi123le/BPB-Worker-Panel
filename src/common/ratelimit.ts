@@ -118,10 +118,6 @@ export function isPathInDictionary(pathSegments: string[]): boolean {
     return pathSegments.every(seg => PUBLIC_PATH_DICTIONARY.has(seg));
 }
 
-function getClientIP(request: Request): string {
-    return request.headers.get('CF-Connecting-IP') || '';
-}
-
 /** 检查是否仍在限流（未超限返回 true） */
 export function checkRateLimit(ip: string): boolean {
     if (!ip) return true;
@@ -155,25 +151,4 @@ export async function writeRateLimitKV(kv: KVNamespace, ip: string, ctx: { waitU
         withTimeout(kv.put(`${RATE_LIMIT_KV_PREFIX}${ip}`, new Date().toISOString(), { expirationTtl: 3600 }), 2000, 'KV 速率限制写入')
             .catch(() => {})
     );
-}
-
-/**
- * 非内置路径守卫：返回 null 表示放行（路径合法），
- * 返回 Response 表示命中限流/黑名单需直接返回。
- */
-export async function rateLimitGuard(request: Request, kv: KVNamespace, ctx: { waitUntil(p: Promise<unknown>): void }, nginxPage: () => Promise<string> | string): Promise<Response | null> {
-    const ip = getClientIP(request);
-    if (!checkRateLimit(ip)) {
-        console.warn(`[速率限制] IP ${ip} 超过非管理员路径请求限制`);
-        await writeRateLimitKV(kv, ip, ctx);
-        return new Response(await nginxPage(), {
-            status: 429,
-            headers: {
-                'Content-Type': 'text/html; charset=UTF-8',
-                'Retry-After': '3600'
-            }
-        });
-    }
-    recordRateLimit(ip);
-    return null;
 }

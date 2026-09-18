@@ -1,6 +1,6 @@
 import { isPermanentBlacklisted, recordViolationAndMaybeBan } from "./blacklist";
 import { isPathInDictionary, checkRateLimit, recordRateLimit, writeRateLimitKV } from "./ratelimit";
-import { camouflageProxy, nginxPage } from "./camouflage";
+import { camouflageProxy, cf1101Page } from "./camouflage";
 
 /**
  * 非内置路径守卫 — 对齐 cfnew 的安全三件套：
@@ -46,7 +46,7 @@ export async function guardNonBuiltinPath(
     // 1. 永久黑名单
     if (ip && kv && await isPermanentBlacklisted(ip, kv)) {
         console.warn(`[永久黑名单] IP ${ip} 命中永久黑名单，直接拦截`);
-        return new Response(await nginxPage(), {
+        return new Response(await cf1101Page(reqURL.host, ip), {
             status: 429,
             headers: {
                 'Content-Type': 'text/html; charset=UTF-8',
@@ -62,7 +62,7 @@ export async function guardNonBuiltinPath(
             console.warn(`[速率限制] IP ${ip} 超过非管理员路径请求限制`);
             if (kv) await writeRateLimitKV(kv, ip, ctx);
             if (ip && kv) ctx.waitUntil(recordViolationAndMaybeBan(ip, kv, ctx));
-            return new Response(await nginxPage(), {
+            return new Response(await cf1101Page(reqURL.host, ip), {
                 status: 429,
                 headers: {
                     'Content-Type': 'text/html; charset=UTF-8',

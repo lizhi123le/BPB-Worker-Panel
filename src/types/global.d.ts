@@ -45,6 +45,10 @@ declare global {
         readonly PROXY_IP: string;
         readonly PREFIX: string;
         readonly FALLBACK: string;
+        // 伪装页环境变量别名（对齐 cfnew：homepage / HOMEPAGE / URL 优先，FALLBACK 兼容）
+        readonly homepage?: string;
+        readonly HOMEPAGE?: string;
+        readonly URL?: string;
         readonly DOH_URL: string;
         readonly kv: KVNamespace;
     }

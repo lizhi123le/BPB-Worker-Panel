@@ -8,8 +8,8 @@ import {
 
 /**
  * URL 伪装 — 对齐 cfnew 的伪装首页全路径反代：
- *  - 伪装域名来源：优先取面板 HOST/SNI 输入（globalThis.settings.hostSniList，string[] 数组，面板已按换行/逗号拆分），
- *    其次取 env `FALLBACK`（支持 `a|b|c` 列表随机），特殊值 `nginx` 直接渲染内建欢迎页。
+ *  - 伪装域名来源：env `homepage`/`HOMEPAGE`/`URL`/`FALLBACK`（支持 `a|b|c` 列表随机），
+ *    特殊值 `nginx` 渲染内建欢迎页；未设置 → 内置 1101 伪装页（hostSniList 仅用于节点 HOST/SNI，不参与伪装页）。
  *  - 对非 / 且非管理路径的请求做反向代理，保留原路径与查询串。
  *  - 图片伪装：探测到图片 URL 时以 data URI 包装或流式直传，含假阳性保护（HTML 降级）。
  *  - 文本类（text/javascript/json/xml）且 <2MB 时缓冲并重写上游 host，内存缓存 5 分钟。
@@ -73,17 +73,105 @@ export async function nginxPage(): Promise<string> {
 </html>`;
 }
 
-function maskSources(): string[] {
-    const panel = (globalThis.settings?.hostSniList || [])
-        .map(s => String(s).trim())
-        .filter(Boolean);
-    if (panel.length > 0) return panel;
+/** 内置 1101 伪装页（对齐 cfnew html1101：Cloudflare Worker threw exception 错误页，随机 Ray ID） */
+export async function cf1101Page(host: string, accessIP: string): Promise<string> {
+    const now = new Date();
+    const timestamp =
+        now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0') +
+        ' ' + String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0') + ':' + String(now.getSeconds()).padStart(2, '0');
+    const randomStr = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
+    return `<!DOCTYPE html>
+<!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]-->
+<!--[if IE 7]>    <html class="no-js ie7 oldie" lang="en-US"> <![endif]-->
+<!--[if IE 8]>    <html class="no-js ie8 oldie" lang="en-US"> <![endif]-->
+<!--[if gt IE 8]><!--> <html class="no-js" lang="en-US"> <!--<![endif]-->
+<head>
+<title>Worker threw exception | ${host} | Cloudflare</title>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=Edge" />
+<meta name="robots" content="noindex, nofollow" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="stylesheet" id="cf_styles-css" href="/cdn-cgi/styles/cf.errors.css" />
+<!--[if lt IE 9]><link rel="stylesheet" id='cf_styles-ie-css' href="/cdn-cgi/styles/cf.errors.ie.css" /><![endif]-->
+<style>body{margin:0;padding:0}</style>
+<!--[if gte IE 10]><!-->
+<script>
+  if (!navigator.cookieEnabled) {
+    window.addEventListener('DOMContentLoaded', function () {
+      var cookieEl = document.getElementById('cookie-alert');
+      cookieEl.style.display = 'block';
+    })
+  }
+</script>
+<!--<![endif]-->
+</head>
+<body>
+    <div id="cf-wrapper">
+        <div class="cf-alert cf-alert-error cf-cookie-error" id="cookie-alert" data-translate="enable_cookies">Please enable cookies.</div>
+        <div id="cf-error-details" class="cf-error-details-wrapper">
+            <div class="cf-wrapper cf-header cf-error-overview">
+                <h1>
+                    <span class="cf-error-type" data-translate="error">Error</span>
+                    <span class="cf-error-code">1101</span>
+                    <small class="heading-ray-id">Ray ID: ${randomStr} &bull; ${timestamp} UTC</small>
+                </h1>
+                <h2 class="cf-subheadline" data-translate="error_desc">Worker threw exception</h2>
+            </div><!-- /.header -->
+            <section></section><!-- spacer -->
+            <div class="cf-section cf-wrapper">
+                <div class="cf-columns two">
+                    <div class="cf-column">
+                        <h2 data-translate="what_happened">What happened?</h2>
+                            <p>You've requested a page on a website (${host}) that is on the <a href="https://www.cloudflare.com/5xx-error-landing?utm_source=error_100x" target="_blank">Cloudflare</a> network. An unknown error occurred while rendering the page.</p>
+                    </div>
+                    <div class="cf-column">
+                        <h2 data-translate="what_can_i_do">What can I do?</h2>
+                            <p><strong>If you are the owner of this website:</strong><br />refer to <a href="https://developers.cloudflare.com/workers/observability/errors/" target="_blank">Workers - Errors and Exceptions</a> and check Workers Logs for ${host}.</p>
+                    </div>
+                </div>
+            </div><!-- /.section -->
+            <div class="cf-error-footer cf-wrapper w-240 lg:w-full py-10 sm:py-4 sm:px-8 mx-auto text-center sm:text-left border-solid border-0 border-t border-gray-300">
+    <p class="text-13">
+      <span class="cf-footer-item sm:block sm:mb-1">Cloudflare Ray ID: <strong class="font-semibold"> ${randomStr}</strong></span>
+      <span class="cf-footer-separator sm:hidden">&bull;</span>
+      <span id="cf-footer-item-ip" class="cf-footer-item hidden sm:block sm:mb-1">
+        Your IP:
+        <button type="button" id="cf-footer-ip-reveal" class="cf-footer-ip-reveal-btn">Click to reveal</button>
+        <span class="hidden" id="cf-footer-ip">${accessIP}</span>
+        <span class="cf-footer-separator sm:hidden">&bull;</span>
+      </span>
+      <span class="cf-footer-item sm:block sm:mb-1"><span>Performance &amp; security by</span> <a rel="noopener noreferrer" href="https://www.cloudflare.com/5xx-error-landing" id="brand_link" target="_blank">Cloudflare</a></span>
+    </p>
+    <script>(function(){function d(){var b=a.getElementById("cf-footer-item-ip"),c=a.getElementById("cf-footer-ip-reveal");b&&"classList"in b&&(b.classList.remove("hidden"),c.addEventListener("click",function(){c.classList.add("hidden");a.getElementById("cf-footer-ip").classList.remove("hidden")}))}var a=document;document.addEventListener&&a.addEventListener("DOMContentLoaded",d)})();</script>
+  </div><!-- /.error-footer -->
+        </div><!-- /#cf-error-details -->
+    </div><!-- /#cf-wrapper -->
+     <script>
+    window._cf_translation = {};
+  </script> 
+</body>
+</html>`;
+}
 
-    const fallback = String((globalThis as any).env?.FALLBACK || (globalThis as any).globalConfig?.fallbackDomain || '')
+/**
+ * 伪装地址来源（对齐 cfnew，面板 hostSniList 仅用于节点 HOST/SNI，不参与伪装页）：
+ * env `homepage`/`HOMEPAGE`/`URL`/`FALLBACK`（支持 `a|b|c` 列表随机）；
+ * 特殊值 `nginx` 渲染内建欢迎页；未设置 → 内置 1101 页。
+ */
+function maskSources(): string[] {
+    const envVal = String(
+        (globalThis as any).env?.homepage ||
+        (globalThis as any).env?.HOMEPAGE ||
+        (globalThis as any).env?.URL ||
+        (globalThis as any).env?.FALLBACK ||
+        (globalThis as any).globalConfig?.fallbackDomain ||
+        ''
+    );
+    return envVal
         .split('|')
         .map(s => s.trim())
         .filter(s => s && s.toLowerCase() !== 'nginx');
-    return fallback;
 }
 
 function normalizeTarget(raw: string): string {
@@ -93,21 +181,24 @@ function normalizeTarget(raw: string): string {
     return target.replace(/\/+$/, '');
 }
 
-/** 解析伪装配置：列表随机；面板为空且 FALLBACK=nginx → 直接渲染欢迎页。 */
-export function resolveMaskTarget(): { target: string; isNginx: boolean } {
-    const rawPanel = (globalThis.settings?.hostSniList || [])
-        .map(s => String(s).trim())
-        .filter(Boolean);
-    if (rawPanel.length === 0) {
-        const envRaw = String((globalThis as any).env?.FALLBACK || '');
-        if (envRaw.trim().toLowerCase() === 'nginx') {
-            return { target: '', isNginx: true };
-        }
+/** 解析伪装配置：列表随机；未设置 env → 内置 1101 页；FALLBACK=nginx → 内建欢迎页。 */
+export function resolveMaskTarget(): { target: string; isNginx: boolean; is1101: boolean } {
+    const envRaw = String(
+        (globalThis as any).env?.homepage ||
+        (globalThis as any).env?.HOMEPAGE ||
+        (globalThis as any).env?.URL ||
+        (globalThis as any).env?.FALLBACK ||
+        (globalThis as any).globalConfig?.fallbackDomain ||
+        ''
+    ).trim();
+    if (envRaw.toLowerCase() === 'nginx') {
+        return { target: '', isNginx: true, is1101: false };
     }
+    if (!envRaw) return { target: '', isNginx: false, is1101: true };
     const sources = maskSources();
-    if (sources.length === 0) return { target: '', isNginx: true };
+    if (sources.length === 0) return { target: '', isNginx: false, is1101: true };
     const picked = sources[Math.floor(Math.random() * sources.length)];
-    return { target: normalizeTarget(picked), isNginx: false };
+    return { target: normalizeTarget(picked), isNginx: false, is1101: false };
 }
 
 /** 构造指纹随机化的出站头（清 CF 入站头与 Sec-CH-UA，重写 Host/Referer/Origin） */
@@ -150,41 +241,60 @@ function arrayBufferToBase64(bytes: ArrayBuffer): string {
     return btoa(binary);
 }
 
-/** 将图片缓冲结果包装为内联 data URI 页（cfnew 同款） */
+/** 将图片缓冲结果包装为内联 data URI 页（对齐 cfnew 生成图片HTML：黑底居中、object-fit:fill 全屏） */
 function wrapImageResponse(body: ArrayBuffer, status: number, contentType: string): Response {
-    const dataUri = `data:${contentType};base64,${arrayBufferToBase64(body)}`;
-    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>image</title><style>body{margin:0;overflow:hidden}img{width:100vw;height:100vh;object-fit:fill}</style></head><body><img src="${dataUri}" alt=""></body></html>`;
+    const dataUri = `data:${contentType || 'image/jpeg'};base64,${arrayBufferToBase64(body)}`;
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>CFnew</title><style>body{margin:0;padding:0;overflow:hidden;background:#000;display:flex;align-items:center;justify-content:center;height:100vh}img{width:100vw;height:100vh;object-fit:fill}</style></head><body><img src="${dataUri}" alt="homepage"></body></html>`;
     return new Response(html, { status, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
-/** 图片伪装分支：命中图片 URL 时尝试缓冲缓存；失败返回 null 降级普通伪装。 */
-async function tryServeImage(maskURL: URL, request: Request): Promise<Response | null> {
-    const cached = maskImageCache.get(maskURL.href);
-    if (cached && Date.now() - cached.time < MASK_HOME_CACHE_TTL) {
+/** 图片伪装分支（对齐 cfnew）：
+ *  - 无论请求路径是什么（/ 或 /随机路径），都返回同一张样式化图片；
+ *    缓存键 = 目标图片完整地址（非请求路径），无 TTL，仅 12 张 FIFO 淘汰。
+ *  - 请求带 Referer（伪装域名 origin + /），指纹随机出站头。
+ *  - <2MB → 缓冲 + 缓存 + HTML 包装；content-length 虚标或 ≥2MB → 原样流出（带 CORS 头）。
+ *  - 失败返回 null，降级普通伪装反代。 */
+async function tryServeImage(maskURL: URL): Promise<Response | null> {
+    const url = maskURL.href;
+    const cached = maskImageCache.get(url);
+    if (cached) {
         return wrapImageResponse(cached.body as ArrayBuffer, cached.status, cached.contentType);
     }
-    const headers = buildMaskedHeaders(request.headers, maskURL);
+    const headers = buildMaskedHeaders(new Headers(), maskURL);
+    headers.set('Referer', maskURL.origin + '/');
     headers.set('Accept', 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8');
     try {
-        const resp = await fetchWithTimeout(maskURL.href, { method: request.method, headers, cf: {} }, 5000);
+        const resp = await fetchWithTimeout(url, { method: 'GET', headers, cf: {} }, 10000);
         const contentType = resp.headers.get('content-type') || 'image/jpeg';
         // 假阳性保护：服务器返回 HTML 说明不是图片，降级普通伪装
         if (contentType.startsWith('text/html')) return null;
         const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
-        // content-length 虚标或 ≥2MB 时流式直传（不缓存）
-        if (contentLength === 0 || contentLength > TEXT_REWRITE_MAX) {
-            return new Response(resp.body, {
-                status: resp.status,
-                headers: withHsts(filterResponseHeaders(resp.headers), undefined)
-            });
+        // content-length 声明 <2MB → 缓冲 + 缓存 + HTML 包装
+        if (contentLength > 0 && contentLength < 2 * 1024 * 1024) {
+            const bytes = await withTimeout(resp.arrayBuffer(), 5000, '图片代理响应体读取');
+            if (bytes.byteLength < 2 * 1024 * 1024) {
+                if (maskImageCache.size >= MASK_IMAGE_CACHE_MAX) {
+                    const oldest = maskImageCache.keys().next().value;
+                    if (oldest) maskImageCache.delete(oldest);
+                }
+                maskImageCache.set(url, { body: bytes, status: resp.status, contentType, time: Date.now() });
+                return wrapImageResponse(bytes, resp.status, contentType);
+            }
+            // content-length 虚标（实际 >2MB）：用已读字节流式直传
+            const headersOut: Record<string, string> = {
+                'Content-Type': contentType,
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'public, max-age=86400'
+            };
+            return new Response(bytes, { status: resp.status, headers: headersOut });
         }
-        const bytes = await withTimeout(resp.arrayBuffer(), 5000, '图片代理响应体读取');
-        if (maskImageCache.size >= MASK_IMAGE_CACHE_MAX) {
-            const oldest = maskImageCache.keys().next().value;
-            if (oldest) maskImageCache.delete(oldest);
-        }
-        maskImageCache.set(maskURL.href, { body: bytes, status: resp.status, contentType, time: Date.now() });
-        return wrapImageResponse(bytes, resp.status, contentType);
+        // 未知长度或无头部 / ≥2MB → 直接流式（不缓冲、不缓存、不包装 HTML）
+        const headersOut: Record<string, string> = {
+            'Content-Type': contentType,
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=86400'
+        };
+        return new Response(resp.body, { status: resp.status, headers: headersOut });
     } catch (e) {
         console.error('伪装图片代理失败:', (e as Error)?.message ?? String(e));
         return null; // fallthrough 到普通伪装逻辑
@@ -204,7 +314,14 @@ function cacheCleansing(): void {
  * 请求路径/查询串原样转发到伪装域名。任何失败降级 nginx 页。
  */
 export async function camouflageProxy(request: Request, env: any): Promise<Response> {
-    const { target, isNginx } = resolveMaskTarget();
+    const { target, isNginx, is1101 } = resolveMaskTarget();
+    if (is1101) {
+        const reqURL = new URL(request.url);
+        return new Response(await cf1101Page(reqURL.host, request.headers.get('CF-Connecting-IP') || ''), {
+            status: 200,
+            headers: withHsts({ 'Content-Type': 'text/html; charset=UTF-8' }, env)
+        });
+    }
     if (isNginx) {
         return new Response(await nginxPage(), {
             status: 200,
@@ -224,7 +341,7 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
 
     // 图片伪装
     if (IMAGE_EXT_RE.test(target)) {
-        const imgResp = await tryServeImage(maskURL, request);
+        const imgResp = await tryServeImage(maskURL);
         if (imgResp) return imgResp;
     }
 

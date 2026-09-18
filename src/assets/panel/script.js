@@ -16,6 +16,14 @@ const [
 const defaultHttpsPorts = [443, 8443, 2053, 2083, 2087, 2096];
 const defaultHttpPorts = [80, 8080, 8880, 2052, 2082, 2086, 2095];
 
+// 背景 iframe：URL 池随机（带随机 query 绕过 5 分钟缓存，每次刷新换背景）
+(function initFallbackBg() {
+    const bg = document.getElementById('fallback-bg');
+    if (bg) {
+        bg.src = '/img?t=' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    }
+})();
+
 fetch('/panel/settings')
     .then(async response => response.json())
     .then(({ success, status, message, body }) => {

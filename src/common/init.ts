@@ -131,13 +131,16 @@ export async function setSettings(request: Request, env: Env) {
 
 export function init(request: Request, env: Env) {
     const { pathname } = new URL(request.url);
-    const { UUID, TR_PASS, FALLBACK, DOH_URL } = env;
+    const { UUID, TR_PASS, DOH_URL } = env;
+
+    // 伪装页环境变量对齐 cfnew：homepage / HOMEPAGE / URL 优先，FALLBACK 兼容保留
+    const fallback = String((env as any).homepage || (env as any).HOMEPAGE || (env as any).URL || env.FALLBACK || 'www.hcaptcha.com');
 
     globalThis.globalConfig = {
         userID: UUID,
         TrPass: TR_PASS,
         pathName: decodeURIComponent(pathname),
-        fallbackDomain: FALLBACK || 'www.hcaptcha.com',
+        fallbackDomain: fallback,
         dohURL: DOH_URL || 'https://cloudflare-dns.com/dns-query'
     };
 }
