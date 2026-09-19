@@ -4,7 +4,7 @@ import { camouflageProxy, cf1101Page } from "./camouflage";
 
 /**
  * 非内置路径守卫 — 对齐 cfnew 的安全三件套：
- *  1. 永久黑名单检查（IP 累计违规超阈值 → 直接 429）
+ *  1. 永久黑名单检查（IP 累计违规超阈值 → 直接返回内置 1101 页，状态码 200）
  *  2. 路径字典校验 + 速率限制（字典路径视为合法公开路径，不限流不计数；
  *     仅路径含字典外段才触发限流与违规计数，避免误伤伪装站点正常流量）
  *  3. 未命中限流 → 全路径伪装反代（字典内路径同样伪装）
@@ -18,7 +18,7 @@ interface GuardContext {
 
 /**
  * 对非内置路径请求执行守卫。
- * 返回 Response：命中黑名单/限流（429 nginx 页）或伪装反代结果。
+ * 返回 Response：命中黑名单/限流（内置 1101 页，状态码 200）或伪装反代结果。
  * 返回 null：属于排除路径，应继续由上层内置逻辑处理。
  */
 export async function guardNonBuiltinPath(
@@ -47,10 +47,9 @@ export async function guardNonBuiltinPath(
     if (ip && kv && await isPermanentBlacklisted(ip, kv)) {
         console.warn(`[永久黑名单] IP ${ip} 命中永久黑名单，直接拦截`);
         return new Response(await cf1101Page(reqURL.host, ip), {
-            status: 429,
+            status: 200,
             headers: {
-                'Content-Type': 'text/html; charset=UTF-8',
-                'Retry-After': '3600'
+                'Content-Type': 'text/html; charset=UTF-8'
             }
         });
     }
@@ -63,10 +62,9 @@ export async function guardNonBuiltinPath(
             if (kv) await writeRateLimitKV(kv, ip, ctx);
             if (ip && kv) ctx.waitUntil(recordViolationAndMaybeBan(ip, kv, ctx));
             return new Response(await cf1101Page(reqURL.host, ip), {
-                status: 429,
+                status: 200,
                 headers: {
-                    'Content-Type': 'text/html; charset=UTF-8',
-                    'Retry-After': '3600'
+                    'Content-Type': 'text/html; charset=UTF-8'
                 }
             });
         }
