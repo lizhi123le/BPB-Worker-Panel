@@ -48,10 +48,43 @@
         .icon {
             height: 2.5rem;
         }
+
+        /* 伪装背景 iframe 垫底：整页铺满，内容浮于其上 */
+        body.has-fallback {
+            background: transparent;
+        }
+
+        body.has-fallback > * {
+            position: relative;
+            z-index: 2;
+        }
+
+        body.has-fallback::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            z-index: 1;
+            pointer-events: none;
+            background: var(--color-bg-main);
+            opacity: 0.72;
+        }
+
+        #fallback-bg {
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            width: 100vw;
+            height: 100vh;
+            border: 0;
+            pointer-events: none;
+            object-fit: fill;
+            background: var(--color-bg-main);
+        }
     </style>
 </head>
 
-<body>
+<body class="has-fallback">
+    <iframe id="fallback-bg" src="/img?t=1" title="fallback background" aria-hidden="true"></iframe>
     <div id="error-container">
         <h1>
             <img class="icon" src="/favicon.ico" alt="BPB Logo"> BPB Panel <span id="panel-version"
@@ -66,6 +99,14 @@
             </p>
         </div>
     </div>
+    <script>
+        (function initFallbackBg() {
+            var bg = document.getElementById('fallback-bg');
+            if (bg) {
+                bg.src = '/img?t=' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+            }
+        })();
+    </script>
 </body>
 
 </html>

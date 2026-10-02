@@ -1,3 +1,11 @@
+// 背景 iframe：URL 池随机（带随机 query 绕过 5 分钟缓存，每次刷新换背景）
+(function initFallbackBg() {
+    const bg = document.getElementById('fallback-bg');
+    if (bg) {
+        bg.src = '/img?t=' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    }
+})();
+
 loadGeoData();
 
 async function loadGeoData() {

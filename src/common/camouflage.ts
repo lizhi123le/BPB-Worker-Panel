@@ -244,7 +244,7 @@ function arrayBufferToBase64(bytes: ArrayBuffer): string {
 /** 将图片缓冲结果包装为内联 data URI 页（对齐 cfnew 生成图片HTML：黑底居中、object-fit:fill 全屏） */
 function wrapImageResponse(body: ArrayBuffer, status: number, contentType: string): Response {
     const dataUri = `data:${contentType || 'image/jpeg'};base64,${arrayBufferToBase64(body)}`;
-    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>CFnew</title><style>body{margin:0;padding:0;overflow:hidden;background:#000;display:flex;align-items:center;justify-content:center;height:100vh}img{width:100vw;height:100vh;object-fit:fill}</style></head><body><img src="${dataUri}" alt="homepage"></body></html>`;
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>BPB Panel v${__VERSION__}</title><style>body{margin:0;padding:0;overflow:hidden;background:#000;display:flex;align-items:center;justify-content:center;height:100vh}img{width:100vw;height:100vh;object-fit:fill}</style></head><body><img src="${dataUri}" alt="homepage"></body></html>`;
     return new Response(html, { status, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
