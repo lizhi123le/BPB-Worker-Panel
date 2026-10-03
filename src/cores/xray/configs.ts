@@ -14,6 +14,7 @@ import {
     buildEntryPortMap,
     getConfigAddresses,
     generateRemark,
+    generateWsPath,
     isDomain,
     isHttps,
     getProtocols,
@@ -164,6 +165,7 @@ async function addBestPingConfigs(
 
 async function addBestFragmentConfigs(
     configs: Config[],
+    usedPaths: Set<string>,
     chainProxy?: Outbound
 ) {
     const {
@@ -188,7 +190,7 @@ async function addBestFragmentConfigs(
             outbounds.push(chain);
         }
 
-        const proxy = buildWebsocketOutbound(`proxy-${index + 1}`, _VL_, hostName, 443, true, fragLength, `${fragmentIntervalMin}-${fragmentIntervalMax}`);
+        const proxy = buildWebsocketOutbound(`proxy-${index + 1}`, _VL_, hostName, 443, generateWsPath(usedPaths), true, fragLength, `${fragmentIntervalMin}-${fragmentIntervalMax}`);
         outbounds.push(proxy);
     });
 
@@ -206,7 +208,7 @@ async function addBestFragmentConfigs(
     );
 
     if (chainProxy) {
-        await addBestFragmentConfigs(configs);
+        await addBestFragmentConfigs(configs, usedPaths);
     }
 
     configs.push(config);
@@ -261,6 +263,8 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     const entryPortMap = buildEntryPortMap();
     const totalPorts = ports.filter(port => !isFragment || isHttps(port));
     const protocols = getProtocols();
+    // 已占用路径池词集合：每个 ws 出站各抽一个互不相同的伪装路径
+    const usedPaths = new Set<string>();
 
     if (upstreamServer && upstreamPort && !isFragment) {
         totalPorts.unshift(upstreamPort);
@@ -279,7 +283,7 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
             for (const port of addrPorts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
-                const outbound = buildWebsocketOutbound("proxy", protocol, host, port, isFragment);
+                const outbound = buildWebsocketOutbound("proxy", protocol, host, port, generateWsPath(usedPaths), isFragment);
                 const proxy = modifyOutbound(outbound, `proxy-${index}`);
                 proxies.push(proxy);
 
@@ -304,7 +308,7 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     await addBestPingConfigs(configs, hosts, proxies, chains, isFragment);
 
     if (isFragment) {
-        await addBestFragmentConfigs(configs, chainProxy);
+        await addBestFragmentConfigs(configs, usedPaths, chainProxy);
         await addWorkerlessConfigs(configs);
     }
 

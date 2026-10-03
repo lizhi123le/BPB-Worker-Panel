@@ -1,7 +1,6 @@
 import {
     base64ToDecimal,
     isHttps,
-    generateWsPath,
     toRange,
     selectSniHost,
     pickRandomEch
@@ -85,6 +84,7 @@ export function buildWebsocketOutbound(
     protocol: string,
     address: string,
     port: number,
+    path: string,
     isFragment: boolean,
     fragLength?: string,
     fragInterval?: string
@@ -116,7 +116,7 @@ export function buildWebsocketOutbound(
 
     const streamSettings: StreamSettings = {
         network: "ws",
-        ...buildTransport("ws", "none", generateWsPath(), host),
+        ...buildTransport("ws", "none", path, host, 2560),
         security: isTLS ? "tls" : "none",
         tlsSettings,
         sockopt: buildSockopt(true, enableTFO, "UseIP"),
@@ -223,7 +223,7 @@ export function buildChainOutbound(): Outbound | undefined {
 
     const streamSettings: StreamSettings = {
         network: type || "raw",
-        ...buildTransport(type, headerType, path, host, serviceName, mode, authority),
+        ...buildTransport(type, headerType, path, host, undefined, serviceName, mode, authority),
         security,
         tlsSettings: security === 'tls' ? buildTlsSettings(sni || address, fp, false, undefined, alpn) : undefined,
         realitySettings: security === "reality" ? buildRealitySettings(sni, fp, pbk, sid, spx) : undefined,
@@ -300,6 +300,7 @@ function buildTransport(
     headerType?: "http" | "none",
     path: string = "/",
     host?: string,
+    earlyData?: number,
     serviceName?: string,
     mode?: string,
     authority?: string
@@ -332,7 +333,9 @@ function buildTransport(
             return {
                 wsSettings: {
                     host: host,
-                    path: path
+                    path: path,
+                    maxEarlyData: earlyData,
+                    earlyDataHeaderName: earlyData ? "Sec-WebSocket-Protocol" : undefined
                 } satisfies WsSettings
             };
 

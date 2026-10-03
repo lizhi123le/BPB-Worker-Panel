@@ -161,6 +161,8 @@ export interface RawSettings {
 export interface WsSettings {
     host?: string;
     path: string;
+    maxEarlyData?: number;
+    earlyDataHeaderName?: "Sec-WebSocket-Protocol";
 }
 
 export interface HttpupgradeSettings {
