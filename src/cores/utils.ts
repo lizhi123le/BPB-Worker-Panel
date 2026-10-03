@@ -487,18 +487,6 @@ export function randomUpperCase(str: string): string {
     return result;
 }
 
-export function getRandomString(lengthMin: number, lengthMax: number): string {
-    let result = '';
-    const charSet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    const length = Math.floor(Math.random() * (lengthMax - lengthMin + 1)) + lengthMin;
-
-    for (let i = 0; i < length; i++) {
-        result += charSet.charAt(Math.floor(Math.random() * charSet.length));
-    }
-
-    return result;
-}
-
 /** 撞到已占用路径时的重抽次数上限（1-3 段路径空间约 1.7 亿，撞车极罕见，纯属兜底） */
 const WS_PATH_MAX_REDRAW = 5;
 
