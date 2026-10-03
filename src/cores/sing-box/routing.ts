@@ -4,6 +4,7 @@ import { Route, RoutingRule, RuleSet } from '#types/sing-box';
 
 export function buildRoutingRules(isWarp: boolean): Route {
     const { blockUDP443 } = globalThis.settings;
+    const { rules: blockBypassRules, ruleSets } = buildBlockAndBypassRules();
 
     const rules: RoutingRule[] = [
         {
@@ -28,7 +29,8 @@ export function buildRoutingRules(isWarp: boolean): Route {
         {
             ip_is_private: true,
             outbound: "direct"
-        }
+        },
+        ...blockBypassRules
     ];
 
     if (!isWarp) {
@@ -37,41 +39,45 @@ export function buildRoutingRules(isWarp: boolean): Route {
         addRoutingRule(rules, 'reject', undefined, undefined, undefined, undefined, "udp", "quic", 443);
     }
 
+    return {
+        rules,
+        rule_set: ruleSets.omitEmpty(),
+        auto_detect_interface: true,
+        final: "✅ Selector"
+    };
+}
+
+/** 生成 Block（reject）+ Bypass（direct）路由规则与 rule_set，供 ACL 模板接管时前置保留。 */
+export function buildBlockAndBypassRules(): { rules: RoutingRule[]; ruleSets: RuleSet[] } {
     const geoAssets = getGeoAssets();
     const routingRules = accRoutingRules(geoAssets);
+    const rules: RoutingRule[] = [];
 
     const blockDomains = [
         ...routingRules.block.geosites,
         ...routingRules.block.domains
     ];
-
     if (blockDomains.length) {
         addRoutingRule(rules, 'reject', routingRules.block.domains, undefined, routingRules.block.geosites);
     }
-
     const blockIPs = [
         ...routingRules.block.geoips,
         ...routingRules.block.ips
     ];
-
     if (blockIPs.length) {
         addRoutingRule(rules, 'reject', undefined, routingRules.block.ips, undefined, routingRules.block.geoips);
     }
-
     const bypassDomains = [
         ...routingRules.bypass.geosites,
         ...routingRules.bypass.domains
     ];
-
     if (bypassDomains.length) {
         addRoutingRule(rules, 'direct', routingRules.bypass.domains, undefined, routingRules.bypass.geosites);
     }
-
     const bypassIPs = [
         ...routingRules.bypass.geoips,
         ...routingRules.bypass.ips
     ];
-
     if (bypassIPs.length) {
         addRoutingRule(rules, 'direct', undefined, routingRules.bypass.ips, undefined, routingRules.bypass.geoips);
     }
@@ -81,12 +87,7 @@ export function buildRoutingRules(isWarp: boolean): Route {
         return sets;
     }, []);
 
-    return {
-        rules,
-        rule_set: ruleSets.omitEmpty(),
-        auto_detect_interface: true,
-        final: "✅ Selector"
-    };
+    return { rules, ruleSets };
 }
 
 function addRoutingRule(

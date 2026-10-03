@@ -529,7 +529,7 @@ export async function buildAclSingbox(
         else if (type === 'domain-suffix') ruleObj.domain_suffix = [rule.ruleVal];
         else if (type === 'domain-keyword') ruleObj.domain_keyword = [rule.ruleVal];
         else if (type === 'ipcidr' || type === 'ip-cidr') ruleObj.ip_cidr = [rule.ruleVal];
-        else if (type === 'geoip') ruleObj.geoip = { country_code: rule.ruleVal.toUpperCase() };
+        else if (type === 'geoip') ruleObj.geoip = [rule.ruleVal.toLowerCase()];
         else if (type === 'process') ruleObj.process = [rule.ruleVal];
         else ruleObj.rule_set = rule.ruleType;
         inlineRouteRules.push(ruleObj);

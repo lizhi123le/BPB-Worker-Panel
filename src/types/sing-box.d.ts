@@ -87,7 +87,7 @@ export interface RoutingRule {
     network?: "tcp" | "udp";
     protocol?: "http" | "tls" | "quic" | "dns";
     port?: number;
-    geoip?: { country_code: string };
+    geoip?: string | string[];
     process?: string[];
     clash_mode?: "Global" | "Direct";
     action?: "route" | "reject" | "hijack-dns" | "sniff";

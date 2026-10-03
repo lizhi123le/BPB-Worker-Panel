@@ -1,6 +1,6 @@
 import { getDataset } from '@kv';
 import { buildDNS } from './dns';
-import { buildRoutingRules } from './routing';
+import { buildRoutingRules, buildBlockAndBypassRules } from './routing';
 import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound } from './outbounds.js';
 import { Outbound, WireguardEndpoint, Config } from '#types/sing-box';
 import { buildEntryPortMap, getConfigAddresses, generateRemark, generateWsPath, isHttps, getProtocols, resetRemarkCounter } from '@utils';
@@ -155,8 +155,18 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                 ]);
                 const retained = config.outbounds.filter(o => !builtinGroupTags.has(o.tag));
                 config.outbounds = [...retained, ...acl.outboundGroups];
-                config.route.rules = acl.rules;
-                config.route.rule_set = acl.ruleSets;
+                // 保留 Block/Bypass 拦截规则在最前（广告/色情/恶意/挖矿 reject、国内/直连 direct），
+                // 再叠加模板路由，避免模板规则覆盖掉 Block 拦截
+                const blockBypass = buildBlockAndBypassRules();
+                config.route.rules = [
+                    ...blockBypass.rules,
+                    ...acl.rules
+                ];
+                // rule_set 合并：既有地理规则集 + 模板内联 rule_set，保证 block/bypass 引用可用
+                config.route.rule_set = [
+                    ...blockBypass.ruleSets,
+                    ...acl.ruleSets
+                ];
                 config.route.final = acl.final;
             }
         } catch (error: any) {

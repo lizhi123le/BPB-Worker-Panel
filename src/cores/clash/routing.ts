@@ -16,15 +16,35 @@ export function buildRoutingRules(isWarp: boolean) {
 
     return [
         ...rules,
+        ...buildBlockRules(),
+        ...buildBypassRules(),
+        "MATCH,✅ Selector"
+    ];
+}
+
+/** 仅生成 Block（REJECT）规则行，供 ACL 模板接管时前置保留。 */
+export function buildBlockRules(): string[] {
+    const geoAssets = getGeoAssets();
+    const routingRules = accRoutingRules(geoAssets);
+    const blockRules = [
         ...routingRules.block.geosites.map(geosite => `RULE-SET,${geosite},REJECT`),
         ...routingRules.block.domains.map(domain => `DOMAIN-SUFFIX,${domain},REJECT`),
         ...routingRules.block.geoips.map(geoip => `RULE-SET,${geoip},REJECT`),
-        ...routingRules.block.ips.map(ip => buildIpCidrRule(ip, 'REJECT')),
+        ...routingRules.block.ips.map(ip => buildIpCidrRule(ip, 'REJECT'))
+    ];
+    // 过滤掉 URL-REGEX 之类 Clash 不支持的规则行由 buildAclClash 处理；这里仅原生 REJECT
+    return blockRules;
+}
+
+/** 仅生成 bypass（DIRECT）规则行，供 ACL 模板前置判定（国内/直连优先）。 */
+export function buildBypassRules(): string[] {
+    const geoAssets = getGeoAssets();
+    const routingRules = accRoutingRules(geoAssets);
+    return [
         ...routingRules.bypass.geosites.map(geosite => `RULE-SET,${geosite},DIRECT`),
         ...routingRules.bypass.domains.map(domain => `DOMAIN-SUFFIX,${domain},DIRECT`),
         ...routingRules.bypass.geoips.map(geoip => `RULE-SET,${geoip},DIRECT`),
-        ...routingRules.bypass.ips.map(ip => buildIpCidrRule(ip, 'DIRECT')),
-        "MATCH,✅ Selector"
+        ...routingRules.bypass.ips.map(ip => buildIpCidrRule(ip, 'DIRECT'))
     ];
 }
 

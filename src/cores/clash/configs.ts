@@ -1,6 +1,6 @@
 import { getDataset } from '@kv';
 import { buildDNS } from './dns';
-import { buildRoutingRules, buildRuleProviders } from './routing';
+import { buildRoutingRules, buildRuleProviders, buildBlockRules, buildBypassRules } from './routing';
 import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound } from './outbounds';
 import type { WireguardOutbound, Config, Outbound } from '#types/clash';
 import { buildEntryPortMap, getConfigAddresses, generateRemark, generateWsPath, getProtocols, resetRemarkCounter } from '@utils';
@@ -142,10 +142,19 @@ export async function getClNormalConfig(): Promise<Response> {
         try {
             const acl = await buildAclClash(aclTemplate, proxyTags);
             if (acl && (acl.groups.length > 0 || acl.rules.length > 0)) {
-                // ACL 模板接管：proxy-groups 整体替换为模板组（去掉内置 Selector/最佳延迟），
-                // 路由也被模板规则接管，内置组不再被引用
+                // ACL 模板接管：proxy-groups 整体替换为模板组（去掉内置 Selector/最佳延迟）
                 config["proxy-groups"] = acl.groups;
-                config.rules = acl.rules;
+                // 保留 Block/Bypass 拦截规则在最前（广告/色情/恶意/挖矿等 REJECT，国内/直连 DIRECT），
+                // 再叠加模板规则，最后补 MATCH 兜底，避免模板规则覆盖掉 Block 拦截
+                config.rules = [
+                    ...buildBlockRules(),
+                    ...buildBypassRules(),
+                    ...acl.rules.filter(r => !r.startsWith('MATCH,'))
+                ];
+                if (!config.rules.some(r => r.startsWith('MATCH,'))) {
+                    const fallback = acl.groups.find(g => g.type === 'select') || acl.groups[0];
+                    config.rules.push(`MATCH,${fallback ? fallback.name : '🚀 节点选择'}`);
+                }
                 // 规则集引用：模板 provider 合并进既有 provider（避免重名），不清空
                 const existingProviders = config["rule-providers"] || {};
                 config["rule-providers"] = {
