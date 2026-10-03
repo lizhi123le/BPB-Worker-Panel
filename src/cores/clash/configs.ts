@@ -3,7 +3,7 @@ import { buildDNS } from './dns';
 import { buildRoutingRules, buildRuleProviders } from './routing';
 import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound } from './outbounds';
 import type { WireguardOutbound, Config, Outbound } from '#types/clash';
-import { buildEntryPortMap, getConfigAddresses, generateRemark, getProtocols, resetRemarkCounter } from '@utils';
+import { buildEntryPortMap, getConfigAddresses, generateRemark, generateWsPath, getProtocols, resetRemarkCounter } from '@utils';
 import { sniffer, tun } from './inbounds';
 
 async function buildConfig(
@@ -82,6 +82,8 @@ export async function getClNormalConfig(): Promise<Response> {
     const hosts = await getConfigAddresses(false);
     const entryPortMap = buildEntryPortMap();
     const protocols = getProtocols();
+    // 已占用路径池词集合：每个 ws 出站各抽一个互不相同的伪装路径
+    const usedPaths = new Set<string>();
 
     if (upstreamServer && upstreamPort) {
         ports.unshift(upstreamPort);
@@ -101,7 +103,7 @@ export async function getClNormalConfig(): Promise<Response> {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
                 const tag = generateRemark(port, host, protocol, false, false);
-                const outbound = buildWebsocketOutbound(protocol, tag, host, port);
+                const outbound = buildWebsocketOutbound(protocol, tag, host, port, generateWsPath(usedPaths));
 
                 if (outbound) {
                     proxyTags.push(tag);

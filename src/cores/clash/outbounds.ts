@@ -1,4 +1,4 @@
-import { isHttps, generateWsPath, parseHostPort, pickRandomEch, selectSniHost } from '@utils';
+import { isHttps, parseHostPort, pickRandomEch, selectSniHost } from '@utils';
 import {
     BaseOutbound,
     HttpOutbound,
@@ -50,6 +50,7 @@ export function buildWebsocketOutbound(
     remark: string,
     address: string,
     port: number,
+    path: string,
 ): VlessOutbound | TrojanOutbound | null {
     const {
         dict: { _VL_, _TR_ },
@@ -82,7 +83,7 @@ export function buildWebsocketOutbound(
         fingerprint
     ) : {};
     
-    const transport = buildTransport("ws", undefined, generateWsPath(), host, undefined, 2560);
+    const transport = buildTransport("ws", undefined, path, host, undefined, 2560);
 
     if (protocol === _VL_) return buildOutbound<VlessOutbound>(remark, protocol, address, port, enableIPv6, enableTFO, tls, transport, {
         "uuid": userID,
