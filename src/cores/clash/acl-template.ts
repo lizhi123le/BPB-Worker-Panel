@@ -327,23 +327,6 @@ export function generateAclGroups(
     return { groups, ruleProviders, inlineRules };
 }
 
-/* ------------------------- 规则集服务端拉取 ------------------------- */
-
-async function fetchRuleSetLines(url: string): Promise<string[]> {
-    try {
-        const resp = await fetchWithTimeout(url, {}, 10000);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const text = await resp.text();
-        return text.split(/\r?\n/).filter(l => {
-            const t = l.trim();
-            return t && !t.startsWith('#') && !t.startsWith('//');
-        });
-    } catch (e: any) {
-        console.warn(`[ACL 规则集] 获取失败 ${url}: ${e.message || e}`);
-        return [];
-    }
-}
-
 /* ------------------------- Clash 组装入口 ------------------------- */
 
 export type ClashGroup = ClashSelector | ClashUrlTest | LoadBalance | Fallback;
@@ -355,18 +338,17 @@ export interface AclClashResult {
 
 /**
  * 把 URL 规则集映射为 Clash rule-providers 记录。
- * `behavior` 依据规则内容抽样判断（含 IP-CIDR/IP-CIDR6 → ipcidr，否则 domain）。
+ * 使用 `behavior: classical`（匹配 ACL4SSR 在线模板的规则集格式）。
  */
 export function buildAclProviders(
-    providers: AclRuleProvider[],
-    behavior: 'domain' | 'ipcidr' = 'domain'
+    providers: AclRuleProvider[]
 ): Record<string, RuleProvider> {
     const out: Record<string, RuleProvider> = {};
     for (const p of providers) {
         out[p.name] = {
             type: 'http',
             format: 'text',
-            behavior,
+            behavior: 'classical',
             url: p.url,
             path: `./ruleset/${p.name}.list`,
             interval: 86400,
@@ -405,16 +387,7 @@ export async function buildAclClash(
     for (const rp of ruleProviders) {
         rules.push(`RULE-SET,${rp.name},${rp.group}`);
     }
-    // 2) 服务端拉取规则集内容，推测 behavior（含 IP-CIDR → ipcidr）
-    let providerBehavior: 'domain' | 'ipcidr' = 'domain';
-    for (const rp of ruleProviders) {
-        const lines = await fetchRuleSetLines(rp.url);
-        if (lines.some(l => /^(IP-CIDR|IP-CIDR6)\b/i.test(l.trim()))) {
-            providerBehavior = 'ipcidr';
-            break;
-        }
-    }
-    const providers = buildAclProviders(ruleProviders, providerBehavior);
+    const providers = buildAclProviders(ruleProviders);
     // 3) 内联规则（模板中 `ruleset=` 的裸规则）仍作为普通规则带策略组
     for (const rule of inlineRules) {
         if (rule.ruleType.toUpperCase() === 'FINAL') {

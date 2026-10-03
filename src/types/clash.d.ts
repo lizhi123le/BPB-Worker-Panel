@@ -231,7 +231,7 @@ export type ChainOutbound = Exclude<Outbound, WireguardOutbound>;
 export interface RuleProvider {
     "type": "http";
     "format": string;
-    "behavior": "domain" | "ipcidr";
+    "behavior": "domain" | "ipcidr" | "classical";
     "url": string;
     "path": string;
     "interval": number;
