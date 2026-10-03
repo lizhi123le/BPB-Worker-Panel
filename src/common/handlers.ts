@@ -752,9 +752,7 @@ export async function getURLConfigs() {
         config.searchParams.append('security', security);
         config.hash = remark;
 
-        config.searchParams.append('eh', 'Sec-WebSocket-Protocol');
-        config.searchParams.append('ed', '2560');
-        config.searchParams.append('path', generateWsPath(usedPaths));
+        config.searchParams.append('path', `${generateWsPath(usedPaths)}?ed=2560`);
 
         if (isTLS) {
             config.searchParams.append('sni', sni);
