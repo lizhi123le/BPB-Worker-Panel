@@ -702,7 +702,7 @@ export async function getURLConfigs() {
     resetRemarkCounter();
     const {
         globalConfig: { userID, TrPass },
-        httpConfig: { defaultHttpsPorts, client, hostName },
+        httpConfig: { defaultHttpsPorts },
         dict: { _VL_, _TR_, _project_ },
         settings: {
             fingerprint,
@@ -752,15 +752,9 @@ export async function getURLConfigs() {
         config.searchParams.append('security', security);
         config.hash = remark;
 
-        if (client === 'sing-box') {
-            config.searchParams.append('eh', 'Sec-WebSocket-Protocol');
-            config.searchParams.append('ed', '2560');
-            config.searchParams.append('path', generateWsPath(usedPaths));
-        } else {
-            config.searchParams.append('eh', 'Sec-WebSocket-Protocol');
-            config.searchParams.append('ed', '2560');
-            config.searchParams.append('path', generateWsPath(usedPaths));
-        }
+        config.searchParams.append('eh', 'Sec-WebSocket-Protocol');
+        config.searchParams.append('ed', '2560');
+        config.searchParams.append('path', generateWsPath(usedPaths));
 
         if (isTLS) {
             config.searchParams.append('sni', sni);
