@@ -1,4 +1,5 @@
 import { safeErrorMessage } from "@common";
+import { PUBLIC_PATH_POOL } from "../common/ratelimit";
 
 // Cloudflare Workers runtime provides global connect function
 declare const connect: (options: { hostname: string; port: number }) => Socket;
@@ -498,13 +499,55 @@ export function getRandomString(lengthMin: number, lengthMax: number): string {
     return result;
 }
 
-export function generateWsPath(): string {
-    // 对齐 cfnew：路径不包含协议信息，协议由服务端首包内容自动识别
-    const config = {
-        junk: getRandomString(8, 16),
-    };
+/** 撞到已占用路径时的重抽次数上限（1-3 段路径空间约 1.7 亿，撞车极罕见，纯属兜底） */
+const WS_PATH_MAX_REDRAW = 5;
 
-    return `/${btoa(JSON.stringify(config))}`;
+/**
+ * 生成 WS 伪装路径 —— 对齐 edgetunnel `随机路径`（edgetunnel/_worker.js.backup:8524）
+ *
+ * 路径由公共路径池中 **1-3 个词**用 `/` 拼接而成（`/api`、`/api/video`）：
+ * 段数 `k = Math.floor(Math.random() * 3 + 1)`，在 1..3 上均匀分布（不加权）。
+ * 抽取方式是「部分 Fisher-Yates 洗牌」：复制池后只洗前 k 个位置（O(k) 替代 O(n)），
+ * 因此同一条路径内的各段互不相同，不会出现 `/api/api`。
+ *
+ * 每段都取自公共路径字典，故天然满足 isPathInDictionary（edgetunnel 于
+ * _worker.js.backup:1400-1401 强制同规则），路径保持人类可读，不做 base64 编码。
+ *
+ * BPB 没有 edgetunnel 的基础节点路径可拼接（只对应 `完整节点路径 === "/"` 分支），
+ * 多段随机路径本身就是伪装路径。
+ *
+ * @param used 同一次生成中已占用的**完整路径**集合（如 `/api/video`），保证节点级唯一：
+ *             抽中后写回；撞到已占用路径则重抽（至多 WS_PATH_MAX_REDRAW 次），
+ *             重抽次数用尽则返回最后一次结果，绝不抛错、绝不返回 undefined。
+ *             注意语义为「整条路径」而非「单词」——段级重复是允许且期望的，
+ *             `/api/video` 与 `/api/blog` 可同时存在。不传则为放回抽取。
+ */
+export function generateWsPath(used?: Set<string>): string {
+    if (PUBLIC_PATH_POOL.length === 0) return "/";
+
+    const len = PUBLIC_PATH_POOL.length;
+    let path = "";
+
+    for (let attempt = 0; attempt < WS_PATH_MAX_REDRAW; attempt++) {
+        // 段数在 1..3 上均匀分布
+        const 随机数 = Math.floor(Math.random() * 3 + 1);
+        // 部分洗牌: 只随机选取前 k 个元素，O(k) 替代 O(n)
+        const shuffleArr = [...PUBLIC_PATH_POOL];
+
+        for (let i = 0; i < 随机数 && i < len; i++) {
+            const j = i + Math.floor(Math.random() * (len - i));
+            [shuffleArr[i], shuffleArr[j]] = [shuffleArr[j], shuffleArr[i]];
+        }
+
+        path = `/${shuffleArr.slice(0, 随机数).join("/")}`;
+
+        if (!used || !used.has(path)) break;
+    }
+
+    // 绝不向 used 写入重复项
+    if (used && !used.has(path)) used.add(path);
+
+    return path;
 }
 
 export function pickRandomEch(echServerNames: string[]): string | undefined {

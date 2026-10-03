@@ -103,6 +103,12 @@ export const PUBLIC_PATH_DICTIONARY: ReadonlySet<string> = new Set([
     "workflow",
 ]);
 
+/**
+ * 伪装路径池 —— 订阅生成时随机抽取 WS 路径的唯一数据源。
+ * 直接由上方字典派生，不重复维护词表：`generateWsPath` 抽到的词天然满足 `isPathInDictionary`。
+ */
+export const PUBLIC_PATH_POOL: readonly string[] = Array.from(PUBLIC_PATH_DICTIONARY);
+
 const RATE_LIMIT_WINDOW_MS = 3600000; // 1 小时
 const RATE_LIMIT_MAX_REQUESTS = 6;    // 每窗口最多 6 次
 const RATE_LIMIT_KV_PREFIX = 'ratelimit:';
