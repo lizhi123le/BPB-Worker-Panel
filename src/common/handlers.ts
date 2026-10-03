@@ -757,8 +757,9 @@ export async function getURLConfigs() {
             config.searchParams.append('ed', '2560');
             config.searchParams.append('path', generateWsPath(usedPaths));
         } else {
-            config.searchParams.append('path', generateWsPath(usedPaths));
+            config.searchParams.append('eh', 'Sec-WebSocket-Protocol');
             config.searchParams.append('ed', '2560');
+            config.searchParams.append('path', generateWsPath(usedPaths));
         }
 
         if (isTLS) {
