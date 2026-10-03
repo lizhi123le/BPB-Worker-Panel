@@ -147,7 +147,12 @@ export async function getClNormalConfig(): Promise<Response> {
                 const newGroups = acl.groups.filter(g => !existingNames.has(g.name));
                 config["proxy-groups"].push(...newGroups);
                 config.rules = acl.rules;
-                config["rule-providers"] = undefined;
+                // 规则集引用：模板 provider 合并进既有 provider（避免重名），不清空
+                const existingProviders = config["rule-providers"] || {};
+                config["rule-providers"] = {
+                    ...existingProviders,
+                    ...(acl.providers || {})
+                };
             }
         } catch (error: any) {
             console.warn('[ACL Config] apply clash template error:', error?.message || error);

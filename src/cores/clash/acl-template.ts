@@ -3,6 +3,7 @@ import type {
     URLTest as ClashUrlTest,
     LoadBalance,
     Fallback,
+    RuleProvider,
 } from '#types/clash';
 import type { RoutingRule, RuleSet, Selector as SbSelector, URLTest as SbUrlTest, Outbound } from '#types/sing-box';
 import { fetchWithTimeout } from '@common';
@@ -352,11 +353,33 @@ export interface AclClashResult {
     rules: string[];
 }
 
-/** 生成 Clash 结构化策略组 + 规则（规则集服务端内联）。load-balance 保留原生。 */
+/**
+ * 把 URL 规则集映射为 Clash rule-providers 记录。
+ * `behavior` 依据规则内容抽样判断（含 IP-CIDR/IP-CIDR6 → ipcidr，否则 domain）。
+ */
+export function buildAclProviders(
+    providers: AclRuleProvider[],
+    behavior: 'domain' | 'ipcidr' = 'domain'
+): Record<string, RuleProvider> {
+    const out: Record<string, RuleProvider> = {};
+    for (const p of providers) {
+        out[p.name] = {
+            type: 'http',
+            format: 'text',
+            behavior,
+            url: p.url,
+            path: `./ruleset/${p.name}.list`,
+            interval: 86400,
+        };
+    }
+    return out;
+}
+
+/** 生成 Clash 结构化策略组 + 规则（rule-providers 引用式，见用户要求）。load-balance 保留原生。 */
 export async function buildAclClash(
     templateUrl: string,
     nodeNames: string[]
-): Promise<AclClashResult | null> {
+): Promise<AclClashResult & { providers: Record<string, RuleProvider> } | null> {
     const parsed = await fetchAclTemplate(templateUrl);
     if (!parsed || (parsed.rulesets.length === 0 && parsed.proxyGroups.length === 0)) return null;
 
@@ -378,44 +401,30 @@ export async function buildAclClash(
     });
 
     const rules: string[] = [];
+    // 1) 规则集引用：RULE-SET,<providerName>,<策略组>
+    for (const rp of ruleProviders) {
+        rules.push(`RULE-SET,${rp.name},${rp.group}`);
+    }
+    // 2) 服务端拉取规则集内容，推测 behavior（含 IP-CIDR → ipcidr）
+    let providerBehavior: 'domain' | 'ipcidr' = 'domain';
     for (const rp of ruleProviders) {
         const lines = await fetchRuleSetLines(rp.url);
-        if (lines.length === 0) {
-            rules.push(`# provider ${rp.name} (${rp.url}) unreachable, skipped`);
-            continue;
-        }
-        for (const raw of lines) {
-            const c = raw.trim().replace(/^\s*-\s*/, '');
-            if (!c) continue;
-            if (/^URL-REGEX\b/i.test(c)) continue; // Clash 不支持 URL-REGEX
-            if (/^(IP-CIDR|IP-CIDR6)/i.test(c)) {
-                const withoutNoResolve = c.replace(/,?\s*no-resolve\s*$/i, '').trim();
-                const parts = withoutNoResolve.split(',');
-                if (parts.length >= 3) {
-                    rules.push(`  - ${withoutNoResolve},no-resolve`);
-                } else {
-                    rules.push(`  - ${withoutNoResolve},${rp.group},no-resolve`);
-                }
-            } else {
-                const commaCount = (c.match(/,/g) || []).length;
-                if (commaCount >= 2) {
-                    rules.push(`  - ${c}`);
-                } else {
-                    rules.push(`  - ${c},${rp.group}`);
-                }
-            }
+        if (lines.some(l => /^(IP-CIDR|IP-CIDR6)\b/i.test(l.trim()))) {
+            providerBehavior = 'ipcidr';
+            break;
         }
     }
-
+    const providers = buildAclProviders(ruleProviders, providerBehavior);
+    // 3) 内联规则（模板中 `ruleset=` 的裸规则）仍作为普通规则带策略组
     for (const rule of inlineRules) {
         if (rule.ruleType.toUpperCase() === 'FINAL') {
-            rules.push(`  - MATCH,${rule.group}`);
+            rules.push(`MATCH,${rule.group}`);
         } else {
-            rules.push(`  - ${rule.ruleType},${rule.ruleVal},${rule.group}`);
+            rules.push(`${rule.ruleType},${rule.ruleVal},${rule.group}`);
         }
     }
 
-    return { groups: clashGroups, rules };
+    return { groups: clashGroups, rules, providers };
 }
 
 /* ------------------------- sing-box 规则格式转换 ------------------------- */
