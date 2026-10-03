@@ -142,10 +142,9 @@ export async function getClNormalConfig(): Promise<Response> {
         try {
             const acl = await buildAclClash(aclTemplate, proxyTags);
             if (acl && (acl.groups.length > 0 || acl.rules.length > 0)) {
-                // 模板组追加到既有组后（保留 Selector/最佳延迟），规则整体替换
-                const existingNames = new Set(config["proxy-groups"].map(g => g.name));
-                const newGroups = acl.groups.filter(g => !existingNames.has(g.name));
-                config["proxy-groups"].push(...newGroups);
+                // ACL 模板接管：proxy-groups 整体替换为模板组（去掉内置 Selector/最佳延迟），
+                // 路由也被模板规则接管，内置组不再被引用
+                config["proxy-groups"] = acl.groups;
                 config.rules = acl.rules;
                 // 规则集引用：模板 provider 合并进既有 provider（避免重名），不清空
                 const existingProviders = config["rule-providers"] || {};

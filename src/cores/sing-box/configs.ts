@@ -144,14 +144,20 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
         try {
             const acl = await buildAclSingbox(aclTemplate, proxyTags);
             if (acl && (acl.outboundGroups.length > 0 || acl.rules.length > 0)) {
-                const existingTags = new Set(config.outbounds.map(o => o.tag));
-                const newGroups = acl.outboundGroups.filter(g => !existingTags.has(g.tag));
-                if (newGroups.length) {
-                    config.outbounds.push(...newGroups);
-                    config.route.rules = acl.rules;
-                    config.route.rule_set = acl.ruleSets;
-                    config.route.final = acl.final;
-                }
+                // ACL 模板接管：去掉内置分组出站（✅ Selector 与各类「最佳延迟」），
+                // 仅保留真实代理出站与 direct，路由与 final 由模板接管
+                const builtinGroupTags = new Set([
+                    "✅ Selector",
+                    "最佳延迟 🚀",
+                    "Warp - 最佳延迟 🚀",
+                    "WoW - 最佳延迟 🚀",
+                    "🔗 最佳延迟 🚀",
+                ]);
+                const retained = config.outbounds.filter(o => !builtinGroupTags.has(o.tag));
+                config.outbounds = [...retained, ...acl.outboundGroups];
+                config.route.rules = acl.rules;
+                config.route.rule_set = acl.ruleSets;
+                config.route.final = acl.final;
             }
         } catch (error: any) {
             console.warn('[ACL Config] apply singbox template error:', error?.message || error);
