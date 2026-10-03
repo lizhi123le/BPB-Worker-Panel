@@ -199,6 +199,24 @@ export interface URLTest {
     "tolerance"?: number;
 }
 
+export interface LoadBalance {
+    "name": string;
+    "type": "load-balance";
+    "proxies": string[];
+    "url"?: string;
+    "interval"?: number;
+    "strategy"?: string;
+}
+
+export interface Fallback {
+    "name": string;
+    "type": "fallback";
+    "proxies": string[];
+    "url"?: string;
+    "interval"?: number;
+    "tolerance"?: number;
+}
+
 export type Outbound =
     | HttpOutbound
     | SocksOutbound
@@ -218,6 +236,8 @@ export interface RuleProvider {
     "path": string;
     "interval": number;
 }
+
+export type ProxyGroup = Selector | URLTest | LoadBalance | Fallback;
 
 interface ExternalControllerCors {
     "allow-origins": ["*"];
@@ -258,7 +278,7 @@ export interface Config {
     "tun": Tun;
     "sniffer": Sniffer;
     "proxies": Outbound[];
-    "proxy-groups": Array<Selector | URLTest>;
+    "proxy-groups": Array<Selector | URLTest | LoadBalance | Fallback>;
     "rule-providers"?: Record<string, RuleProvider>;
     "rules": string[];
     "ntp": NTP;

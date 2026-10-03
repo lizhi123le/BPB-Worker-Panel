@@ -5,6 +5,7 @@ import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutb
 import { Outbound, WireguardEndpoint, Config } from '#types/sing-box';
 import { buildEntryPortMap, getConfigAddresses, generateRemark, generateWsPath, isHttps, getProtocols, resetRemarkCounter } from '@utils';
 import { buildMixedInbound, tun } from './inbounds';
+import { buildAclSingbox } from '../clash/acl-template';
 
 async function buildConfig(
     outbounds: Outbound[],
@@ -136,6 +137,26 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
         false,
         isChain
     );
+
+    // ACL4SSR 分组模板：load-balance/fallback → urltest，模板路由整体接管（失败回退默认）
+    const { aclEnabled, aclTemplate } = globalThis.settings;
+    if (aclEnabled && aclTemplate) {
+        try {
+            const acl = await buildAclSingbox(aclTemplate, proxyTags);
+            if (acl && (acl.outboundGroups.length > 0 || acl.rules.length > 0)) {
+                const existingTags = new Set(config.outbounds.map(o => o.tag));
+                const newGroups = acl.outboundGroups.filter(g => !existingTags.has(g.tag));
+                if (newGroups.length) {
+                    config.outbounds.push(...newGroups);
+                    config.route.rules = acl.rules;
+                    config.route.rule_set = acl.ruleSets;
+                    config.route.final = acl.final;
+                }
+            }
+        } catch (error: any) {
+            console.warn('[ACL Config] apply singbox template error:', error?.message || error);
+        }
+    }
 
     return new Response(JSON.stringify(config, null, 4), {
         status: 200,

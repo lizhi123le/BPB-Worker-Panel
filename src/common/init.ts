@@ -112,6 +112,8 @@ globalThis.settings = {
     amneziaNoiseSizeMax: 100,
     customSubs: [],
     customConfigs: [],
+    aclEnabled: true,
+    aclTemplate: 'https://raw.githubusercontent.com/lizhi123le/ACL4SSR/master/Clash/config/ACL4SSR_Online_Full_MultiMode.ini',
     panelVersion: __VERSION__
 };
 

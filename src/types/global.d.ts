@@ -167,6 +167,9 @@ declare global {
         customSubs: string[];
         customConfigs: string[];
         panelVersion: string;
+        // 分组配置模板（ACL4SSR）：默认开启，URL 可面板配置
+        aclEnabled: boolean;
+        aclTemplate: string;
     }
 
     var settings: Settings;

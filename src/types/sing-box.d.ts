@@ -78,13 +78,17 @@ export interface MixedInbound {
 }
 
 export interface RoutingRule {
-    rule_set?: string[];
+    rule_set?: string[] | string;
     domain_suffix?: string[];
+    domain?: string[];
+    domain_keyword?: string[];
     ip_cidr?: string[] | string;
     ip_is_private?: true;
     network?: "tcp" | "udp";
     protocol?: "http" | "tls" | "quic" | "dns";
     port?: number;
+    geoip?: { country_code: string };
+    process?: string[];
     clash_mode?: "Global" | "Direct";
     action?: "route" | "reject" | "hijack-dns" | "sniff";
     outbound?: string;
@@ -98,9 +102,15 @@ export interface RuleSet {
     download_detour: string;
 }
 
+export interface InlineRuleSet {
+    type: "inline";
+    tag: string;
+    rules: Array<Record<string, string[]>>;
+}
+
 export interface Route {
     rules: RoutingRule[];
-    rule_set?: RuleSet[];
+    rule_set?: Array<RuleSet | InlineRuleSet>;
     auto_detect_interface: true;
     final: string;
 }
@@ -228,6 +238,7 @@ export interface URLTest {
     outbounds: string[];
     url: string;
     interval: string;
+    tolerance?: number;
     interrupt_exist_connections: false;
 }
 

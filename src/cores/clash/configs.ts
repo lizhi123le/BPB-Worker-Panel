@@ -5,6 +5,7 @@ import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutb
 import type { WireguardOutbound, Config, Outbound } from '#types/clash';
 import { buildEntryPortMap, getConfigAddresses, generateRemark, generateWsPath, getProtocols, resetRemarkCounter } from '@utils';
 import { sniffer, tun } from './inbounds';
+import { buildAclClash } from './acl-template';
 
 async function buildConfig(
     outbounds: Outbound[],
@@ -134,6 +135,24 @@ export async function getClNormalConfig(): Promise<Response> {
         false,
         false
     );
+
+    // ACL4SSR 分组模板：启用时用模板分组 + 规则整体接管（失败回退默认）
+    const { aclEnabled, aclTemplate } = globalThis.settings;
+    if (aclEnabled && aclTemplate) {
+        try {
+            const acl = await buildAclClash(aclTemplate, proxyTags);
+            if (acl && (acl.groups.length > 0 || acl.rules.length > 0)) {
+                // 模板组追加到既有组后（保留 Selector/最佳延迟），规则整体替换
+                const existingNames = new Set(config["proxy-groups"].map(g => g.name));
+                const newGroups = acl.groups.filter(g => !existingNames.has(g.name));
+                config["proxy-groups"].push(...newGroups);
+                config.rules = acl.rules;
+                config["rule-providers"] = undefined;
+            }
+        } catch (error: any) {
+            console.warn('[ACL Config] apply clash template error:', error?.message || error);
+        }
+    }
 
     return new Response(JSON.stringify(config, null, 4), {
         status: 200,
