@@ -721,6 +721,9 @@ export async function getURLConfigs() {
         }
     } = globalThis;
 
+    // 已占用路径池词集合：本次请求内 VLESS / Trojan 各抽一个互不相同的伪装路径
+    const usedPaths = new Set<string>();
+
     const buildConfig = (protocol: string, addr: string, port: number, host: string, sni: string, remark: string) => {
         const isTLS = defaultHttpsPorts.includes(port) || addr === upstreamServer || Object.values(entryPortMap).some(ports => ports.includes(port));
         const security = isTLS ? 'tls' : 'none';
@@ -742,7 +745,6 @@ export async function getURLConfigs() {
             config.username = TrPass;
         }
 
-        const path = generateWsPath();
         config.hostname = parseHostPort(addr, true).host;
         config.port = port.toString();
         config.searchParams.append('host', host);
@@ -753,9 +755,9 @@ export async function getURLConfigs() {
         if (client === 'sing-box') {
             config.searchParams.append('eh', 'Sec-WebSocket-Protocol');
             config.searchParams.append('ed', '2560');
-            config.searchParams.append('path', path);
+            config.searchParams.append('path', generateWsPath(usedPaths));
         } else {
-            config.searchParams.append('path', path);
+            config.searchParams.append('path', generateWsPath(usedPaths));
             config.searchParams.append('ed', '2560');
         }
 
