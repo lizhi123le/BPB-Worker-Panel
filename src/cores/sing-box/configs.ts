@@ -3,7 +3,7 @@ import { buildDNS } from './dns';
 import { buildRoutingRules } from './routing';
 import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound } from './outbounds.js';
 import { Outbound, WireguardEndpoint, Config } from '#types/sing-box';
-import { buildEntryPortMap, getConfigAddresses, generateRemark, isHttps, getProtocols, resetRemarkCounter } from '@utils';
+import { buildEntryPortMap, getConfigAddresses, generateRemark, generateWsPath, isHttps, getProtocols, resetRemarkCounter } from '@utils';
 import { buildMixedInbound, tun } from './inbounds';
 
 async function buildConfig(
@@ -85,6 +85,8 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
     const hosts = await getConfigAddresses(isFragment);
     const entryPortMap = buildEntryPortMap();
     const totalPorts = ports.filter(port => !isFragment || isHttps(port));
+    // 已占用路径池词集合：每个 ws 出站各抽一个互不相同的伪装路径
+    const usedPaths = new Set<string>();
 
     if (upstreamServer && upstreamPort && !isFragment) {
         totalPorts.unshift(upstreamPort);
@@ -105,7 +107,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
                 const tag = generateRemark(port, host, protocol, isFragment, false);
-                const outbound = buildWebsocketOutbound(protocol, tag, host, port, isFragment);
+                const outbound = buildWebsocketOutbound(protocol, tag, host, port, generateWsPath(usedPaths), isFragment);
 
                 outbounds.push(outbound);
                 proxyTags.push(tag);
