@@ -114,6 +114,18 @@ export interface Route {
     rule_set?: Array<RuleSet | InlineRuleSet>;
     auto_detect_interface: true;
     final: string;
+    /**
+     * sing-box 1.14.0 起：远程规则集等出站 HTTP 请求所用客户端的默认 tag（指向顶层 `http_clients`）。
+     * 不指定会报 “implicit default HTTP client using default outbound for remote rule-sets is deprecated
+     * in sing-box 1.14.0 and will be removed in 1.16.0”。
+     */
+    default_http_client?: string;
+}
+
+/** sing-box 1.14.0 起：可复用的 HTTP 客户端（远程规则集 / ACME 等共用），`detour` 指定下载走哪个出站。 */
+export interface HttpClient {
+    tag: string;
+    detour: string;
 }
 
 export interface TLS {
@@ -317,4 +329,6 @@ export interface Config {
     route: Route;
     ntp: NTP;
     experimental: Experimental;
+    /** 1.14.0 起：远程规则集等共用的 HTTP 客户端定义 */
+    http_clients: HttpClient[];
 }

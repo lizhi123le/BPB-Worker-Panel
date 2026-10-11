@@ -26,6 +26,14 @@ async function buildConfig(
             timestamp: true
         },
         dns: await buildDNS(isWarp, isChain),
+        // 1.14.0 起远程规则集必须显式指定 HTTP 客户端，否则报
+        // “implicit default HTTP client using default outbound for remote rule-sets is deprecated in
+        //  sing-box 1.14.0 and will be removed in sing-box 1.16.0”。
+        // 这里声明一个固定走 direct 下载的客户端（等价于旧的 download_detour: "direct"，但用的是新 schema），
+        // 并由下方 route.default_http_client 设为全局默认，覆盖 geoip/geosite 与 ACL 模板的全部远程规则集。
+        http_clients: [
+            { tag: "http-direct", detour: "direct" }
+        ],
         inbounds: [
             tun,
             buildMixedInbound()
@@ -68,6 +76,9 @@ async function buildConfig(
             }
         }
     };
+
+    // 远程规则集统一用上面声明的 HTTP 客户端下载（显式指定；从 config 自身取值，避免两处字面量漂移）
+    config.route.default_http_client = config.http_clients[0].tag;
 
     const tag = isWarp ? "Warp - 最佳延迟 🚀" : "最佳延迟 🚀";
     const mainUrlTest = buildUrlTest(tag, urlTestTags, isWarp);
