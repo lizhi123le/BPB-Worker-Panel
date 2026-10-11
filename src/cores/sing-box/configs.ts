@@ -195,11 +195,18 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                     ...blockBypass.rules,
                     ...acl.rules
                 ];
-                // rule_set 合并：既有地理规则集 + 模板内联 rule_set，保证 block/bypass 引用可用
-                config.route.rule_set = [
-                    ...blockBypass.ruleSets,
-                    ...acl.ruleSets
-                ];
+                // rule_set 合并：既有地理规则集 + 模板内联 rule_set，保证 block/bypass 引用可用。
+                // 必须按 tag 去重：模板里的 `[]GEOIP,CN` 会生成 tag `geoip-cn`，与面板自身 geo 资源
+                // （bypassChina → geo-assets `geoip-cn`）撞名；sing-box 对重复 tag 直接 FATAL
+                // （1.14 实测：`initialize router: duplicate rule-set tag: geoip-cn`）→ 整份配置加载失败。
+                // 保留首次出现者（面板自身资源在前，优先）。
+                const mergedRuleSets = [...blockBypass.ruleSets, ...acl.ruleSets];
+                const ruleSetTags = new Set<string>();
+                config.route.rule_set = mergedRuleSets.filter(rs => {
+                    if (ruleSetTags.has(rs.tag)) return false;
+                    ruleSetTags.add(rs.tag);
+                    return true;
+                });
                 config.route.final = acl.final;
             }
         } catch (error: any) {

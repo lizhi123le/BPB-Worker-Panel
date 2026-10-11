@@ -562,7 +562,8 @@ export type SnboxGroup = SbSelector | SbUrlTest;
 export interface AclSingboxResult {
     outboundGroups: SnboxGroup[];
     rules: RoutingRule[];
-    ruleSets: Array<{ type: 'inline'; tag: string; rules: Array<Record<string, string[]>> }>;
+    // 内含两类：URL provider 服务端内联（inline），以及 geoip 规则所需的 remote/binary 规则集
+    ruleSets: Array<RuleSet | { type: 'inline'; tag: string; rules: Array<Record<string, string[]>> }>;
     final: string;
 }
 
@@ -658,7 +659,28 @@ export async function buildAclSingbox(
         else if (type === 'domain-suffix') ruleObj.domain_suffix = [rule.ruleVal];
         else if (type === 'domain-keyword') ruleObj.domain_keyword = [rule.ruleVal];
         else if (type === 'ipcidr' || type === 'ip-cidr') ruleObj.ip_cidr = [rule.ruleVal];
-        else if (type === 'geoip') ruleObj.geoip = [rule.ruleVal.toLowerCase()];
+        else if (type === 'geoip') {
+            // sing-box 1.8 弃用、1.12 **删除** legacy `geoip` 字段（1.14 实测：`parse rule[N]: geoip database is
+            // deprecated ... removed in sing-box 1.12.0` → 整份配置加载失败）。官方迁移口径：
+            // `geoip:"private"/"lan"` → `ip_is_private: true`；`geoip:"xx"` → 引用 rule_set `geoip-xx`。
+            const cc = rule.ruleVal.trim().toLowerCase();
+            if (cc === 'lan' || cc === 'private') {
+                ruleObj.ip_is_private = true;
+            } else {
+                const tag = `geoip-${cc}`;
+                // 与 sing-box/geo-assets.ts 的 geoip 规则集同 tag 同源（SagerNet/sing-geoip），故按 tag 去重
+                if (!ruleSets.some(rs => rs.tag === tag)) {
+                    ruleSets.push({
+                        type: 'remote',
+                        tag,
+                        format: 'binary',
+                        url: `https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/${tag}.srs`,
+                        download_detour: 'direct'
+                    });
+                }
+                ruleObj.rule_set = [tag];
+            }
+        }
         else if (type === 'process') ruleObj.process = [rule.ruleVal];
         else {
             // C14：未命中已知类型时绝不能把规则类型名（如 `URL-REGEX`）当成 rule_set tag 下发 ——

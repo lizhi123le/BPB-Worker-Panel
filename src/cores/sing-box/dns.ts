@@ -242,8 +242,10 @@ export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> 
     return {
         servers,
         rules,
-        strategy: enableIPv6 ? "prefer_ipv4" : "ipv4_only",
-        independent_cache: true
+        strategy: enableIPv6 ? "prefer_ipv4" : "ipv4_only"
+        // independent_cache 自 sing-box 1.14 弃用、1.16 将删除，且 1.14 源码里它已是**空操作**
+        // （dns/router.go 仅在为 true 时调用 deprecated.Report，无任何行为）→ 删除：避免 1.14+ 打 WARN、
+        // 1.16+ 因未知/已删字段直接拒配置。官方迁移口径即「remove the field」。
     }
 }
 

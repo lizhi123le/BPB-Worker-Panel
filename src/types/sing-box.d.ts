@@ -57,7 +57,7 @@ export interface DNS {
     servers: DnsServer[];
     rules: DnsRule[];
     strategy: ResolveStrategy;
-    independent_cache: true;
+    // independent_cache 已于 sing-box 1.14 弃用、1.16 删除，且 1.14 起为空操作 → 不再下发（见 dns.ts）
 }
 
 export interface TunInbound {
