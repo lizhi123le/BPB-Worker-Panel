@@ -48,14 +48,14 @@ export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> 
 
     const url = new URL(remoteDNS);
     const protocol = url.protocol.replace(':', '');
-    const servers: DnsServer[] = [
-        {
-            type: isWarp ? "udp" : protocol,
-            server: isWarp ? warpRemoteDNS : remoteDnsHost.host,
-            detour: isWarp ? "Warp - 最佳延迟 🚀" : isChain ? "🔗 最佳延迟 🚀" : "✅ Selector",
-            tag: "dns-remote"
-        }
-    ];
+    // 命名引用：下面「域名型 DoH 服务器需要 domain_resolver」处直接改这个对象
+    const remoteServer: DnsServer = {
+        type: isWarp ? "udp" : protocol,
+        server: isWarp ? warpRemoteDNS : remoteDnsHost.host,
+        detour: isWarp ? "Warp - 最佳延迟 🚀" : isChain ? "🔗 最佳延迟 🚀" : "✅ Selector",
+        tag: "dns-remote"
+    };
+    const servers: DnsServer[] = [remoteServer];
 
     // 明文 DNS（localDNS）：dns-direct 与节点域名解析器的回退副本共用同一份定义
     const addLocalDnsServer = (tag: string) => {
@@ -123,10 +123,13 @@ export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> 
         const { ipv4, ipv6, host } = remoteDnsHost;
         const predefined = ipv4.concatIf(enableIPv6, ipv6);
         addDnsServer(servers, "hosts", "hosts", undefined, undefined, undefined, host, predefined);
-        rules.unshift({
-            ip_accept_any: true,
-            server: "hosts"
-        });
+        // 域名型 DoH 服务器（server 是域名）必须能解析自身地址 → 指向上面的静态 hosts 服务器
+        //（面板侧已解析出 IP，无需真实 DNS 查询，无环）。这正是 sing-box 1.12+ 对「域名型 DNS 服务器」
+        // 的正规机制 domain_resolver。
+        // 旧写法 `rules.unshift({ ip_accept_any: true, server: "hosts" })` 必须移除：`ip_accept_any` 属
+        // Response Match Fields（sing-box 1.14 起要求 match_response），较新内核启动期直接拒载整份配置：
+        // `validate dns rule[0]: Response Match Fields (...) require match_response to be enabled`。
+        remoteServer.domain_resolver = { server: "hosts", strategy: "ipv4_only" };
     }
 
     const assets = getGeoAssets();

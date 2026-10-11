@@ -46,7 +46,8 @@ export interface DnsRule {
     rule_set?: string[] | string;
     domain?: string[];
     domain_suffix?: string[];
-    ip_accept_any?: true;
+    // 注意：不要在此加 ip_cidr / ip_is_private / ip_accept_any / response_* —— 它们属 Response Match Fields，
+    // sing-box 1.14 起需要 match_response，较新内核会以「require match_response」拒载整份配置（见 dns.ts）。
     inbound?: string;
     query_type?: Array<"A" | "AAAA" | "HTTPS">;
     action?: "route" | "reject";
