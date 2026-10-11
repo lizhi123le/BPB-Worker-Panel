@@ -61,15 +61,24 @@ export const ACL_BUILTIN_GROUP_TAGS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * 只有 Clash/mihomo 才存在的内置策略名：mihomo 把它们当策略常量解析，但 sing-box 里没有对应出站 tag
- * （REJECT 是 route 的 action，不是 outbound；PASS/COMPATIBLE/GLOBAL 同理）。
- * ACL4SSR 默认模板会把 `[]REJECT` 写进分组成员（🛑 广告拦截 等 select 组），透传到 sing-box 即
- * `selector -> REJECT` 悬空引用、整份配置加载失败。注意 DIRECT 不在此列：它有 sing-box 对应出站
- * direct，由 generateAclGroups 的 mapMember 归一。
+ * 语义为「拒绝」的内置策略名（mihomo）。ACL4SSR 默认模板把它们写进分组成员 ——
+ * `🛑 广告拦截` / `🛡️ 隐私防护` / `🍃 应用净化` 都是 `select`[]REJECT`[]DIRECT`。
+ * sing-box 里没有对应的出站 tag（拒绝是 route 的 action，不是 outbound），因此：
+ *   1) 生成出站时要把这些成员名从 sing-box 分组成员里滤掉，否则 `selector -> REJECT` 悬空引用、整份配置加载失败；
+ *   2) 还必须把「指向这类分组」的规则改写成 `action: "reject"`（见 buildAclSingbox 的 blockGroupTags）——
+ *      否则该组只剩 direct/节点，广告与恶意域名会退化成**直连或走节点**，拦截彻底失效。
+ */
+const REJECT_POLICY_MEMBERS: ReadonlySet<string> = new Set([
+    'REJECT',
+    'REJECT-DROP'
+]);
+
+/**
+ * 只有 Clash/mihomo 才存在的内置策略名：mihomo 把它们当策略常量解析，但 sing-box 里没有对应出站 tag。
+ * 注意 DIRECT 不在此列：它有 sing-box 对应出站 direct，由 generateAclGroups 的 mapMember 归一。
  */
 const CLASH_ONLY_POLICY_MEMBERS: ReadonlySet<string> = new Set([
-    'REJECT',
-    'REJECT-DROP',
+    ...REJECT_POLICY_MEMBERS,
     'PASS',
     'COMPATIBLE',
     'GLOBAL'
@@ -245,6 +254,8 @@ export interface AclGroup {
     interval?: number;
     tolerance?: number;
     strategy?: string;
+    /** 成员里含 REJECT/REJECT-DROP → 该组语义是「拒绝」；sing-box 侧据此把指向它的规则改写成 action:"reject" */
+    blocking?: boolean;
 }
 
 interface AclRuleProvider {
@@ -333,19 +344,23 @@ export function generateAclGroups(
         } else {
             proxyList = type === 'select' ? [directTag, ...fallbackNodes] : [...fallbackNodes];
         }
+        // 本次分组是否为「拦截组」：成员里含 REJECT/REJECT-DROP。
+        // 判定必须在下面的哨兵过滤**之前**（过滤后 REJECT 就没了）；标记由 buildAclSingbox 消费。
+        let blocking = false;
         // 过滤自引用，避免环路；并归一模板里显式书写的大写 DIRECT（仅 sing-box 目标生效）
         proxyList = proxyList.filter(p => p !== pg.name).map(mapMember);
-        // 仅 sing-box 目标：再滤掉 Clash 专有的内置策略名（如 `[]REJECT`）——它们在 sing-box 里没有出站 tag，
-        // 留着就是 `selector/urltest -> REJECT` 悬空引用。拦截语义不受影响：本过滤只保证配置可加载，
-        // 真正的拦截由 sing-box/configs.ts 前置的 block/bypass reject 规则（buildBlockAndBypassRules）承担。
+        // 仅 sing-box 目标：滤掉 Clash 专有的内置策略名（如 `[]REJECT`）——它们在 sing-box 里没有出站 tag，
+        // 留着就是 `selector/urltest -> REJECT` 悬空引用、整份配置加载失败。
         // Clash 目标保留（REJECT 是 mihomo 合法内置策略），故此处只对 singbox 生效。
         if (targetClient === 'singbox') {
+            blocking = proxyList.some(p => REJECT_POLICY_MEMBERS.has(p));
             proxyList = proxyList.filter(p => !CLASH_ONLY_POLICY_MEMBERS.has(p));
             // 成员全是哨兵名时（模板只写了 `[]REJECT`）退回节点清单，避免生成 outbounds 为空的组
             if (proxyList.length === 0) proxyList = fallbackNodes;
         }
 
         const group: AclGroup = { name: pg.name, type, proxies: proxyList };
+        if (blocking) group.blocking = true;
         if ((type === 'url-test' || type === 'load-balance' || type === 'fallback') && pg.url) {
             group.url = pg.url;
             group.interval = pg.interval;
@@ -618,6 +633,11 @@ export async function buildAclSingbox(
         return false;
     };
 
+    // 拦截组（模板成员含 REJECT）：其 sing-box 出站成员已被滤掉 REJECT，只剩 direct/节点。
+    // 指向它们的规则必须改写成 `action: "reject"`，否则广告/隐私/恶意域名变成直连或走节点（拦截失效）。
+    const blockGroupTags = new Set(groups.filter(g => g.blocking).map(g => g.name));
+    const isBlockTarget = (group: string): boolean => blockGroupTags.has(group);
+
     // URL provider → inline rule_set
     const ruleSets: AclSingboxResult['ruleSets'] = [];
     const urlRules: RoutingRule[] = [];
@@ -640,7 +660,9 @@ export async function buildAclSingbox(
             if (!val.tag || val.rules.length === 0) return;
             if (!keepGroup(val.group, `rule_set=${val.tag}`)) return;
             ruleSets.push({ type: 'inline', tag: val.tag, rules: val.rules });
-            urlRules.push({ rule_set: val.tag, outbound: val.group });
+            urlRules.push(isBlockTarget(val.group)
+                ? { rule_set: val.tag, action: 'reject' }
+                : { rule_set: val.tag, outbound: val.group });
         });
     }
 
@@ -654,7 +676,7 @@ export async function buildAclSingbox(
         }
         if (!keepGroup(rule.group, `${rule.ruleType},${rule.ruleVal}`)) continue;
         const type = rule.ruleType.toLowerCase();
-        const ruleObj: RoutingRule = { outbound: rule.group };
+        const ruleObj: RoutingRule = isBlockTarget(rule.group) ? { action: 'reject' } : { outbound: rule.group };
         if (type === 'domain') ruleObj.domain = [rule.ruleVal];
         else if (type === 'domain-suffix') ruleObj.domain_suffix = [rule.ruleVal];
         else if (type === 'domain-keyword') ruleObj.domain_keyword = [rule.ruleVal];
@@ -696,6 +718,12 @@ export async function buildAclSingbox(
     if (finalGroup && !sbKnownGroups.has(finalGroup)) {
         console.warn(`[ACL 分组] 丢弃引用未生成分组的规则 FINAL: ${finalGroup}`);
         finalGroup = undefined;
+    }
+
+    // 拦截组不能作为 route.final：sing-box 的 final 只能是出站 tag，没有 reject 形态。
+    // 保持原样（该组退化为直连/节点）并明确告警，避免静默失效。
+    if (finalGroup && isBlockTarget(finalGroup)) {
+        console.warn(`[ACL 分组] FINAL 指向拦截组 ${finalGroup}：sing-box 无法把 final 表达为 reject，该组按直连/节点处理`);
     }
 
     // C3 同源兜底：模板只提供规则、一个分组都没生成时，默认 final 不能是「✅ Selector」——
