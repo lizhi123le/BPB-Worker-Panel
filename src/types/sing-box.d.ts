@@ -68,8 +68,7 @@ export interface TunInbound {
     mtu: 9000;
     auto_route: true;
     strict_route: true;
-    // 仅 system 可在无 with_gvisor 编译标签的客户端上启动（gvisor/mixed 都会失败，默认值也是 gvisor）
-    stack: "system";
+    // 不再下发 `stack`：1.15.0 弃用、1.17.0 移除；省略即用 sing-tun 自带 TCP/IP 栈
 }
 
 export interface MixedInbound {
@@ -101,7 +100,7 @@ export interface RuleSet {
     tag: string;
     format: "binary";
     url: string;
-    download_detour: string;
+    // 不再下发 `download_detour`：1.14.0 弃用、1.16.0 移除
 }
 
 export interface InlineRuleSet {

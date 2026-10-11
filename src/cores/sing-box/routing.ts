@@ -130,12 +130,13 @@ function addRoutingRule(
 function addRuleSets(ruleSets: RuleSet[], geoAsset: GeoAsset) {
     const { geosite, geositeURL, geoip, geoipURL } = geoAsset;
 
+    // 不下发 `download_detour`：该选项在 sing-box 1.14.0 已弃用、1.16.0 将移除。
+    // 省略后下载出口由内核默认行为决定（不再固定指向 direct）。
     const addRuleSet = (geo: string, url: string) => ruleSets.push({
         type: "remote",
         tag: geo,
         format: "binary",
-        url,
-        download_detour: "direct"
+        url
     });
 
     if (geosite && geositeURL) addRuleSet(geosite, geositeURL);

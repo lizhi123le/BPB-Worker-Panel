@@ -721,8 +721,8 @@ export async function buildAclSingbox(
                         type: 'remote',
                         tag,
                         format: 'binary',
-                        url: `https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/${tag}.srs`,
-                        download_detour: 'direct'
+                        url: `https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/${tag}.srs`
+                        // 不下发 download_detour：1.14.0 弃用、1.16.0 移除（与 sing-box/routing.ts 同口径）
                     });
                 }
                 ruleObj.rule_set = [tag];
