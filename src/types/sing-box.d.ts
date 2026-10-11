@@ -68,7 +68,8 @@ export interface TunInbound {
     mtu: 9000;
     auto_route: true;
     strict_route: true;
-    stack: "mixed";
+    // 仅 system 可在无 with_gvisor 编译标签的客户端上启动（gvisor/mixed 都会失败，默认值也是 gvisor）
+    stack: "system";
 }
 
 export interface MixedInbound {
