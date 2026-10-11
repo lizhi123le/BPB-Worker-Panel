@@ -169,6 +169,10 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                 // 仅保留真实代理出站与 direct，路由与 final 由模板接管
                 const retained = config.outbounds.filter(o => !ACL_BUILTIN_GROUP_TAGS.has(o.tag));
                 config.outbounds = [...retained, ...acl.outboundGroups];
+                // 拦截组（模板 `[]REJECT`）需要一个 `type:"block"` 出站作为成员载体：
+                // 模板里的 REJECT 成员已映射到该 tag，缺了它 selector 就引用不存在的出站 ——
+                // sing-box 的 check 不报，但客户端启动期解析出站失败、整份配置不可用。
+                if (acl.blockOutbound) config.outbounds.push(acl.blockOutbound as unknown as Outbound);
                 // C3：dns-remote 的 detour 原本指向被上面过滤掉的内置分组（✅ Selector / 各类「最佳延迟」），
                 // 接管后这些 tag 已不存在 → sing-box 启动期解析出站失败、整份配置加载失败。
                 // 改指向模板实际生成的默认分组（与 route.final 同义：由默认策略组解析 DoH）；
