@@ -15,6 +15,7 @@ import {
     getConfigAddresses,
     generateRemark,
     generateWsPath,
+    pickEarlyData,
     isDomain,
     isHttps,
     getProtocols,
@@ -22,14 +23,14 @@ import {
     resetRemarkCounter
 } from '@utils';
 
-function buildBalancer(tag: string, selector: string, hasFallback: boolean): Balancer {
+function buildBalancer(tag: string, selector: string, fallbackTag?: string): Balancer {
     return {
         tag,
         selector: [selector],
         strategy: {
             type: "leastPing",
         },
-        fallbackTag: hasFallback ? "proxy-2" : undefined
+        fallbackTag
     };
 }
 
@@ -56,8 +57,16 @@ async function buildConfig(
     let balancers, observatory;
 
     if (isBalancer) {
-        balancers = [buildBalancer("all-proxies", "proxy", balancerFallback)]
-            .concatIf(isChain, buildBalancer("all-chains", "chain", false));
+        // C15：fallbackTag 必须指向本配置内真实存在的出站。原实现恒写死 "proxy-2"，
+        // 但 proxy-N 只在存在第 N 个 proxy 出站时才创建（单节点场景只有 proxy-1）→ 悬空 tag。
+        // 优先沿用 "proxy-2"（多节点行为不变），否则退回首个 proxy 出站；两者都无则整体省略。
+        const fallbackTag = balancerFallback
+            ? outbounds.find(outbound => outbound.tag === "proxy-2")?.tag
+                ?? outbounds.find(outbound => outbound.tag === "proxy-1")?.tag
+            : undefined;
+
+        balancers = [buildBalancer("all-proxies", "proxy", fallbackTag)]
+            .concatIf(isChain, buildBalancer("all-chains", "chain"));
 
         observatory = {
             subjectSelector: isChain ? ["chain", "proxy"] : ["proxy"],
@@ -166,6 +175,7 @@ async function addBestPingConfigs(
 async function addBestFragmentConfigs(
     configs: Config[],
     usedPaths: Set<string>,
+    usedEds: Set<number>,
     chainProxy?: Outbound
 ) {
     const {
@@ -186,15 +196,17 @@ async function addBestFragmentConfigs(
 
     bestFragValues.forEach((fragLength, index) => {
         if (isChain) {
-            const chain = modifyOutbound(chainProxy, `chain-${index + 1}`, `proxy-${index + 1}`);
+            const chain = modifyOutbound(chainProxy, `chain-${index + 1}`, usedEds, `proxy-${index + 1}`);
             outbounds.push(chain);
         }
 
-        const proxy = buildWebsocketOutbound(`proxy-${index + 1}`, _VL_, hostName, 443, generateWsPath(usedPaths), true, fragLength, `${fragmentIntervalMin}-${fragmentIntervalMax}`);
+        const proxy = buildWebsocketOutbound(`proxy-${index + 1}`, _VL_, hostName, 443, generateWsPath(usedPaths), pickEarlyData(usedEds), true, fragLength, `${fragmentIntervalMin}-${fragmentIntervalMax}`);
         outbounds.push(proxy);
     });
 
     const chainSign = isChain ? '🔗 ' : '';
+    // C16 复核：chainSign 已同时作用于「最佳分片」与「最佳延迟」两处 remark（带链 🔗 / 无链无前缀），
+    // 不存在两份 remark 相同的问题；递归先于 push 造成的「无链在前」与最佳延迟、逐节点分组的顺序一致，故不改顺序。
     const config = await buildConfig(
         `${chainSign}最佳分片 😎`,
         outbounds,
@@ -208,7 +220,7 @@ async function addBestFragmentConfigs(
     );
 
     if (chainProxy) {
-        await addBestFragmentConfigs(configs, usedPaths);
+        await addBestFragmentConfigs(configs, usedPaths, usedEds);
     }
 
     configs.push(config);
@@ -258,13 +270,15 @@ async function addWorkerlessConfigs(configs: Config[]) {
 export async function getXrCustomConfigs(isFragment: boolean): Promise<Response> {
     resetRemarkCounter();
     const { outProxy, ports, upstreamParams: { upstreamServer, upstreamPort } } = globalThis.settings;
-    const chainProxy = outProxy ? buildChainOutbound() : undefined;
+    // 已占用路径池词集合：每个 ws 出站各抽一个互不相同的伪装路径
+    const usedPaths = new Set<string>();
+    // 已占用 early-data 阈值集合：与 usedPaths 同粒度、同批次共享，保证任意两个节点的 ed 两两不同
+    const usedEds = new Set<number>();
+    const chainProxy = outProxy ? buildChainOutbound(pickEarlyData(usedEds)) : undefined;
     const hosts = await getConfigAddresses(isFragment);
     const entryPortMap = buildEntryPortMap();
     const totalPorts = ports.filter(port => !isFragment || isHttps(port));
     const protocols = getProtocols();
-    // 已占用路径池词集合：每个 ws 出站各抽一个互不相同的伪装路径
-    const usedPaths = new Set<string>();
 
     if (upstreamServer && upstreamPort && !isFragment) {
         totalPorts.unshift(upstreamPort);
@@ -283,8 +297,8 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
             for (const port of addrPorts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
-                const outbound = buildWebsocketOutbound("proxy", protocol, host, port, generateWsPath(usedPaths), isFragment);
-                const proxy = modifyOutbound(outbound, `proxy-${index}`);
+                const outbound = buildWebsocketOutbound("proxy", protocol, host, port, generateWsPath(usedPaths), pickEarlyData(usedEds), isFragment);
+                const proxy = modifyOutbound(outbound, `proxy-${index}`, usedEds);
                 proxies.push(proxy);
 
                 const remark = generateRemark(port, host, protocol, isFragment, false);
@@ -296,7 +310,7 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
                     const chainConfig = await buildConfig(remark, [chainProxy, outbound], false, true, false, false, false, [host]);
                     configs.push(chainConfig);
 
-                    const chain = modifyOutbound(chainProxy, `chain-${index}`, `proxy-${index}`);
+                    const chain = modifyOutbound(chainProxy, `chain-${index}`, usedEds, `proxy-${index}`);
                     chains.push(chain);
                 }
 
@@ -308,7 +322,7 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     await addBestPingConfigs(configs, hosts, proxies, chains, isFragment);
 
     if (isFragment) {
-        await addBestFragmentConfigs(configs, usedPaths, chainProxy);
+        await addBestFragmentConfigs(configs, usedPaths, usedEds, chainProxy);
         await addWorkerlessConfigs(configs);
     }
 
@@ -371,7 +385,8 @@ export async function getXrWarpConfigs(
         const proxy = modifyOutbound(warpOutbound, `proxy-${index + 1}`);
         proxies.push(proxy);
 
-        const chain = modifyOutbound(wowOutbound, `chain-${index + 1}`, `proxy-${index + 1}`);
+        // warp / WoW 出站无 wsSettings，不涉及 early-data，故 usedEds 传 undefined
+        const chain = modifyOutbound(wowOutbound, `chain-${index + 1}`, undefined, `proxy-${index + 1}`);
         chains.push(chain);
     }
 
@@ -409,12 +424,20 @@ export async function getXrWarpConfigs(
     });
 }
 
-function modifyOutbound(outbound: Outbound, tag: string, dialerProxy?: string): Outbound {
+function modifyOutbound(outbound: Outbound, tag: string, usedEds?: Set<number>, dialerProxy?: string): Outbound {
     const newOutbound = structuredClone(outbound);
     newOutbound.tag = tag;
 
     if (dialerProxy && newOutbound.streamSettings?.sockopt) {
         newOutbound.streamSettings.sockopt.dialerProxy = dialerProxy;
+    }
+
+    // 克隆体不得继承源节点的 early-data：在共享去重池中重新无放回抽取，
+    // 并保持「有值才写协议头」的自洽（pickEarlyData 必返回 2048..2560 的正整数）。
+    const wsSettings = newOutbound.streamSettings?.wsSettings;
+    if (wsSettings) {
+        wsSettings.maxEarlyData = pickEarlyData(usedEds);
+        wsSettings.earlyDataHeaderName = "Sec-WebSocket-Protocol";
     }
 
     return newOutbound;

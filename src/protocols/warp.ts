@@ -30,6 +30,14 @@ export async function fetchWarpAccounts(env: Env): Promise<WarpAccount[]> {
 
         for (const [index, key] of warpKeys.entries()) {
             const { config } = await fetchAccount(key);
+
+            // 上游字段守卫：client_id 缺失/为空时 reserved 会以 undefined 落进 KV（JSON 序列化丢键），
+            // 下游只会得到一个空 reserved。此处直接抛错，由外层 catch 回退到内置默认账号。
+            // （interface.addresses.v6 / peers[0].public_key 缺失会在下方取用时抛 TypeError，同样落入该 catch）
+            if (typeof config?.client_id !== 'string' || config.client_id.length === 0) {
+                throw new Error('WARP registration response is missing a valid client_id (reserved).');
+            }
+
             warpAccounts.push({
                 privateKey: key.privateKey,
                 warpIPv6: `${config.interface.addresses.v6}/128`,

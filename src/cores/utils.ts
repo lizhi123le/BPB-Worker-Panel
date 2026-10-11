@@ -1,6 +1,28 @@
 import { safeErrorMessage } from "@common";
 import { PUBLIC_PATH_POOL } from "../common/ratelimit";
 
+// ── H6：跨部署硬编码常量的 env 覆盖入口 ──
+// 本模块是纯工具模块，拿不到 Env 参数：运行时配置统一从 globalThis 取
+// （worker.ts 在每个请求入口把 env 挂到 globalThis.env）。
+
+/** 运行时 env（模块被非请求路径加载时可能为 undefined） */
+function runtimeEnv(): any {
+    return (globalThis as any).env;
+}
+
+/** 解析 env 中的地址列表（换行或逗号分隔）；未设置或解析为空 → undefined（= 沿用内置默认值） */
+function parseEnvAddressList(value: unknown): string[] | undefined {
+    if (typeof value !== 'string') return undefined;
+    const list = value.split(/[\r\n,]+/).map(item => item.trim()).filter(Boolean);
+    return list.length ? list : undefined;
+}
+
+/** 原地替换数组内容，保持导出引用不变（DEFAULT_PROXY_IPS / OFFICIAL_DIRECT_IPS 是模块级常量数组） */
+function replaceList(target: string[], next: string[]): void {
+    target.length = 0;
+    target.push(...next);
+}
+
 // Cloudflare Workers runtime provides global connect function
 declare const connect: (options: { hostname: string; port: number }) => Socket;
 
@@ -258,7 +280,8 @@ function parseUrlLines(text: string, url = ''): string[] {
 
 /** Resolve URL entries in an array — fetches http/https URLs and replaces them with their content lines.
  *  When an Env with a KV binding is provided, fetched results are cached in KV under a
- *  per-URL key with a TTL to avoid repeated network calls within the cache window.
+ *  per-URL key for URL_RESOLVE_TTL: both the value's `ts` (read side) and the KV server-side
+ *  `expirationTtl` (write side) carry the same window, so the key expires instead of accumulating.
  *  Applies IP:Port deduplication aligned with cfnew across all sources. */
 export async function resolveUrlEntries(entries: string[], env?: Env): Promise<string[]> {
     // 1. 展开可能包含逗号分隔的多 URL / 多 IP 条目
@@ -309,7 +332,11 @@ export async function resolveUrlEntries(entries: string[], env?: Env): Promise<s
 
             if (env?.kv) {
                 try {
-                    await env.kv.put(cacheKey, JSON.stringify({ ts: Date.now(), lines }));
+                    // C-10：与读侧的 ts 判定对齐的 KV 服务端 TTL —— 原先注释承诺「带 TTL 缓存」但 put 未传
+                    // expirationTtl，键永不过期、随 URL 种类无限累积。Cloudflare KV 的 TTL 按秒计且要求 ≥ 60。
+                    await env.kv.put(cacheKey, JSON.stringify({ ts: Date.now(), lines }), {
+                        expirationTtl: Math.round(URL_RESOLVE_TTL / 1000),
+                    });
                 } catch {}
             }
         } catch {}
@@ -395,6 +422,14 @@ export function getProtocols() {
     return [].concatIf(VLConfigs, _VL_).concatIf(TRConfigs, _TR_);
 }
 
+/** H6：内置第三方测速域名节点。env.SPEEDTEST_ADDRESS 未设置时保持内置 'www.speedtest.net'；
+ *  显式设为空串时不加入该节点；设为其它值时用它替换。 */
+function envSpeedtestAddress(): string | undefined {
+    const raw = runtimeEnv()?.SPEEDTEST_ADDRESS;
+    if (typeof raw !== 'string') return 'www.speedtest.net';
+    return raw.trim() || undefined;
+}
+
 export async function getConfigAddresses(isFragment: boolean): Promise<string[]> {
     const {
         httpConfig: { hostName },
@@ -409,9 +444,10 @@ export async function getConfigAddresses(isFragment: boolean): Promise<string[]>
         ipv6.length > 0 ? filterReachableIPs(ipv6) : Promise.resolve([] as string[]),
     ]);
 
+    const speedtestAddress = envSpeedtestAddress();
     const addrs = [
         hostName,
-        'www.speedtest.net',
+        ...(speedtestAddress ? [speedtestAddress] : []),
         ...reachableIPv4,
         ...reachableIPv6.map((ip: string) => `[${ip}]`),
         ...entryAddresses(cleanIPs)
@@ -456,9 +492,9 @@ export function generateRemark(
         baseName = '上游代理';
     } else if (isDomain(address)) {
         baseName = address;
-    } else if (isIPv4(address)) {
+    } else if (isBareIPv4(address)) {
         baseName = 'IPv4优选';
-    } else if (isIPv6(address)) {
+    } else if (isBareIPv6(address)) {
         baseName = 'IPv6优选';
     } else {
         baseName = '节点';
@@ -475,16 +511,6 @@ export function generateRemark(
     remarkCounter[baseName] = (remarkCounter[baseName] || 0) + 1;
     const suffix = String(remarkCounter[baseName]).padStart(2, '0');
     return `${chainPrefix}${baseName}_${suffix}`;
-}
-
-export function randomUpperCase(str: string): string {
-    let result = '';
-
-    for (let i = 0; i < str.length; i++) {
-        result += Math.random() < 0.5 ? str[i].toUpperCase() : str[i];
-    }
-
-    return result;
 }
 
 /** 撞到已占用路径时的重抽次数上限（1-3 段路径空间约 1.7 亿，撞车极罕见，纯属兜底） */
@@ -538,23 +564,57 @@ export function generateWsPath(used?: Set<string>): string {
     return path;
 }
 
+/**
+ * 无放回抽取 early-data 阈值（2048..2560，共 513 个取值），与 generateWsPath 的 `used` 同一套路：
+ * 传入同一 `used` 集合即可保证同一份订阅内任意两个节点的 ed 两两不同；
+ * 集合耗尽（节点数 > 513）时退化为有放回抽样，绝不抛错、绝不返回区间外的值。
+ * 下限不再取更低：ed 是「首包长度阈值」而非缓冲区大小，首包超过它会直接不启用 Early Data（丢 0-RTT）。
+ */
+export function pickEarlyData(used?: Set<number>): number {
+    const ED_MIN = 2048;
+    const ED_MAX = 2560;
+    const draw = () => ED_MIN + Math.floor(Math.random() * (ED_MAX - ED_MIN + 1));
+
+    if (!used) return draw();
+    // 池耗尽兜底：与 generateWsPath 一致，退化为有放回，不抛错
+    if (used.size >= ED_MAX - ED_MIN + 1) return draw();
+
+    let value = draw();
+    while (used.has(value)) value = draw();
+    used.add(value);
+    return value;
+}
+
 export function pickRandomEch(echServerNames: string[]): string | undefined {
     if (!echServerNames || echServerNames.length === 0) return undefined;
     return echServerNames[Math.floor(Math.random() * echServerNames.length)];
 }
 
-export function base64ToDecimal(base64: string): number[] {
-    const binaryString = atob(base64);
+export function base64ToDecimal(base64: string | null | undefined): number[] {
+    // 容错：空值/非法 base64 降级为 []（= 无 reserved 字节），绝不抛错。
+    // reserved 缺失（上游字段变化 / 旧 KV 数据）时若抛错，会让整个 /sub/warp 订阅 500。
+    if (typeof base64 !== 'string' || base64.length === 0) return [];
+
+    let binaryString: string;
+    try {
+        binaryString = atob(base64);
+    } catch {
+        return [];
+    }
+
+    if (!binaryString) return [];
+
     const hexString = Array
         .from(binaryString)
         .map(char => char.charCodeAt(0).toString(16).padStart(2, '0'))
         .join('');
 
     const decimalArray = hexString
-        .match(/.{2}/g)!
-        .map(hex => parseInt(hex, 16));
+        .match(/.{2}/g);
 
-    return decimalArray;
+    return decimalArray
+        ? decimalArray.map(hex => parseInt(hex, 16))
+        : [];
 }
 
 export function isIPv4(address: string): boolean {
@@ -566,6 +626,17 @@ export function isIPv6(address: string): boolean {
     const ipv6BracketPattern = /^\[(?:(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,7}:|::(?:[a-fA-F0-9]{1,4}:){0,7}|(?:[a-fA-F0-9]{1,4}:){1,6}:[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,5}(?::[a-fA-F0-9]{1,4}){1,2}|(?:[a-fA-F0-9]{1,4}:){1,4}(?::[a-fA-F0-9]{1,4}){1,3}|(?:[a-fA-F0-9]{1,4}:){1,3}(?::[a-fA-F0-9]{1,4}){1,4}|(?:[a-fA-F0-9]{1,4}:){1,2}(?::[a-fA-F0-9]{1,4}){1,5}|[a-fA-F0-9]{1,4}:(?::[a-fA-F0-9]{1,4}){1,6})\](?:\/(1[0-1][0-9]|12[0-8]|[0-9]?[0-9]))?$/;
     const ipv6RawPattern = /^(?:(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,7}:|::(?:[a-fA-F0-9]{1,4}:){0,7}|(?:[a-fA-F0-9]{1,4}:){1,6}:[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,5}(?::[a-fA-F0-9]{1,4}){1,2}|(?:[a-fA-F0-9]{1,4}:){1,4}(?::[a-fA-F0-9]{1,4}){1,3}|(?:[a-fA-F0-9]{1,4}:){1,3}(?::[a-fA-F0-9]{1,4}){1,4}|(?:[a-fA-F0-9]{1,4}:){1,2}(?::[a-fA-F0-9]{1,4}){1,5}|[a-fA-F0-9]{1,4}:(?::[a-fA-F0-9]{1,4}){1,6})(?:\/(1[0-1][0-9]|12[0-8]|[0-9]?[0-9]))?$/;
     return ipv6BracketPattern.test(address) || ipv6RawPattern.test(address);
+}
+
+/** C-14：「单个可拨号地址」判定 —— 在 isIPv4/isIPv6 基础上排除 CIDR 后缀。
+ *  `isIPv4/isIPv6` 保留对 CIDR 的宽松接受是既有对外契约（clash/routing.ts:82-83 依赖它，
+ *  并在 `ip.includes('/')` 分支里自行兜底），此处只新增窄判定供按「单地址」使用的调用点使用。 */
+export function isBareIPv4(address: string): boolean {
+    return isIPv4(address) && !address.includes('/');
+}
+
+export function isBareIPv6(address: string): boolean {
+    return isIPv6(address) && !address.includes('/');
 }
 
 export function getDomain(url: string) {
@@ -598,31 +669,43 @@ export function selectSniHost(address: string, sniHostOverride?: string) {
 
     const isCustomAddr = entryAddresses(customCdnAddrs).includes(address);
     const host = hostName;
-    const sni = randomUpperCase(hostName);
+    // 隐私加固：不再随机化 SNI 大小写 —— RFC 6066 规定 SNI 大小写不敏感，
+    // 随机大小写没有对抗价值，却制造出「真实浏览器绝不产生」的形态，反而成为异常特征。
+    const sni = hostName;
 
+    // H12（未做，需产品决策）：allowInsecure 的**唯一**触发条件是「本条 address 命中 customCdnAddrs」
+    // （见上方 isCustomAddr），用户既看不到哪些地址会关掉证书校验、也无法单独开关。
+    // 若关校验，则本地址在 Clash(skip-cert-verify)/sing-box(insecure)/URL(allowInsecure=1) 三端一致关闭。
+    // 本轮不动：改成显式开关需要新增 settings 字段 + kv.ts 白名单 + global.d.ts 声明 + 面板 UI
+    // （均在本文件之外），按工作单约束只记录触发条件，不越界改。
     return { host, sni, allowInsecure: isCustomAddr };
 }
 
 export function parseHostPort(input: string, brackets?: boolean): { host: string, port: number } {
-    const bm = input.match(/^\[(?<ipv6>.+?)\](?::(?<port>\d+))?$/);
+    // C-05：统一规范化 —— 首尾空白 + `@REGION` 标签在这里吸收掉，不再要求调用点先 stripRegionTag；
+    // 规范化后为空串（或只剩空白）时保持原语义返回 {host:"",port:0}，交给调用点按「无地址」处理。
+    const normalized = stripRegionTagRaw(input);
+    if (!normalized) return { host: "", port: 0 };
+
+    const bm = normalized.match(/^\[(?<ipv6>.+?)\](?::(?<port>\d+))?$/);
     if (bm?.groups) {
         const host = brackets ? `[${bm.groups.ipv6}]` : bm.groups.ipv6;
         return { host, port: bm.groups.port ? Number(bm.groups.port) : 0 };
     }
 
-    if (input.includes('::')) {
-        const lastColon = input.lastIndexOf(':');
-        const afterLastColon = input.slice(lastColon + 1);
+    if (normalized.includes('::')) {
+        const lastColon = normalized.lastIndexOf(':');
+        const afterLastColon = normalized.slice(lastColon + 1);
         if (/^\d+$/.test(afterLastColon)) {
-            const hostPart = input.slice(0, lastColon);
+            const hostPart = normalized.slice(0, lastColon);
             if (hostPart.includes(':') && !hostPart.endsWith(':')) {
                 return { host: brackets ? `[${hostPart}]` : hostPart, port: Number(afterLastColon) };
             }
         }
-        return { host: brackets ? `[${input}]` : input, port: 0 };
+        return { host: brackets ? `[${normalized}]` : normalized, port: 0 };
     }
 
-    const hm = input.match(/^(?<host>[^:]+)(?::(?<port>\d+))?$/);
+    const hm = normalized.match(/^(?<host>[^:]+)(?::(?<port>\d+))?$/);
     if (hm?.groups) {
         return { host: hm.groups.host, port: hm.groups.port ? Number(hm.groups.port) : 0 };
     }
@@ -709,7 +792,9 @@ export function accDnsRules(geoAssets: GeoAsset[]) {
 }
 
 export function toRange(min?: number, max?: number) {
-    if (!min || !max) return undefined;
+    // C-08：判空用 `== null` —— 原 `!min || !max` 把合法的数字 0（0ms 延迟 / 0 长度）
+    // 当成「未设置」静默丢弃，面板填 0 与生成结果不一致。
+    if (min == null || max == null) return undefined;
     if (min === max) return String(min);
     return `${min}-${max}`;
 }
@@ -857,12 +942,19 @@ export function parseProxyIPWithRegion(entry: string): { host: string; port: num
     return { host, port };
 }
 
-/** Strip @REGION suffix from proxy IP, return the clean address part */
-export function stripRegionTag(entry: string): string {
+/** 去掉 `#name` 注释、首尾空白与 `@REGION` 标签，返回纯地址部分（不校验 host 合法性）。
+ *  C-05：`parseHostPort` / `stripRegionTag` / `parseProxyIPWithRegion` 共用同一套规范化规则，
+ *  避免「只靠调用点先 stripRegionTag」的隐式约束再次分叉。 */
+function stripRegionTagRaw(entry: string): string {
     const clean = entry.split('#')[0].trim();
     const atIdx = clean.lastIndexOf('@');
     if (atIdx !== -1) return clean.slice(0, atIdx).trim();
     return clean;
+}
+
+/** Strip @REGION suffix from proxy IP, return the clean address part */
+export function stripRegionTag(entry: string): string {
+    return stripRegionTagRaw(entry);
 }
 
 // ── IP 可达性探测（TCP 连接检查，对齐 cfnew 的 `探测IP可达性`）──
@@ -875,19 +967,28 @@ export async function probeIPReachability(
     port: number = 443,
     timeoutMs: number = PROBE_TIMEOUT
 ): Promise<boolean> {
+    let socket: Socket | null = null;
     try {
         // 使用与 connectSocket 相同的懒求值模式，避免被打包器优化掉
-        const socket = (globalThis as any).connect({ hostname, port });
+        const createdSocket: Socket = (globalThis as any).connect({ hostname, port });
+        socket = createdSocket;
         await Promise.race([
-            socket.opened,
-            new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('timeout')), timeoutMs)
-            ),
+            createdSocket.opened,
+            // timer.unref 让挂起的超时定时器不阻止请求结束（对齐 F-09 同类修复）
+            new Promise((_, reject) => {
+                const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs) as unknown as { unref?: () => void };
+                timer.unref?.();
+            }),
         ]);
-        socket.close();
         return true;
     } catch {
         return false;
+    } finally {
+        // C-09：超时/异常路径同样关闭 socket —— 原先 close 只在成功路径执行，
+        // 不可达候选多时未关闭的 TCP 尝试会在 isolate 内累积。
+        try {
+            socket?.close();
+        } catch {}
     }
 }
 
@@ -984,8 +1085,17 @@ async function dohQueryCached(domain: string, type: string): Promise<any[]> {
 }
 
 // ── Proxy IP pool resolution cache (对齐 edgetunnel 缓存反代IP 9896) ──
-let _proxyPoolCacheIP: string | null = null;
-let _proxyPoolCacheResult: [string, number][] | null = null;
+// C-04：缓存键原先只有 proxyIP，且无 TTL → 同一 isolate 内第二个 targetDomain/uuid
+// 会拿到为第一个域名洗出的同一份 8 条子集，且首次降级结果被永久冻结。
+const PROXY_POOL_CACHE_TTL = 10 * 60 * 1000; // 10min：与解析依赖的 DoH 结果缓存 DOH_CACHE_TTL 对齐
+const PROXY_POOL_CACHE_MAX = 32;             // 键数量上限，防止长生命周期 isolate 中无界增长
+/** 模块级缓存：isolate 生命周期内有效（键 = proxyIP|targetDomain|uuid），命中时校验 TTL，超限时按 LRU 淘汰 */
+const _proxyPoolCache = new Map<string, { result: [string, number][]; time: number }>();
+
+/** 代理池缓存键：proxyIP 归一化（trim + 小写）与 targetDomain/uuid 一起参与，避免跨目标域名串味 */
+function proxyPoolCacheKey(proxyIP: string, targetDomain: string, uuid: string): string {
+    return `${proxyIP.trim().toLowerCase()}|${targetDomain}|${uuid}`;
+}
 
 /** Parse a "host:port" or "[ipv6]:port" entry into [host, port] tuple, default port 0 */
 function parseHostPortEntry(entry: string): [string, number] {
@@ -997,7 +1107,8 @@ function parseHostPortEntry(entry: string): [string, number] {
  * Resolve proxy IP string into a pool of [host, port] entries.
  * Supports: .william domains (TXT prefix expansion), .tpN domains (port extraction),
  * normal domains (DoH A/AAAA dual-source), and direct IPs.
- * Results are cached; pool is sorted + deterministically shuffled + capped at 8.
+ * Results are cached per (proxyIP, targetDomain, uuid) with a TTL; pool is sorted
+ * + deterministically shuffled + capped at 8.
  * Aligns with edgetunnel `解析地址端口` (9895-10016).
  */
 export async function resolveProxyIPPool(
@@ -1005,9 +1116,15 @@ export async function resolveProxyIPPool(
     targetDomain: string,
     uuid: string
 ): Promise<[string, number][]> {
-    if (_proxyPoolCacheIP === proxyIP && _proxyPoolCacheResult) {
-        return _proxyPoolCacheResult;
+    const cacheKey = proxyPoolCacheKey(proxyIP, targetDomain, uuid);
+    const cachedPool = _proxyPoolCache.get(cacheKey);
+    if (cachedPool && Date.now() - cachedPool.time < PROXY_POOL_CACHE_TTL) {
+        // 命中即刷新 LRU 顺序，保证淘汰的是最久未用的键
+        _proxyPoolCache.delete(cacheKey);
+        _proxyPoolCache.set(cacheKey, cachedPool);
+        return cachedPool.result;
     }
+    if (cachedPool) _proxyPoolCache.delete(cacheKey);
 
     const proxyIPNormalized = proxyIP.toLowerCase();
     const entries = proxyIPNormalized.split(',').map(s => s.trim()).filter(Boolean);
@@ -1080,8 +1197,11 @@ export async function resolveProxyIPPool(
     );
 
     const result = shuffled.slice(0, 8);
-    _proxyPoolCacheIP = proxyIP;
-    _proxyPoolCacheResult = result;
+    // C-04：写入带时间戳的键化缓存；超限时按插入顺序（LRU）淘汰最旧一条
+    _proxyPoolCache.set(cacheKey, { result, time: Date.now() });
+    if (_proxyPoolCache.size > PROXY_POOL_CACHE_MAX) {
+        _proxyPoolCache.delete(_proxyPoolCache.keys().next().value!);
+    }
     return result;
 }
 
@@ -1096,6 +1216,19 @@ export const DEFAULT_PROXY_IPS: string[] = 备用地址列表.map(item =>
 // 运行时 base64 解码，避免静态特征被识别
 const 官方直连地址 = atob('MTcyLjcxLjIxOC4xOTAsMTYyLjE1OC4yMjguODcsMTYyLjE1OC4xODkuMTM0LDE2Mi4xNTguMjYuNjMsMTYyLjE1OC4yNS44NiwxNjIuMTU4LjI5LjIxNiwxNjIuMTU4LjIxOC4xNjAsMTYyLjE1OC4yMjcuMjE0LDE3Mi42OS4xMTguMTk4LDE3Mi42OS4xMTkuMTUw');
 export const OFFICIAL_DIRECT_IPS: string[] = 官方直连地址.split(',').map(ip => `${ip}:443@CF`);
+// ── H6：内置池的 env 覆盖入口 ──
+// 出厂内置值快照：在 env 覆盖**之前**捕获（上方原声明保持逐字不变），未设置 env 时用它还原。
+const BUILTIN_PROXY_IPS: string[] = [...DEFAULT_PROXY_IPS];
+const BUILTIN_OFFICIAL_DIRECT_IPS: string[] = [...OFFICIAL_DIRECT_IPS];
+
+/** H6：env.DEFAULT_PROXY_IPS / env.OFFICIAL_IPS 覆盖内置池（换行或逗号分隔）。
+ *  由 init.ts 的 init() 在每个请求入口调用 —— 模块级常量数组在导入期读不到 env。
+ *  未设置（或解析为空）时还原为出厂内置值，默认行为逐字不变。 */
+export function applyAddressEnvOverrides(env: any): void {
+    replaceList(DEFAULT_PROXY_IPS, parseEnvAddressList(env?.DEFAULT_PROXY_IPS) ?? BUILTIN_PROXY_IPS);
+    replaceList(OFFICIAL_DIRECT_IPS, parseEnvAddressList(env?.OFFICIAL_IPS) ?? BUILTIN_OFFICIAL_DIRECT_IPS);
+}
+
 export function getOfficialDirectAddress(): string {
     return OFFICIAL_DIRECT_IPS[Math.floor(Math.random() * OFFICIAL_DIRECT_IPS.length)];
 }

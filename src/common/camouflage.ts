@@ -3,7 +3,8 @@ import {
     withTimeout,
     hstsHeaders,
     randomUserAgent,
-    randomAcceptLanguage
+    randomAcceptLanguage,
+    copySafeOutboundHeaders
 } from "@common";
 
 /**
@@ -33,27 +34,17 @@ type CacheEntry = {
 const maskHomeCache = new Map<string, CacheEntry>();
 const maskImageCache = new Map<string, CacheEntry>();
 
-const CF_INBOUND_HEADERS = [
-    'CF-Connecting-IP', 'CF-IPCountry', 'CF-Ray', 'CF-Visitor',
-    'CF-Worker', 'CF-Cache-Status', 'True-Client-IP',
-    'X-Forwarded-For', 'X-Forwarded-For-Original',
-    'X-Forwarded-Proto', 'X-Forwarded-Host',
-    'Forwarded', 'Via', 'X-Real-IP', 'X-Originating-IP',
-    'X-Remote-IP', 'X-Client-IP', 'Client-IP',
-    'X-Cluster-Client-IP', 'CF-Connecting-IPv6', 'CF-Pseudo-IPv4'
-];
-
-const CH_HEADERS = [
-    'Sec-CH-UA', 'Sec-CH-UA-Arch', 'Sec-CH-UA-Bitness', 'Sec-CH-UA-Full-Version',
-    'Sec-CH-UA-Mobile', 'Sec-CH-UA-Model', 'Sec-CH-UA-Platform', 'Sec-CH-UA-Platform-Version'
-];
-
 const SAFE_PROXY_HEADERS = new Set([
     'content-type', 'content-length', 'content-encoding', 'transfer-encoding',
     'accept-ranges', 'content-range', 'content-language',
     'cache-control', 'expires', 'last-modified', 'age',
-    'vary', 'date', 'content-disposition', 'connection'
+    'vary', 'date', 'content-disposition', 'connection',
+    // 3xx 跳转头：丢掉它会让 cover 站返回「没有 Location 的 3xx」，是可判定的反代痕迹（H8）
+    'location'
 ]);
+
+/** 正文会被重写（host 替换）的内容类型：内容不再与上游一致，必须保持 no-store */
+const REWRITTEN_CONTENT_TYPE_RE = /text|javascript|json|xml/i;
 
 const IMAGE_EXT_RE = /\.(jpg|jpeg|png|gif|webp|bmp|svg|ico)(\?|$)|[?&]f=(jpg|jpeg|png|gif|webp|bmp|svg|ico)\b|\/image\/|\/img\/|\/photo\/|\/thumb\/|\/photo-|[?&](auto|fm|format)=(jpg|jpeg|png|gif|webp|bmp|svg|ico)\b/i;
 
@@ -201,14 +192,12 @@ export function resolveMaskTarget(): { target: string; isNginx: boolean; is1101:
     return { target: normalizeTarget(picked), isNginx: false, is1101: false };
 }
 
-/** 构造指纹随机化的出站头（清 CF 入站头与 Sec-CH-UA，重写 Host/Referer/Origin） */
+/** 构造指纹随机化的出站头（清会话凭据与 CF 入站头、Sec-CH-UA，重写 Host/Referer/Origin） */
 function buildMaskedHeaders(original: Headers, upstream: URL): Headers {
-    const out = new Headers();
-    for (const [k, v] of original as any) {
-        if (CF_INBOUND_HEADERS.includes(k)) continue;
-        if (CH_HEADERS.includes(k)) continue;
-        if (['host', 'referer', 'origin'].includes(k.toLowerCase())) continue;
-        out.set(k, v);
+    const out = copySafeOutboundHeaders(original);
+    // Sec-CH-UA* 客户端提示头：Headers 迭代产出的头名恒为小写，必须大小写不敏感比较
+    for (const [k] of [...out]) {
+        if (k.toLowerCase().startsWith('sec-ch-')) out.delete(k);
     }
     out.set('Host', upstream.host);
     out.set('Referer', upstream.origin);
@@ -218,17 +207,59 @@ function buildMaskedHeaders(original: Headers, upstream: URL): Headers {
     return out;
 }
 
-function filterResponseHeaders(headers: Headers): Record<string, string> {
-    const filtered: Record<string, string> = {};
-    for (const [k, v] of headers) {
-        if (SAFE_PROXY_HEADERS.has(k.toLowerCase())) filtered[k] = v;
+/** 取全部 Set-Cookie：运行时（workerd）支持 getSetCookie 时逐条取，否则退化为单条 get（避免静默丢成一条） */
+function getSetCookieValues(headers: Headers): string[] {
+    const runtime = headers as Headers & { getSetCookie?: () => string[] };
+    if (typeof runtime.getSetCookie === 'function') {
+        const values = runtime.getSetCookie();
+        if (Array.isArray(values) && values.length > 0) return values;
     }
-    filtered['Cache-Control'] = 'no-store';
-    return filtered;
+    const single = headers.get('set-cookie');
+    return single ? [single] : [];
 }
 
-function withHsts(headers: Record<string, string>, env: any): Record<string, string> {
-    return { ...headers, ...hstsHeaders(env) };
+/**
+ * 过滤上游响应头（H8）：
+ *  - 只放行 SAFE_PROXY_HEADERS，防止服务器信息泄露；
+ *  - Location 放行并重写（保守策略，见下）；Set-Cookie 放行且逐条保留；
+ *  - 缓存策略按 content-type 区分，不再一律 no-store。
+ */
+function filterResponseHeaders(headers: Headers, maskURL: URL, reqURL: URL): Headers {
+    const out = new Headers();
+    for (const [k, v] of headers) {
+        if (SAFE_PROXY_HEADERS.has(k.toLowerCase())) out.set(k, v);
+    }
+
+    // Location 重写（保守策略）：仅当它是**指向上游伪装域自身**的绝对地址时，才按与正文重写
+    // （replaceAll(maskURL.host, reqURL.host)）同款语义改写为面板域名；相对地址（/path）本就指向
+    // 面板域，原样放行；指向第三方域的绝对地址不做改写（改写不属于伪装域的跳转不是反代该做的事）。
+    const location = headers.get('location');
+    if (location) {
+        out.set('Location', /^https?:\/\//i.test(location) ? location.replaceAll(maskURL.host, reqURL.host) : location);
+    }
+
+    // Set-Cookie：同名头可能有多条，必须逐条 append（Headers 允许重复 set-cookie），不能只留一条
+    for (const cookie of getSetCookieValues(headers)) out.append('Set-Cookie', cookie);
+
+    // 缓存策略按 content-type 区分：
+    //  - HTML/JS/JSON/XML：正文已被重写，保持 no-store；
+    //  - 其余静态体（图片等）：沿用上游 cache-control，缺省时与 tryServeImage 一致用 public, max-age=86400。
+    const contentType = headers.get('content-type') || '';
+    if (REWRITTEN_CONTENT_TYPE_RE.test(contentType)) {
+        out.set('Cache-Control', 'no-store');
+    } else if (!out.has('Cache-Control')) {
+        out.set('Cache-Control', 'public, max-age=86400');
+    }
+    return out;
+}
+
+function withHsts(headers: Headers | Record<string, string>, env: any): Headers | Record<string, string> {
+    const hsts = hstsHeaders(env);
+    if (headers instanceof Headers) {
+        for (const [k, v] of Object.entries(hsts)) headers.set(k, v);
+        return headers;
+    }
+    return { ...headers, ...hsts };
 }
 
 function arrayBufferToBase64(bytes: ArrayBuffer): string {
@@ -242,9 +273,11 @@ function arrayBufferToBase64(bytes: ArrayBuffer): string {
 }
 
 /** 将图片缓冲结果包装为内联 data URI 页（对齐 cfnew 生成图片HTML：黑底居中、object-fit:fill 全屏） */
-function wrapImageResponse(body: ArrayBuffer, status: number, contentType: string): Response {
+function wrapImageResponse(body: ArrayBuffer, status: number, contentType: string, maskHost: string): Response {
     const dataUri = `data:${contentType || 'image/jpeg'};base64,${arrayBufferToBase64(body)}`;
-    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>BPB Panel v${__VERSION__}</title><style>body{margin:0;padding:0;overflow:hidden;background:#000;display:flex;align-items:center;justify-content:center;height:100vh}img{width:100vw;height:100vh;object-fit:fill}</style></head><body><img src="${dataUri}" alt="homepage"></body></html>`;
+    // F14：标题取伪装站 host，不再写项目名 + 版本号——伪装面自报项目与版本是可被扫描器
+    // 直接抓到的部署指纹；内联 data URI 与伪装站自身资源同源，用它的域名作标题最自洽
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${maskHost}</title><style>body{margin:0;padding:0;overflow:hidden;background:#000;display:flex;align-items:center;justify-content:center;height:100vh}img{width:100vw;height:100vh;object-fit:fill}</style></head><body><img src="${dataUri}" alt="homepage"></body></html>`;
     return new Response(html, { status, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
@@ -258,7 +291,7 @@ async function tryServeImage(maskURL: URL): Promise<Response | null> {
     const url = maskURL.href;
     const cached = maskImageCache.get(url);
     if (cached) {
-        return wrapImageResponse(cached.body as ArrayBuffer, cached.status, cached.contentType);
+        return wrapImageResponse(cached.body as ArrayBuffer, cached.status, cached.contentType, maskURL.hostname);
     }
     const headers = buildMaskedHeaders(new Headers(), maskURL);
     headers.set('Referer', maskURL.origin + '/');
@@ -278,7 +311,7 @@ async function tryServeImage(maskURL: URL): Promise<Response | null> {
                     if (oldest) maskImageCache.delete(oldest);
                 }
                 maskImageCache.set(url, { body: bytes, status: resp.status, contentType, time: Date.now() });
-                return wrapImageResponse(bytes, resp.status, contentType);
+                return wrapImageResponse(bytes, resp.status, contentType, maskURL.hostname);
             }
             // content-length 虚标（实际 >2MB）：用已读字节流式直传
             const headersOut: Record<string, string> = {
@@ -376,7 +409,7 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
             try {
                 const text = await withTimeout(clone.text(), 5000, '伪装页读取');
                 const rewritten = text.replaceAll(maskURL.host, reqURL.host);
-                const filtered = filterResponseHeaders(resp.headers);
+                const filtered = filterResponseHeaders(resp.headers, maskURL, reqURL);
                 const headersFinal = withHsts(filtered, env);
                 maskHomeCache.set(cacheKey, {
                     body: rewritten,
@@ -393,7 +426,7 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
         return new Response(resp.body, {
             status: resp.status,
             statusText: resp.statusText,
-            headers: withHsts(filterResponseHeaders(resp.headers), env)
+            headers: withHsts(filterResponseHeaders(resp.headers, maskURL, reqURL), env)
         });
     } catch (error) {
         console.error('伪装页反代失败:', (error as Error)?.message ?? String(error));
@@ -413,7 +446,7 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
                     return new Response(fallbackResp.body, {
                         status: fallbackResp.status,
                         statusText: fallbackResp.statusText,
-                        headers: withHsts(filterResponseHeaders(fallbackResp.headers), env)
+                        headers: withHsts(filterResponseHeaders(fallbackResp.headers, maskURL, reqURL), env)
                     });
                 }
             } catch (e2) {

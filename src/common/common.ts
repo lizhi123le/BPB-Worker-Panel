@@ -34,6 +34,8 @@ export function respond(
 ): Response {
     const headers = {
         'Content-Type': 'application/json',
+        // F13：JSON 接口同样带安全头（含 no-store）。env 由 worker.ts 挂在 globalThis.env。
+        ...securityHeaders((globalThis as any)?.env),
         ...customHeaders,
     };
 
@@ -116,6 +118,50 @@ export function hstsHeaders(env: Record<string, string | undefined> | undefined)
         return { 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload' };
     }
     return {};
+}
+
+/**
+ * F13：面板/登录/密钥/错误页与 JSON 接口的通用安全响应头（HSTS 仍按 env 开关，默认不加）。
+ *
+ * CSP 刻意**只**含 `object-src` / `base-uri` / `frame-ancestors` 三条，不含 `default-src`/`script-src`：
+ * 四个 index.html 大量依赖内联 `onclick`（panel/index.html 就有 59 处）与内联 `<script>`，
+ * 一旦写 `script-src 'self'` 会直接拦死面板全部交互。未列出的指令不受限，
+ * 因此这三条既不改变页面功能，又挡住 <base> 劫持、插件嵌入与跨站 framing。
+ */
+export function securityHeaders(env?: Record<string, string | undefined>): Record<string, string> {
+    return {
+        'Content-Security-Policy': "object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
+        'X-Content-Type-Options': 'nosniff',
+        'Referrer-Policy': 'no-referrer',
+        'Cache-Control': 'no-store',
+        ...hstsHeaders(env)
+    };
+}
+
+/**
+ * 出站敏感头 denylist（全部小写）。
+ * 比较必须用 `k.toLowerCase()`：Headers 迭代产出的头名恒为小写，用大写名单直接比较会静默失配。
+ */
+export const SENSITIVE_OUTBOUND_HEADERS: ReadonlySet<string> = new Set([
+    // 会话凭据
+    'cookie', 'authorization', 'proxy-authorization',
+    // CF / 代理链路入站头：真实访客 IP 与网络拓扑
+    'cf-connecting-ip', 'cf-connecting-ipv6', 'cf-pseudo-ipv4', 'cf-ipcountry',
+    'cf-ray', 'cf-visitor', 'cf-worker', 'cf-cache-status',
+    'true-client-ip', 'x-forwarded-for', 'x-forwarded-for-original',
+    'x-forwarded-proto', 'x-forwarded-host', 'forwarded', 'via',
+    'x-real-ip', 'x-originating-ip', 'x-remote-ip', 'x-client-ip',
+    'client-ip', 'x-cluster-client-ip'
+]);
+
+/** 逐头拷贝并丢弃 {@link SENSITIVE_OUTBOUND_HEADERS}（大小写不敏感）。 */
+export function copySafeOutboundHeaders(src: Headers): Headers {
+    const out = new Headers();
+    for (const [k, v] of src) {
+        if (SENSITIVE_OUTBOUND_HEADERS.has(k.toLowerCase())) continue;
+        out.set(k, v);
+    }
+    return out;
 }
 
 /** Realistic browser UA pool with weights — cfnew style weighted random selection. */

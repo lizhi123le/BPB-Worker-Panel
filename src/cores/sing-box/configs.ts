@@ -1,11 +1,12 @@
 import { getDataset } from '@kv';
-import { buildDNS } from './dns';
-import { buildRoutingRules, buildBlockAndBypassRules } from './routing';
-import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound } from './outbounds.js';
+import { buildDNS, retargetDnsDetour } from './dns';
+import { buildRoutingRules, buildBlockAndBypassRules, buildBaseRoutingRules } from './routing';
+import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound, getChainExplicitEarlyData, redrawChainEarlyData } from './outbounds.js';
 import { Outbound, WireguardEndpoint, Config } from '#types/sing-box';
-import { buildEntryPortMap, getConfigAddresses, generateRemark, generateWsPath, isHttps, getProtocols, resetRemarkCounter } from '@utils';
+import { buildEntryPortMap, getConfigAddresses, generateRemark, generateWsPath, isHttps, getProtocols, pickEarlyData, resetRemarkCounter } from '@utils';
 import { buildMixedInbound, tun } from './inbounds';
-import { buildAclSingbox } from '../clash/acl-template';
+import { buildAclSingbox, ACL_BUILTIN_GROUP_TAGS } from '../clash/acl-template';
+import { DEFAULT_ACL_TEMPLATE_URL } from '../../common/defaults';
 
 async function buildConfig(
     outbounds: Outbound[],
@@ -80,14 +81,20 @@ async function buildConfig(
 export async function getSbCustomConfig(isFragment: boolean): Promise<Response> {
     resetRemarkCounter();
     const { outProxy, ports, upstreamParams: { upstreamServer, upstreamPort } } = globalThis.settings;
-    const chainProxy = outProxy ? buildChainOutbound() : undefined;
-    const isChain = !!chainProxy;
     const protocols = getProtocols();
     const hosts = await getConfigAddresses(isFragment);
     const entryPortMap = buildEntryPortMap();
     const totalPorts = ports.filter(port => !isFragment || isHttps(port));
     // 已占用路径池词集合：每个 ws 出站各抽一个互不相同的伪装路径
     const usedPaths = new Set<string>();
+    // 已占用 early-data 阈值池：作用域与 usedPaths 一致（一次请求一个集合），
+    // 同一份订阅内任意两个节点的 ed 两两不同（无放回抽取）
+    const usedEds = new Set<number>();
+    const chainProxy = outProxy ? buildChainOutbound(usedEds) : undefined;
+    const isChain = !!chainProxy;
+    // 用户在 outProxy URI 里显式写的 ed：原型只是模板、不出现在输出中，
+    // 故把该值待到链式克隆点上消费一次（只给第一个链式节点），其余节点仍从池中无放回抽取
+    let pendingChainEd = getChainExplicitEarlyData();
 
     if (upstreamServer && upstreamPort && !isFragment) {
         totalPorts.unshift(upstreamPort);
@@ -108,7 +115,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
                 const tag = generateRemark(port, host, protocol, isFragment, false);
-                const outbound = buildWebsocketOutbound(protocol, tag, host, port, generateWsPath(usedPaths), isFragment);
+                const outbound = buildWebsocketOutbound(protocol, tag, host, port, generateWsPath(usedPaths), isFragment, pickEarlyData(usedEds));
 
                 outbounds.push(outbound);
                 proxyTags.push(tag);
@@ -119,6 +126,11 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                     const chain = structuredClone(chainProxy);
                     chain.tag = chainTag;
                     chain.detour = tag;
+                    // structuredClone 会连 transport 一起复制：克隆体不得继承源节点的 early-data，
+                    // 必须从同一 usedEds 池重新无放回抽取（否则所有链式节点共用同一阈值，形成固定指纹）；
+                    // 用户显式写的 ed 则恰好由第一个克隆体使用一次
+                    redrawChainEarlyData(chain, usedEds, pendingChainEd);
+                    pendingChainEd = undefined;
                     outbounds.push(chain);
 
                     chainTags.push(chainTag);
@@ -140,25 +152,46 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
 
     // ACL4SSR 分组模板：load-balance/fallback → urltest，模板路由整体接管（失败回退默认）
     const { aclEnabled, aclTemplate } = globalThis.settings;
-    if (aclEnabled && aclTemplate) {
+    // 启用分组模板但 Template URL 未填（空串/纯空白/缺失）→ 用内置远程模板地址兜底，
+    // 避免「开关打开却静默不生效」。地址来源唯一：@common/defaults。
+    const aclUrl = aclTemplate?.trim() || DEFAULT_ACL_TEMPLATE_URL;
+    if (aclEnabled && aclUrl) {
         try {
-            const acl = await buildAclSingbox(aclTemplate, proxyTags);
+            // 已配置的地址取不到有效内容（404 / 被墙 / 格式不符）时，旧行为是**静默跳过** ——
+            // 用户只看到「开关已启用却仍是内置分组」。故退回内置地址再试一次；两次都取不到才保持内置分组。
+            let acl = await buildAclSingbox(aclUrl, proxyTags);
+            if ((!acl || (acl.outboundGroups.length === 0 && acl.rules.length === 0)) && aclUrl !== DEFAULT_ACL_TEMPLATE_URL) {
+                console.warn('[ACL Config] 模板地址无有效内容，改用内置模板:', aclUrl);
+                acl = await buildAclSingbox(DEFAULT_ACL_TEMPLATE_URL, proxyTags);
+            }
             if (acl && (acl.outboundGroups.length > 0 || acl.rules.length > 0)) {
                 // ACL 模板接管：去掉内置分组出站（✅ Selector 与各类「最佳延迟」），
                 // 仅保留真实代理出站与 direct，路由与 final 由模板接管
-                const builtinGroupTags = new Set([
-                    "✅ Selector",
-                    "最佳延迟 🚀",
-                    "Warp - 最佳延迟 🚀",
-                    "WoW - 最佳延迟 🚀",
-                    "🔗 最佳延迟 🚀",
-                ]);
-                const retained = config.outbounds.filter(o => !builtinGroupTags.has(o.tag));
+                const retained = config.outbounds.filter(o => !ACL_BUILTIN_GROUP_TAGS.has(o.tag));
                 config.outbounds = [...retained, ...acl.outboundGroups];
-                // 保留 Block/Bypass 拦截规则在最前（广告/色情/恶意/挖矿 reject、国内/直连 direct），
-                // 再叠加模板路由，避免模板规则覆盖掉 Block 拦截
+                // C3：dns-remote 的 detour 原本指向被上面过滤掉的内置分组（✅ Selector / 各类「最佳延迟」），
+                // 接管后这些 tag 已不存在 → sing-box 启动期解析出站失败、整份配置加载失败。
+                // 改指向模板实际生成的默认分组（与 route.final 同义：由默认策略组解析 DoH）；
+                // 模板一个分组都没生成时退回内置直连出站 direct —— 它不在移除集合里，必然存在。
+                const aclGroupTags = new Set(acl.outboundGroups.map(g => g.tag));
+                const aclDnsDetour = aclGroupTags.has(acl.final)
+                    ? acl.final
+                    : (acl.outboundGroups[0]?.tag ?? 'direct');
+                retargetDnsDetour(config.dns, ACL_BUILTIN_GROUP_TAGS, aclDnsDetour);
+                // C6：模板接管的是「分流」，不能连基础规则一起丢。原先只前置 Block/Bypass，
+                // sniff、hijack-dns（含 172.19.0.2 上游 DNS 劫持）、ip_is_private 直连、UDP reject
+                // 全被整表替换掉 → 接管后 DNS/局域网/嗅探行为静默改变（与 Clash 端 C5 对称）。
+                // 顺序与 Clash 端 ACL 分支逐条对齐：基础规则 → Block/Bypass 拦截 → 模板规则。
+                const baseRules = buildBaseRoutingRules(false);
+                // 基础规则里 clash_mode "Global" 原本指向内置 "✅ Selector"，而该分组正是被上面滤掉的那个；
+                // 悬空出站会让 sing-box 启动期解析失败 → 整份配置加载失败。改写为 aclDnsDetour（模板实际存在的
+                // 出站，与 C3 的 dns-remote detour 同一目标），使「全局模式」切换在 ACL 下仍然有效。
+                for (const rule of baseRules) {
+                    if (rule.clash_mode === "Global") rule.outbound = aclDnsDetour;
+                }
                 const blockBypass = buildBlockAndBypassRules();
                 config.route.rules = [
+                    ...baseRules,
                     ...blockBypass.rules,
                     ...acl.rules
                 ];

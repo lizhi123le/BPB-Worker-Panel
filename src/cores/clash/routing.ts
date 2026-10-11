@@ -2,10 +2,14 @@ import { RuleProvider } from '#types/clash';
 import { getGeoAssets } from './geo-assets';
 import { isIPv6, isIPv4, accRoutingRules } from '@utils';
 
-export function buildRoutingRules(isWarp: boolean) {
+/**
+ * 不含 Block/Bypass 与 MATCH 兜底的基础规则行（局域网直连 + UDP 策略）。
+ * C5：ACL 模板接管时 rules 会被整体重建（configs.ts#getClNormalConfig），
+ * 若只前置 buildBlockRules/buildBypassRules，就会丢掉这两行 baseline —— 局域网不再强制直连、
+ * UDP 也不再被策略性 reject，行为与未接管时不一致。故单独抽出，供默认路径与 ACL 路径共用。
+ */
+export function buildBaseRoutingRules(isWarp: boolean): string[] {
     const { blockUDP443 } = globalThis.settings;
-    const geoAssets = getGeoAssets();
-    const routingRules = accRoutingRules(geoAssets);
     const rules = [`GEOIP,lan,DIRECT,no-resolve`];
 
     if (!isWarp) {
@@ -14,8 +18,12 @@ export function buildRoutingRules(isWarp: boolean) {
         rules.push("AND,((NETWORK,udp),(DST-PORT,443)),REJECT");
     }
 
+    return rules;
+}
+
+export function buildRoutingRules(isWarp: boolean) {
     return [
-        ...rules,
+        ...buildBaseRoutingRules(isWarp),
         ...buildBlockRules(),
         ...buildBypassRules(),
         "MATCH,✅ Selector"

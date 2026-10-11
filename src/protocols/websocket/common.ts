@@ -1,5 +1,5 @@
 import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS } from '@utils';
-import { safeErrorMessage } from '@common';
+import { safeErrorMessage, randomUserAgent } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
 // 核心修复：原写法 `export const connectSocket = getConnect()` 在模块加载期立即执行，
@@ -25,13 +25,26 @@ const IP_BLACKLIST_TTL = 30 * 1000;          // 基础冷却 30 秒
 const IP_BLACKLIST_BACKOFF = 2;              // 指数退避系数
 const IP_BLACKLIST_MAX_TTL = 30 * 60 * 1000; // 最大冷却 30 分钟
 const IP_BLACKLIST_MAX_FAIL = 3;             // failCount 封顶，防止长生命周期 isolate 中无界增长
+const IP_BLACKLIST_MAX_ENTRIES = 512;        // 键数量上限：只封顶单条大小不封顶键数，长期 isolate 内 Map 仍会无界增长
 const ipBlacklist = new Map<string, { failCount: number; lastFailAt: number }>();
+
+/** 条目冷却时长：指数退避 基础 30s × 2^(failCount-1)，上限 30min（对齐 edgetunnel 节点黑名单计算过期时间） */
+function blacklistTtl(e: { failCount: number }): number {
+    return Math.min(IP_BLACKLIST_TTL * Math.pow(IP_BLACKLIST_BACKOFF, e.failCount - 1), IP_BLACKLIST_MAX_TTL);
+}
+
+/** 清扫已过期条目（F-10）：未被再次查询的键也必须回收，原实现只在同键再次查询且已过期时删除 */
+function blacklistSweep(): void {
+    const now = Date.now();
+    for (const [key, e] of ipBlacklist) {
+        if (now - e.lastFailAt > blacklistTtl(e)) ipBlacklist.delete(key);
+    }
+}
+
 function blacklistCheck(key: string): boolean {
     const e = ipBlacklist.get(key);
     if (!e) return false;
-    // 指数退避：基础 30s × 2^(failCount-1)，上限 30min（对齐 edgetunnel 节点黑名单计算过期时间）
-    const ttl = Math.min(IP_BLACKLIST_TTL * Math.pow(IP_BLACKLIST_BACKOFF, e.failCount - 1), IP_BLACKLIST_MAX_TTL);
-    if (Date.now() - e.lastFailAt > ttl) {
+    if (Date.now() - e.lastFailAt > blacklistTtl(e)) {
         ipBlacklist.delete(key);
         return false;
     }
@@ -42,6 +55,15 @@ function blacklistRecord(key: string) {
     // failCount 封顶到 IP_BLACKLIST_MAX_FAIL，防止长生命周期 isolate 中无界增长
     const failCount = Math.min((e ? e.failCount : 0) + 1, IP_BLACKLIST_MAX_FAIL);
     ipBlacklist.set(key, { failCount, lastFailAt: Date.now() });
+    // F-10 容量兜底：超上限时先清扫过期条目，仍超上限则按 Map 插入序淘汰最旧键
+    if (ipBlacklist.size > IP_BLACKLIST_MAX_ENTRIES) {
+        blacklistSweep();
+        while (ipBlacklist.size > IP_BLACKLIST_MAX_ENTRIES) {
+            const oldestKey = ipBlacklist.keys().next().value;
+            if (oldestKey === undefined) break;
+            ipBlacklist.delete(oldestKey);
+        }
+    }
 }
 function blacklistClear(key: string) { ipBlacklist.delete(key); }
 
@@ -134,12 +156,19 @@ async function connectWithRaceDial(
             if (blacklistCheck(key)) return { socket: null, ip: cleanIp, port: entryPort, index: batchIndexes[j] };
             const socket = connectSocket({ hostname: cleanIp, port: entryPort }, fetcher);
             // 等待连接建立
-            await Promise.race([
-                socket.opened,
-                new Promise<never>((_, reject) =>
-                    setTimeout(() => reject(new Error('timeout')), PROXY_DIAL_TIMEOUT)
-                )
-            ]);
+            try {
+                await Promise.race([
+                    socket.opened,
+                    new Promise<never>((_, reject) =>
+                        setTimeout(() => reject(new Error('timeout')), PROXY_DIAL_TIMEOUT)
+                    )
+                ]);
+            } catch (dialError) {
+                // F-09：超时/reject 分支创建的 socket 同样要回收。allSettled 的 rejected 分支不再携带
+                // socket，若不在此关闭，每次竞速失败都会残留 2-3 条半开连接。
+                try { socket.close(); } catch {}
+                throw dialError;
+            }
             return { socket, ip: cleanIp, port: entryPort, index: batchIndexes[j] };
         });
 
@@ -251,12 +280,18 @@ async function connectWithDirectRaceDial(
         // 并发拨号，取最快成功的（对齐 cfnew 并发连接候选 Promise.any）
         const dialPromises = batchCandidates.map(async (candidate) => {
             const socket = connectSocket({ hostname: candidate.hostname, port: candidate.port }, fetcher);
-            await Promise.race([
-                socket.opened,
-                new Promise<never>((_, reject) =>
-                    setTimeout(() => reject(new Error('timeout')), DIRECT_DIAL_TIMEOUT)
-                )
-            ]);
+            try {
+                await Promise.race([
+                    socket.opened,
+                    new Promise<never>((_, reject) =>
+                        setTimeout(() => reject(new Error('timeout')), DIRECT_DIAL_TIMEOUT)
+                    )
+                ]);
+            } catch (dialError) {
+                // F-09：Promise.any 只处理 fulfilled 的败者，reject 分支的 socket 必须在这里就地回收
+                try { socket.close(); } catch {}
+                throw dialError;
+            }
             return { socket, candidate };
         });
 
@@ -316,7 +351,8 @@ async function connectAndWrite(address: string, port: number, rawClientData: Arr
 
     // log(`connected to ${address}:${port}`);
     const writer = tcpSocket.writable.getWriter();
-    await writer.write(rawClientData);
+    // F-19：rawClientData 可能为 undefined（首包剥离后无残余载荷），直接 write(undefined) 会抛 TypeError
+    if (rawClientData && rawClientData.byteLength) await writer.write(rawClientData);
     writer.releaseLock();
     return tcpSocket;
 }
@@ -516,9 +552,12 @@ async function socks5Connect(
     if (selectedMethod === 2) {
         if (!username || !password) throw new Error('socks server needs auth');
         const encoder = new TextEncoder();
+        // F-20：SOCKS5 认证长度字段是 UTF-8 字节数，非 ASCII 账号/口令用 .length（字符数）会少算 → 认证报文非法
+        const usernameBytes = encoder.encode(username);
+        const passwordBytes = encoder.encode(password);
         const authRequest = new Uint8Array([
-            1, username.length, ...encoder.encode(username),
-            password.length, ...encoder.encode(password)
+            1, usernameBytes.length, ...usernameBytes,
+            passwordBytes.length, ...passwordBytes
         ]);
         await writer.write(authRequest);
         response = await readAtLeast(2);
@@ -588,9 +627,10 @@ async function httpConnectTunnel(
     const targetAddr = `${targetHost}:${targetPort}`;
 
     // Build CONNECT request — cfnew L5617-5621
+    // H13：固定 `User-Agent: Mozilla/5.0` 是 cfnew 系的恒定特征，改用随机真实浏览器 UA
     let requestText = `CONNECT ${targetAddr} HTTP/1.1\r\n`
         + `Host: ${targetAddr}\r\n`
-        + `User-Agent: Mozilla/5.0\r\n`
+        + `User-Agent: ${randomUserAgent()}\r\n`
         + `Proxy-Connection: Keep-Alive\r\n`;
     if (username) {
         requestText += `Proxy-Authorization: Basic ${btoa(`${username}:${password || ''}`)}\r\n`;
@@ -706,7 +746,8 @@ export async function handleTCPOutBound(
 
         log(`connected to ${address}:${port}`);
         const writer = tcpSocket.writable.getWriter();
-        await writer.write(rawClientData);
+        // F-19：与 socks5Connect 一致，写入前判空，避免 write(undefined) 抛 TypeError
+        if (rawClientData && rawClientData.byteLength) await writer.write(rawClientData);
         writer.releaseLock();
         return tcpSocket;
     }
@@ -832,6 +873,13 @@ export async function handleTCPOutBound(
                 }, log);
                 return;
             }
+            // proxyOnly：上游代理配置非空但非法/解析失败时 connectThroughUpstreamProxy 返回 null（不抛错），
+            // 此处必须阻断，否则会穿透到下方直连竞速拨号，真实流量从 Worker 出口 IP 泄漏
+            if (!upstreamSocket && proxyOnly) {
+                log(`proxy-only: upstream proxy unavailable for ${originalAddress}:${originalPort}`);
+                webSocket.close(1011, 'Proxy-only mode: upstream proxy unavailable');
+                return;
+            }
         } catch (upstreamError) {
             log(`upstream-proxy failed: ${safeErrorMessage(upstreamError)}`);
             console.warn(`Upstream proxy failed: ${upstreamError}`);
@@ -895,7 +943,9 @@ function concatUint8Arrays(a: Uint8Array, b: Uint8Array): Uint8Array {
 // --- cfnew-style download batcher (aligned with cfnew 创建值值 L5013-5078) ---
 // Batches small TCP chunks into larger WebSocket frames for better throughput.
 function createDownloadBatcher(webSocket: WebSocket) {
-    const PACKET_SIZE = DOWNLOAD_PACKET_SIZE;   // 32KB
+    // 出口帧长抖动：每连接在 24KiB..40KiB 闭区间随机取包长，消除固定 32KiB 帧长的可统计长度指纹
+    // （DOWNLOAD_PACKET_SIZE 保留为模块级基准值，抖动后仍恒 ≤ DOWNLOAD_BLOCK_SIZE）
+    const PACKET_SIZE = DOWNLOAD_PACKET_SIZE / 4 * 3 + Math.floor(Math.random() * (DOWNLOAD_PACKET_SIZE / 2 + 1));
     const TAIL = DOWNLOAD_TAIL;                 // 512
     const LOW_WATER = Math.max(4096, TAIL << 3); // 4096
     let buffer = new Uint8Array(PACKET_SIZE);
@@ -1071,6 +1121,37 @@ async function remoteSocketToWS(
     }
 }
 
+// ===== 每连接清理钩子：WS teardown 统一收口（F-11 DNS socket 释放 + F-21 close 语义）=====
+// makeReadableWebSocketStream 的 close / cancel / error 是 WS 关闭仅有的三条路径，
+// 与 remoteSocketWrapper（由 unified.ts 的 writableStream 收口）无关的自建资源在此登记，
+// 避免「UDP DNS 复用的 TCP socket 无人关闭」这类半开残留。
+// 键表用 WeakMap：WS 对象被回收时登记项随之消失，不假设 close 一定触发。
+const wsCleanupHooks = new WeakMap<WebSocket, Set<() => void>>();
+
+/** 注册连接级清理钩子（同一 ws + 同一函数引用去重） */
+export function registerWsCleanup(webSocket: WebSocket, hook: () => void): void {
+    let hooks = wsCleanupHooks.get(webSocket);
+    if (!hooks) {
+        hooks = new Set();
+        wsCleanupHooks.set(webSocket, hooks);
+    }
+    hooks.add(hook);
+}
+
+/**
+ * 排空并执行该连接的全部清理钩子。
+ * 先 delete 再执行：close / cancel / error 中先到者执行，后到者成为 no-op —— 每个钩子至多跑一次，
+ * 因此内部即便不做幂等也不会重复关闭。
+ */
+function runWsCleanupHooks(webSocket: WebSocket): void {
+    const hooks = wsCleanupHooks.get(webSocket);
+    if (!hooks) return;
+    wsCleanupHooks.delete(webSocket);
+    for (const hook of hooks) {
+        try { hook(); } catch (error) { console.error('ws cleanup hook failed', error); }
+    }
+}
+
 export function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader: string, log: Function) {
     let readableStreamCancel = false;
     const stream = new ReadableStream({
@@ -1083,12 +1164,15 @@ export function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDat
 
             webSocketServer.addEventListener("close", () => {
                 safeCloseWebSocket(webSocketServer);
+                runWsCleanupHooks(webSocketServer);
                 if (readableStreamCancel) return;
-                controller.close();
+                // F-21：early data 解码失败或 error 事件已先把流 error 化，此处再 close() 会在监听器内抛 TypeError
+                try { controller.close(); } catch (_) { /* 流已 error/关闭，忽略 */ }
             });
 
             webSocketServer.addEventListener("error", (err) => {
                 log("webSocketServer has error");
+                runWsCleanupHooks(webSocketServer);
                 controller.error(err);
             });
 
@@ -1106,6 +1190,7 @@ export function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDat
             log(`ReadableStream was canceled, due to ${reason}`);
             readableStreamCancel = true;
             safeCloseWebSocket(webSocketServer);
+            runWsCleanupHooks(webSocketServer);
         }
     });
 

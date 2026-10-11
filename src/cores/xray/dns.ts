@@ -1,6 +1,6 @@
 import { getGeoAssets } from './geo-assets';
 import type { DNS, DnsServer, DnsHosts } from '#types/xray';
-import { resolveDNS, isDomain, getDomain, accDnsRules } from '@utils';
+import { resolveDNS, isDomain, isIPv6, getDomain, accDnsRules } from '@utils';
 
 export async function buildDNS(
     outboundAddrs: string[],
@@ -46,6 +46,18 @@ export async function buildDNS(
     const remoteDnsServer = buildDnsServer(finalRemoteDNS, undefined, undefined, undefined, undefined, "remote-dns");
     servers.push(remoteDnsServer);
 
+    // H7：节点自身域名（outboundAddrs）改走 DoH，不再交给明文 localDNS。
+    // 仅在 finalRemoteDNS 确为 DoH（https://）时启用；否则保持原有明文 localDNS 行为
+    // （warp 配置下 warpRemoteDNS 默认是裸 IP 1.1.1.1，不应把明文查询换成另一个明文解析器）。
+    // 单列一条带 domains 的服务器，而不依赖「默认服务器」回退：fakeDNS 开启时 fakedns 会被
+    // unshift 到首位，仅靠默认回退会被解析成 fake IP。
+    // 防环：DoH 端点自身若为域名，已由上方 hosts[remoteDnsHost.host] 或 hosts[customDns] 静态预置。
+    const outboundDomains = outboundAddrs.filter(isDomain).map(domain => `full:${domain}`);
+    const outboundDomainsOnDoH = /^https:\/\//i.test(finalRemoteDNS);
+    if (outboundDomainsOnDoH && outboundDomains.length) {
+        servers.push(buildDnsServer(finalRemoteDNS, outboundDomains));
+    }
+
     const geoAssets = getGeoAssets();
     const dnsRules = accDnsRules(geoAssets);
 
@@ -70,14 +82,43 @@ export async function buildDNS(
     const bypassDomains = [
         ...dnsRules.bypass.localDNS.geosites,
         ...dnsRules.bypass.localDNS.domains.map(domain => `domain:${domain}`),
-        ...outboundAddrs.filter(isDomain).map(domain => `full:${domain}`)
+        ...(outboundDomainsOnDoH ? [] : outboundDomains)
     ];
 
+    // 残留 #6：制裁域名「优先 DoH，明文 IP 兜底」（clash/sing-box 同一口径）。
+    // 面板输入 antiSanctionDNS 仍是唯一权威来源，不新增设置项：
+    //   - 已带 https:// → 直接当 DoH 端点，无明文兜底；
+    //   - 裸 IP/域名   → 拼 `https://<输入>/dns-query` 作 DoH，原地址留作明文兜底
+    //     （伊朗对加密 DNS 有封锁，兜底不可省）。
+    // 表达「优先 + 兜底」无需 Xray 新字段：sortClients 按 servers 出现顺序收集全部 domains 命中的
+    // 条目，serialQuery 依次查询、前面取不到结果才用后面的，故「DoH 条目在前 + 明文条目在后」即原生语义
+    // （app/dns/dns.go: sortClients/serialQuery）。finalQuery 只标在链尾（有明文兜底时标明文，否则标
+    // DoH 那条）：命中后不再回落到默认 remoteDNS，与改动前单条 finalQuery:true 的语义保持一致。
     if (sanctionDomains.length) {
-        const sanctionDnsServer = buildDnsServer(antiSanctionDNS, sanctionDomains, undefined, skipFallback, true);
-        servers.push(sanctionDnsServer);
-        
-        const { host, isHostDomain } = getDomain(antiSanctionDNS);
+        const antiSanctionOnDoH = /^https:\/\//i.test(antiSanctionDNS);
+        // 裸 IPv6 必须加方括号，否则 `https://2001:db8::1/dns-query` 不是合法地址，xray 会启动失败。
+        const antiSanctionDohHost = isIPv6(antiSanctionDNS) && !antiSanctionDNS.startsWith('[')
+            ? `[${antiSanctionDNS}]`
+            : antiSanctionDNS;
+        const antiSanctionDohUrl = antiSanctionOnDoH ? antiSanctionDNS : `https://${antiSanctionDohHost}/dns-query`;
+        const antiSanctionPlainFallback = antiSanctionOnDoH ? undefined : antiSanctionDNS;
+
+        servers.push(buildDnsServer(
+            antiSanctionDohUrl,
+            sanctionDomains,
+            undefined,
+            skipFallback,
+            antiSanctionPlainFallback ? undefined : true
+        ));
+
+        if (antiSanctionPlainFallback) {
+            servers.push(buildDnsServer(antiSanctionPlainFallback, sanctionDomains, undefined, skipFallback, true));
+        }
+
+        // 防环：DoH 端点若为域名，其自身域名必须先由明文 localDNS 解析（加入 bypass 列表），
+        // 否则它会被这条 DoH 服务器反向依赖。裸 IP 端点无需处理。
+        // 取 host 用 DoH URL 而非原始输入：new URL() 只接受带协议的字符串。
+        const { host, isHostDomain } = getDomain(antiSanctionDohUrl);
         if (isHostDomain) bypassDomains.push(`full:${host}`);
     }
 

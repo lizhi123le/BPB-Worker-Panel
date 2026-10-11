@@ -2,6 +2,7 @@ import {
     safeCloseTcpSocket,
     handleTCPOutBound,
     makeReadableWebSocketStream,
+    registerWsCleanup,
     WS_READY_STATE_OPEN,
     connectSocket
 } from './common';
@@ -9,102 +10,90 @@ import {
 // 对齐 cfnew c0eb20c（明文源吗 L33-40）：隐私增强 —— 智能剥离随机填充前缀
 // 客户端首包可能携带 [0xED 0x7F][2 字节 padLen][padLen 字节随机填充]，若不剥离直接做
 // 协议检测，0xED 0x7F 会被 parseVlHeader 当成版本号、填充被当成 UUID，检测必失败。
-// 幂等：无魔数或 padLen 异常时原样返回，非首包（已建连后的数据块）不受影响。
+// 幂等：无魔数或 padLen 异常时原样返回；仅由 write() 在本次连接的首个数据块起调用
+// （见 paddingStripped 标志），一旦判定完成即转直通，已建连后的数据块不再剥离。
+// V-02：首包可能被客户端拆成多个 WS 帧 —— 第 1 帧不足 4 字节（判不了魔数），或只含
+// [魔数][长度] 而不含全部填充，此时第 2 帧起是纯随机填充，逐帧剥离必然失败。故在
+// 「尚未判定是否含填充」的这段头部上做跨帧累积，直到能给出确定结论再一次性交给后续流程。
+// H15 — 冻结，不作卖点：魔数 0xED7F 与 padLen ∈ [64,2048] 仍是客户端侧的固定常量，服务端只做剥离、
+// 既不校验也不回写，因此这条填充链路只对 cfnew 系客户端生效，且不构成任何抗指纹增益。
+// 不要把它当成隐私卖点，也不要据此单方面推进「客户端约定」（需客户端与订阅侧同步改）；
+// 本次明确按「不作卖点」冻结，魔数与上界保持现状。
 const PRIVACY_MAGIC = 0xED7F;
+const PRIVACY_PAD_MIN = 64;
+const PRIVACY_PAD_MAX = 2048;
+// 等待态允许保留的字节上限：判定所需的头部最长就是 [魔数 2][长度 2][填充 2048] = 2052。
+// 超过它只会来自畸形/恶意帧，直接判为无填充交回，放任缓冲增长就是内存放大面。
+const PRIVACY_PROBE_LIMIT = 4 + PRIVACY_PAD_MAX;
+// 跨帧累积状态：pending === null 表示「未在等待」，此时无缓冲、无额外拷贝（热路径直通）。
+type PrivacyProbe = { pending: Uint8Array | null };
 
-function stripPrivacyPadding(data: ArrayBuffer): ArrayBuffer {
-    if (data.byteLength < 4) return data;
-    const bytes = new Uint8Array(data);
-    const magic = (bytes[0] << 8) | bytes[1];
-    if (magic !== PRIVACY_MAGIC) return data; // 旧客户端，无魔数
+/**
+ * 判定并剥离首包 0xED7F 填充（跨帧安全，取代 V-02 之前的单块 stripPrivacyPadding）。
+ * 返回 null：当前字节不足以判定（头部已累积进 state.pending），调用方应丢弃本帧、等后续帧补齐；
+ * 返回 ArrayBuffer：判定完成 —— 有填充则已剥离，无填充则按原字节序交回（未进入等待态时是同一个对象，零拷贝）。
+ */
+function probePrivacyPadding(chunk: ArrayBuffer, state: PrivacyProbe): ArrayBuffer | null {
+    let buf: ArrayBuffer;
+    if (state.pending) {
+        // 只有等待态才发生拷贝：把上一帧留下的头部与当前帧按序拼成一个块再次判定
+        const pending = state.pending;
+        const merged = new Uint8Array(pending.byteLength + chunk.byteLength);
+        merged.set(pending, 0);
+        merged.set(new Uint8Array(chunk), pending.byteLength);
+        state.pending = null;
+        buf = merged.buffer;
+    } else {
+        buf = chunk; // 无填充客户端的首帧：零拷贝直通，与改动前逐字节一致
+    }
+
+    const bytes = new Uint8Array(buf);
+
+    // ① 连魔数都判不了（<2 字节）→ 继续等：至多 1 字节，不可能触上限
+    if (bytes.byteLength < 2) {
+        state.pending = bytes;
+        return null;
+    }
+
+    // ② 前 2 字节不是魔数 → 判定为无填充，原样一次性交回
+    if (((bytes[0] << 8) | bytes[1]) !== PRIVACY_MAGIC) return buf;
+
+    // ③ 是魔数但长度字段未收全（2 或 3 字节）→ 继续等：至多 3 字节，不可能触上限
+    if (bytes.byteLength < 4) {
+        state.pending = bytes;
+        return null;
+    }
+
     const padLen = (bytes[2] << 8) | bytes[3];
-    if (padLen < 64 || padLen > 2048) return data; // 异常值，视为旧客户端
-    return data.slice(4 + padLen); // 跳过 [魔数][长度][填充]
+    // ④ padLen 不在 [64,2048] → 判为无填充，原样交回
+    if (padLen < PRIVACY_PAD_MIN || padLen > PRIVACY_PAD_MAX) return buf;
+
+    // ⑤ 填充没收全 → 继续累积到 4 + padLen 再剥离
+    if (bytes.byteLength < 4 + padLen) {
+        // 结构性防御：本分支内 bytes.byteLength < 4 + padLen ≤ PRIVACY_PROBE_LIMIT，
+        // 等待态在现有常量下不可能超限；保留判断以防将来放宽上界后失去内存保护。
+        if (bytes.byteLength > PRIVACY_PROBE_LIMIT) return buf;
+        state.pending = bytes;
+        return null;
+    }
+
+    // ⑥ 已收满 [魔数][长度][填充] → 剥离，交回真实协议头
+    return buf.slice(4 + padLen);
 }
 
 // ===== xPadding 抗指纹（对齐 cfnew 52143dccb，参考 cmliu/edgetunnel）=====
-// UUID 派生隐蔽的填充头名/键名，服务端宽松校验、响应回写随机填充，订阅链接带 extra 约定。
-// 与上方 0xED7F 隐私填充（数据层）不同，xPadding 是 HTTP 层抗指纹机制，两者互不冲突。
-// 霍夫曼码长表（RFC 7541，257 项，索引 0-256，256 为 EOS）
-const XPADDING_HUFFMAN_CODE_LENGTHS = [
-    13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
-    28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
-    6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
-    5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
-    13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
-    15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5,
-    6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
-    20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23,
-    24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
-    22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23,
-    21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
-    26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25,
-    19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
-    20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23,
-    26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
-    30
-];
+// UUID 派生隐蔽的填充头名/键名，订阅链接据此生成 extra 约定（跨组冻结接口，勿改名/删除）。
+// 服务端不再对入站填充做任何校验，也不在 101 响应里回写填充头，理由见下：
+//   1. 校验可被零成本绕过（不发送填充即放行），却把“非法填充 → 400”变成一个可区分响应，
+//      攻击者用“猜测的 UUID 算出的头名 + 非法长度填充”即可区分 400 与放行 → UUID 校验 oracle；
+//   2. 101 响应回写 UUID 派生头会把 UUID 的 12 个 hex 字符泄露给未认证调用方。
 
 // 从 UUID 派生隐蔽的头名/键名，与订阅侧 extra 约定一致
 export function getXPaddingIdentifier(uuid: string): { header: string; key: string } {
     return { header: uuid.slice(1, 7), key: '_' + uuid.slice(25, 31) };
 }
 
-// 计算字符串按霍夫曼编码后的字节长度（用于填充长度校验）
-function calcXPaddingHuffmanByteLength(str: string): number {
-    const bytes = new TextEncoder().encode(str);
-    let totalBits = 0;
-    for (let i = 0; i < bytes.length; i++) totalBits += XPADDING_HUFFMAN_CODE_LENGTHS[bytes[i]];
-    return Math.ceil(totalBits / 8);
-}
-
-// 提取填充值：优先头（URL 编码形式），回退请求 URL 查询参数
-function extractXPaddingValue(request: Request, header: string, key: string): string {
-    const headerValue = request.headers.get(header);
-    if (headerValue) {
-        try {
-            const parsed = new URL(headerValue, 'https://x.invalid');
-            const queryValue = parsed.searchParams.get(key);
-            if (queryValue) return queryValue;
-        } catch (_) { /* ignore */ }
-        return headerValue;
-    }
-    try {
-        return new URL(request.url).searchParams.get(key) || '';
-    } catch (_) {
-        return '';
-    }
-}
-
-// 宽松校验：空填充放行（老客户端兼容），非空时霍夫曼字节长度须在 98..1002
-function validateXPadding(request: Request, header: string, key: string): boolean {
-    const padding = extractXPaddingValue(request, header, key);
-    if (!padding) return true;
-    const length = calcXPaddingHuffmanByteLength(padding);
-    return length >= 98 && length <= 1002;
-}
-
-const XPADDING_CHARSET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-
-// 生成随机填充串（纯噪声，服务端不回读校验）
-function generateXPaddingString(length: number): string {
-    const charsetLength = XPADDING_CHARSET.length;
-    let result = '';
-    for (let i = 0; i < length; i++) result += XPADDING_CHARSET[Math.floor(Math.random() * charsetLength)];
-    return result;
-}
-
 export async function UnifiedWSHandler(request: Request): Promise<Response> {
-    // 对齐 cfnew 52143dccb：xPadding 抗指纹 —— 入站宽松校验（空填充放行，非法返回 400）
-    const { userID: xPaddingUserID } = globalThis.globalConfig;
-    if (xPaddingUserID) {
-        const { header: xPaddingHeader, key: xPaddingKey } = getXPaddingIdentifier(xPaddingUserID);
-        if (!validateXPadding(request, xPaddingHeader, xPaddingKey)) {
-            return new Response('Bad Request', { status: 400 });
-        }
-    }
-
     // 对齐 cfnew d4b2b7f：优先用请求绑定的 fetcher 建连（新版 Workers 运行时可能缺全局 connect）
     const fetcher = request.fetcher;
     const webSocketPair = new WebSocketPair();
@@ -125,6 +114,9 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
 
     let remoteSocketWrapper: { value: Socket | null } = { value: null };
     let remoteWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
+    let remoteWriterSocket: Socket | null = null; // remoteWriter 绑定的 socket，回退换 socket 后据此重建
+    let paddingStripped = false; // 每连接一次：0xED7F 隐私填充只在首包上判定/剥离一次，判定完成即转直通
+    const paddingProbe: PrivacyProbe = { pending: null }; // V-02：填充头部被拆帧时的跨帧累积态
     let udpStreamWrite: any = null;
     let isDns = false;
 
@@ -180,11 +172,35 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
         if (firstData && firstData.byteLength > 0) await processWsLocalSpeedTestData(firstData);
     };
 
+    // ===== 首包非法的主动收口（H5 残留）=====
+    // 首包已到达却无法建连（既非合法 VLESS 也非合法 Trojan，或协议已认出但头畸形）时统一收口。
+    // 此前只有 write() 抛错，WS 关闭完全依赖 pipeTo 在目标流 write 失败后隐式触发的 source.cancel()
+    // → common.ts 的 safeCloseWebSocket（不带 code → 客户端看到 1005），且日志与「管道异常」混在一起。
+    // 现在显式 close(1008)：客户端立刻拿到确定的关闭码，日志也能区分「首包非法」与「管道异常」。
+    // 只在「已判定首包非法」时调用（调用点全部在 write() 内、非空帧、协议识别之后）：
+    // 首包未到达（write 未被调用 / 空帧）根本走不到这些行，不会误关。
+    // close reason 固定用通用文案：invalid user / password 之类的拒绝原因只写服务端日志，
+    // 回给未认证调用方会重新引入 UUID / 口令 oracle。
+    const closeInvalidFirstPacket = (reason: string) => {
+        log(`invalid first packet: ${reason}, closing WS 1008`);
+        try {
+            webSocket.close(1008, 'Invalid protocol or authentication failed');
+        } catch (_) { /* 已关闭或正在关闭，忽略 */ }
+    };
+
     const writableStream = new WritableStream({
         async write(chunk) {
-            // 对齐 cfnew c0eb20c：write 入口无条件剥离 0xED7F 魔数+随机填充（明文源吗 L4638）
-            // 幂等：无魔数/异常 padLen 原样返回；剥离后数据供后续所有协议检测与解析使用
-            chunk = stripPrivacyPadding(chunk);
+            // 对齐 cfnew c0eb20c：0xED7F 魔数+随机填充只在本次连接的首包上判定/剥离一次。
+            // 若对每个数据块都剥离，任一后续块首 2 字节恰为 0xED7F 且 padLen ∈ [64,2048] 时会被静默截断/丢弃。
+            // 空帧（客户端可发零长度 WS 消息）不消耗这次机会，否则真首包将不再被剥离。
+            // V-02：判定未完成时 probePrivacyPadding 返回 null（填充头被拆帧），本帧不下发、继续等下一帧；
+            // 一旦判定完成 paddingStripped=true，后续数据块零缓冲、零拷贝直通（不进这个分支）。
+            if (!paddingStripped && chunk.byteLength) {
+                const resolved = probePrivacyPadding(chunk, paddingProbe);
+                if (resolved === null) return;
+                paddingStripped = true;
+                chunk = resolved;
+            }
 
             // 测速拦截：WS 本地测速模式下直接处理请求（对齐 cfnew L4641-4644）
             if (wsLocalSpeedTestMode) {
@@ -197,8 +213,14 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
             }
 
             if (remoteSocketWrapper.value) {
-                if (!remoteWriter) {
+                // FIRST_BYTE_TIMEOUT 回退会替换 remoteSocketWrapper.value（common.ts handleRetryConnection），
+                // 旧 writer 仍指向已关闭的 socket；写前校验并解绑重建，否则回退路径永远写不出去。
+                if (!remoteWriter || remoteWriterSocket !== remoteSocketWrapper.value) {
+                    if (remoteWriter) {
+                        try { remoteWriter.releaseLock(); } catch (_) { /* already released */ }
+                    }
                     remoteWriter = remoteSocketWrapper.value.writable.getWriter();
+                    remoteWriterSocket = remoteSocketWrapper.value;
                 }
                 await remoteWriter.write(chunk);
                 return;
@@ -262,6 +284,7 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                     portRemote = 443,
                     addressRemote = "",
                     rawClientData,
+                    trAddrHeader,
                     isUDP,
                 } = await parseTrHeader(chunk, TrPass!);
 
@@ -275,7 +298,7 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                 if (isUDP) {
                     if (portRemote === 53) {
                         isDns = true;
-                        const { write } = await handleUDPOutBound(webSocket, null, log, 'trojan', fetcher);
+                        const { write } = await handleUDPOutBound(webSocket, null, log, 'trojan', fetcher, trAddrHeader);
                         udpStreamWrite = write;
                         await udpStreamWrite(rawClientData);
                         return;
@@ -301,6 +324,10 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                     fetcher
                 );
             } else {
+                // 零长度帧不构成首包（客户端可发零长度 WS 消息），更不构成「非法首包」：
+                // 忽略并继续等待，避免把「首包尚未到达」误判为非法而主动断开。
+                if (!chunk.byteLength) return;
+
                 const firstChunk = chunk;
 
                 const vlResult = tryParseVlHeader(firstChunk, userID!);
@@ -323,6 +350,7 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                     portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? "udp " : "tcp "} `;
 
                     if (hasError) {
+                        closeInvalidFirstPacket(`vless header: ${String(message)}`);
                         throw new Error(message);
                     }
 
@@ -371,6 +399,7 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                         portRemote = 443,
                         addressRemote = "",
                         rawClientData,
+                        trAddrHeader,
                         isUDP,
                     } = await parseTrHeader(firstChunk, TrPass!);
 
@@ -378,13 +407,14 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                     portWithRandomLog = `${portRemote}--${Math.random()} tcp`;
 
                     if (hasError) {
+                        closeInvalidFirstPacket(`trojan header: ${String(message)}`);
                         throw new Error(message);
                     }
 
                     if (isUDP) {
                         if (portRemote === 53) {
                             isDns = true;
-                            const { write } = await handleUDPOutBound(webSocket, null, log, 'trojan', fetcher);
+                            const { write } = await handleUDPOutBound(webSocket, null, log, 'trojan', fetcher, trAddrHeader);
                             udpStreamWrite = write;
                             await udpStreamWrite(rawClientData);
                             return;
@@ -412,6 +442,8 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                     return;
                 }
 
+                // H5 残留：首包既不是合法 VLESS 也不是合法 Trojan —— 已判定非法，主动收口。
+                closeInvalidFirstPacket('neither VLESS nor Trojan');
                 throw new Error('Invalid protocol or authentication failed');
             }
         },
@@ -419,6 +451,7 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
             if (remoteWriter) {
                 try { remoteWriter.releaseLock(); } catch (_) { /* already released */ }
                 remoteWriter = null;
+                remoteWriterSocket = null;
             }
             safeCloseTcpSocket(remoteSocketWrapper.value);
         },
@@ -434,22 +467,12 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
             safeCloseTcpSocket(remoteSocketWrapper.value);
         });
 
-    // 对齐 cfnew 52143dccb：xPadding 抗指纹 —— 101 响应回写随机填充头（100-1000 字符纯噪声）
-    const responseHeaders = new Headers();
-    try {
-        const { userID: respUserID } = globalThis.globalConfig;
-        if (respUserID) {
-            const { header: respPaddingHeader, key: respPaddingKey } = getXPaddingIdentifier(respUserID);
-            const paddingUrl = new URL('https://x.invalid/');
-            paddingUrl.searchParams.set(respPaddingKey, generateXPaddingString(100 + Math.floor(Math.random() * 901)));
-            responseHeaders.set(respPaddingHeader, paddingUrl.toString());
-        }
-    } catch (_) { /* ignore */ }
-
+    // 自定义头泄露修复：不再回写 UUID 派生的填充头。
+    // 旧实现用 getXPaddingIdentifier(uuid) 的头名/键名回写随机填充，等于把 UUID 的 12 个 hex 字符
+    // 送给未认证调用方（48 bit 可枚举），故 101 响应不设任何头。
     return new Response(null, {
         status: 101,
         webSocket: client,
-        headers: responseHeaders,
     });
 }
 
@@ -458,7 +481,10 @@ function parseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
         return { hasError: true, message: "invalid data" };
     }
 
-    const version = new Uint8Array(VLBuffer.slice(0, 1));
+    // F-18：VLESS 响应版本字节按规范固定回 0，不再原样回显客户端输入（原实现把入站字节回写进响应头）。
+    // 入站版本不做拒绝：拒绝只会在握手主路径上新增一个可区分的失败面，而鉴权完全由 UUID 保证，
+    // 非 0 版本不放大攻击面（审计结论），故取「归一为 0 再回显」而非「拒绝」。
+    const version = new Uint8Array([0]);
     const slicedBuffer = new Uint8Array(VLBuffer.slice(1, 17));
     const slicedBufferString = stringify(slicedBuffer);
     const isValidUser = slicedBufferString === userID;
@@ -479,6 +505,11 @@ function parseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
     }
 
     const portIndex = 18 + optLength + 1;
+    // F-17：optLength 可达 255，读端口前必须校验边界，否则 DataView.getUint16 抛 RangeError
+    // （同文件 tryParseVlHeader 已有同型校验）
+    if (VLBuffer.byteLength < portIndex + 2) {
+        return { hasError: true, message: "invalid data" };
+    }
     const portBuffer = VLBuffer.slice(portIndex, portIndex + 2);
     const portRemote = new DataView(portBuffer).getUint16(0);
 
@@ -605,7 +636,8 @@ async function parseTrHeader(chunk: ArrayBuffer, password: string) {
     }
 
     const data = bytes.subarray(58);
-    if (data.byteLength < 6) {
+    // F-16：协议最小请求体 = CMD(1) + ATYP(1) + IPv4(4) + PORT(2) = 8 字节（原写 6，6 字节体读端口会抛 RangeError）
+    if (data.byteLength < 8) {
         return { hasError: true, message: "invalid trojan request data" };
     }
 
@@ -650,12 +682,16 @@ async function parseTrHeader(chunk: ArrayBuffer, password: string) {
         return { hasError: true, message: `address is empty, addressType is ${addrType}` };
     }
 
+    // F-16：读端口前校验 addressIndex + 2 <= len
+    if (data.byteLength < addressIndex + 2) return { hasError: true, message: "invalid data" };
     const port = view.getUint16(addressIndex);
 
     return {
         hasError: false,
         addressRemote: address,
         portRemote: port,
+        // F-12：请求头里的地址头（ATYP + ADDR + PORT），供 Trojan UDP 首包缺地址头时补齐响应帧
+        trAddrHeader: data.slice(1, addressIndex + 2),
         rawClientData: data.slice(addressIndex + 2).buffer,
         isUDP,
     };
@@ -674,7 +710,8 @@ async function tryParseTrHeader(chunk: ArrayBuffer, password: string) {
         if (receivedPassword !== passwordHash) return null;
 
         const data = bytes.subarray(58);
-        if (data.byteLength < 6) return null;
+        // F-16：与 parseTrHeader 保持一致的下限（协议最小 8 字节），避免「检出 trojan 却解析失败」
+        if (data.byteLength < 8) return null;
 
         const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
         const cmd = view.getUint8(0);
@@ -909,19 +946,31 @@ function getDNSCache(dnsQueryPacket: Uint8Array): Uint8Array | null {
     return null;
 }
 
-async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Array<ArrayBuffer> | null, log: Function, protocol: 'vless' | 'trojan', fetcher?: any) {
+async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Array<ArrayBuffer> | null, log: Function, protocol: 'vless' | 'trojan', fetcher?: any, trAddrHeader?: Uint8Array) {
     if (protocol === 'vless') {
         // VLESS UDP DNS: TCP socket to 8.8.4.4:53 with caching (cfnew style)
         let isVLHeaderSent = false;
 
         const socket = connectSocket({ hostname: '8.8.4.4', port: 53 }, fetcher);
-        await Promise.race([
-            socket.opened,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('DNS connect timeout')), 5000))
-        ]);
+        try {
+            await Promise.race([
+                socket.opened,
+                new Promise((_, reject) => setTimeout(() => reject(new Error('DNS connect timeout')), 5000))
+            ]);
+        } catch (connectError) {
+            // F-11：建连超时/失败时这条 socket 还没登记清理钩子（WS 也没关），必须就地关闭，否则残留半开连接
+            safeCloseTcpSocket(socket);
+            throw connectError;
+        }
         log('VLESS DNS TCP connected to 8.8.4.4:53');
 
         const writer = socket.writable.getWriter();
+        // F-11：UDP DNS 复用的 TCP socket 不在 remoteSocketWrapper 纳管范围内（WS 关闭时无人关它），
+        // 在此登记到 WS teardown 钩子：关闭后读循环因 done/error 退出并释放 reader 锁。
+        registerWsCleanup(webSocket, () => {
+            try { writer.releaseLock(); } catch { /* 有未决写时释放会抛，忽略（socket 即将关闭） */ }
+            safeCloseTcpSocket(socket);
+        });
         
         // Response handling with caching
         let dnsBuffer = new Uint8Array(0);
@@ -997,7 +1046,8 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
             } catch (e) {
                 log("VLESS DNS response error: " + e);
             } finally {
-                responseReader.releaseLock();
+                // F-11：teardown 由外部 close 驱动，此时 reader 已无未决读；仍包 try/catch 以防重复释放
+                try { responseReader.releaseLock(); } catch { /* already released */ }
             }
         };
         handleVLESSDNSResponse();
@@ -1109,44 +1159,83 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
             } catch (e) {
                 log("Trojan DNS response error: " + e);
             } finally {
-                reader.releaseLock();
+                // F-11：teardown 由外部 close 驱动，此时 reader 已无未决读；仍包 try/catch 以防重复释放
+                try { reader.releaseLock(); } catch { /* already released */ }
             }
         }
 
         // Connect to DNS server via TCP
         const socket = connectSocket({ hostname: '8.8.4.4', port: 53 }, fetcher);
-        await Promise.race([
-            socket.opened,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('DNS connect timeout')), 5000))
-        ]);
+        try {
+            await Promise.race([
+                socket.opened,
+                new Promise((_, reject) => setTimeout(() => reject(new Error('DNS connect timeout')), 5000))
+            ]);
+        } catch (connectError) {
+            // F-11：建连超时/失败时这条 socket 还没登记清理钩子（WS 也没关），必须就地关闭，否则残留半开连接
+            safeCloseTcpSocket(socket);
+            throw connectError;
+        }
         log('Trojan DNS TCP connected to 8.8.4.4:53');
         handleTrojanUDPResponse(socket);
 
         const writer = socket.writable.getWriter();
+        // F-11：UDP DNS 复用的 TCP socket 不在 remoteSocketWrapper 纳管范围内（WS 关闭时无人关它），
+        // 在此登记到 WS teardown 钩子：关闭后读循环因 done/error 退出并释放 reader 锁。
+        registerWsCleanup(webSocket, () => {
+            try { writer.releaseLock(); } catch { /* 有未决写时释放会抛，忽略（socket 即将关闭） */ }
+            safeCloseTcpSocket(socket);
+        });
+
+        // F-12：请求头已给出目标地址（ATYP+ADDR+PORT），首个 UDP 包可能省略地址头，用它预置响应帧头；
+        // 否则响应帧无从构建（原实现 currentRequestHeader 只在收到带地址头的包后才置位）
+        if (trAddrHeader) currentRequestHeader = trAddrHeader;
 
         return {
             async write(chunk: ArrayBuffer) {
                 const data = new Uint8Array(chunk);
                 
                 // Parse incoming Trojan UDP packet:
-                // Format: addrType (1B) + addr + port (2B) + payloadLen (2B) + CRLF (2B) + payload
-                if (data.length < 7) return;
-                const atype = data[0];
+                // 规范形态：addrType (1B) + addr + port (2B) + payloadLen (2B) + CRLF (2B) + payload
+                // F-12 兼容形态：首个 UDP 包可能省略地址头（目标地址已在请求头里给出），
+                //   即 payloadLen (2B) + CRLF (2B) + payload。原实现 data[0] 非 1/3/4 即静默 return，
+                //   首个 DNS 查询因此被丢弃；此处用请求头地址头补齐，响应帧仍能正确回填。
+                // 另：rawClientData 取自请求头端口字段之后，部分客户端会把请求收尾的 CRLF 一并计入，
+                // 故先跳过可选的前置 CRLF（ATYP 取值 1/3/4，不可能与 0x0d 冲突），再判定形态。
+                let base = 0;
+                if (data.length >= 2 && data[0] === 0x0d && data[1] === 0x0a) base = 2;
+
                 let addrLen = 0;
-                if (atype === 1) addrLen = 4;
-                else if (atype === 4) addrLen = 16;
-                else if (atype === 3) {
-                    addrLen = 1 + data[1];
-                } else return;
+                if (data[base] === 1) addrLen = 4;
+                else if (data[base] === 4) addrLen = 16;
+                else if (data[base] === 3) {
+                    if (data.length < base + 2) return;
+                    addrLen = 1 + data[base + 1];
+                }
 
-                const portIdx = 1 + addrLen;
-                if (data.length < portIdx + 6) return;
+                let addrHeader: Uint8Array;
+                let lenIndex: number;
+                if (addrLen) {
+                    const portIdx = base + 1 + addrLen;
+                    if (data.length < portIdx + 6) return;
 
-                const addrHeader = data.slice(0, portIdx + 2); // addrType + addr + port
+                    addrHeader = data.slice(base, portIdx + 2); // addrType + addr + port
+                    lenIndex = portIdx + 2;
+                } else {
+                    // 无地址头形态：[payloadLen][CRLF][payload]
+                    if (!currentRequestHeader || data.length < base + 4
+                        || data[base + 2] !== 0x0d || data[base + 3] !== 0x0a) {
+                        log('Trojan UDP: packet without address header and no valid request header, dropped');
+                        return;
+                    }
+                    addrHeader = currentRequestHeader;
+                    lenIndex = base;
+                }
+
                 currentRequestHeader = addrHeader;
 
-                const payloadLen = (data[portIdx + 2] << 8) | data[portIdx + 3];
-                const payloadStart = portIdx + 6; // skips port(2B) + length(2B) + CRLF(2B)
+                const payloadLen = (data[lenIndex] << 8) | data[lenIndex + 1];
+                const payloadStart = lenIndex + 4; // skips length(2B) + CRLF(2B)
                 const payloadEnd = payloadStart + payloadLen;
                 if (data.length < payloadEnd) return;
 

@@ -1283,36 +1283,50 @@ function resetPassword(event) {
 }
 
 function renderPortsBlock(ports) {
-    let noneTlsPortsBlock = '', tlsPortsBlock = '';
     const totalPorts = [
         ...(window.origin.includes('workers.dev') ? defaultHttpPorts : []),
         ...defaultHttpsPorts
     ];
 
-    totalPorts.forEach(port => {
-        const isChecked = ports.includes(port) ? 'checked' : '';
-        let clss = '', handler = '';
+    // F21：端口来自 KV / 导入的 .dat，一律用 DOM API 构建（不再拼 innerHTML）；
+    // 原先 TLS 端口的点击行为靠字符串内联 onclick 生成，现改为 addEventListener
+    const tlsPortsContainer = document.getElementById("tls-ports");
+    const noneTlsPortsContainer = document.getElementById("non-tls-ports");
+    tlsPortsContainer.replaceChildren();
+    noneTlsPortsContainer.replaceChildren();
 
-        if (defaultHttpsPorts.includes(port)) {
-            clss = 'class="https"';
-            handler = 'onclick="handlePortChange(event)"';
+    let noneTlsPortCount = 0;
+
+    totalPorts.forEach(port => {
+        const isTlsPort = defaultHttpsPorts.includes(port);
+        const portBlock = document.createElement('div');
+        portBlock.className = 'routing';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.name = port;
+        checkbox.value = 'true';
+        checkbox.checked = ports.includes(port);
+
+        if (isTlsPort) {
+            checkbox.className = 'https';
+            checkbox.addEventListener('click', handlePortChange);
         }
 
-        const portBlock = `
-            <div class="routing">
-                <input type="checkbox" name=${port} ${clss} value="true" ${isChecked} ${handler}>
-                <label>${port}</label>
-            </div>`;
+        const label = document.createElement('label');
+        label.textContent = port;
 
-        defaultHttpsPorts.includes(port)
-            ? tlsPortsBlock += portBlock
-            : noneTlsPortsBlock += portBlock;
+        portBlock.append(checkbox, label);
+
+        if (isTlsPort) {
+            tlsPortsContainer.append(portBlock);
+        } else {
+            noneTlsPortsContainer.append(portBlock);
+            noneTlsPortCount++;
+        }
     });
 
-    document.getElementById("tls-ports").innerHTML = tlsPortsBlock;
-
-    if (noneTlsPortsBlock) {
-        document.getElementById("non-tls-ports").innerHTML = noneTlsPortsBlock;
+    if (noneTlsPortCount) {
         document.getElementById("none-tls").style.display = 'flex';
     }
 }
@@ -1330,49 +1344,96 @@ function addUdpNoise(isManual, noiseIndex, udpNoise) {
     container.className = "inner-container";
     container.id = `udp-noise-${index + 1}`;
 
-    container.innerHTML = `
-        <div class="header-container">
-            <h4>Noise ${index + 1}</h4>
-            <button type="button" class="delete-noise">
-                <span class="material-symbols-rounded">delete</span>
-            </button>      
-        </div>
-        <div class="section">
-            <div class="form-control">
-                <label>😵‍💫 Mode</label>
-                <div>
-                    <select name="udpXrayNoiseMode">
-                        <option value="base64" ${noise.type === 'base64' ? 'selected' : ''}>Base64</option>
-                        <option value="rand" ${noise.type === 'rand' ? 'selected' : ''}>Random</option>
-                        <option value="str" ${noise.type === 'str' ? 'selected' : ''}>String</option>
-                        <option value="hex" ${noise.type === 'hex' ? 'selected' : ''}>Hex</option>
-                        <option value="array" ${noise.type === 'array' ? 'selected' : ''}>Array</option>
-                    </select>
-                </div>
-            </div>
-            <div class="form-control">
-                <label>📦 Packet</label>
-                <div>
-                    <input type="text" name="udpXrayNoisePacket" value="${noise.packet}">
-                </div>
-            </div>
-            <div class="form-control">
-                <label>🎚️ Count</label>
-                <div>
-                    <input type="number" name="udpXrayNoiseCount" value="${noise.count}" min="1" required>
-                </div>
-            </div>
-            <div class="form-control">
-                <label>🕞 Delay</label>
-                <div class="min-max">
-                    <input type="number" name="udpXrayNoiseDelayMin"
-                        value="${noise.delay.split('-')[0]}" min="1" required>
-                    <span> - </span>
-                    <input type="number" name="udpXrayNoiseDelayMax"
-                        value="${noise.delay.split('-')[1]}" min="1" required>
-                </div>
-            </div>
-        </div>`;
+    // F21：noise 的 packet/type/delay/count 来自 KV / 导入的 .dat，
+    // 原先拼进 innerHTML 的属性位（`value="${noise.packet}"`）可被 `"><img onerror=…>` 逃逸；
+    // 现全部改为 textContent / value 赋值，不经过任何 HTML 解析
+    const headerContainer = document.createElement('div');
+    headerContainer.className = 'header-container';
+
+    const noiseTitle = document.createElement('h4');
+    noiseTitle.textContent = `Noise ${index + 1}`;
+
+    const deleteButton = document.createElement('button');
+    deleteButton.type = 'button';
+    deleteButton.className = 'delete-noise';
+    const deleteIcon = document.createElement('span');
+    deleteIcon.className = 'material-symbols-rounded';
+    deleteIcon.textContent = 'delete';
+    deleteButton.append(deleteIcon);
+
+    headerContainer.append(noiseTitle, deleteButton);
+
+    const buildFormControl = labelText => {
+        const formControl = document.createElement('div');
+        formControl.className = 'form-control';
+
+        const label = document.createElement('label');
+        label.textContent = labelText;
+
+        const wrapper = document.createElement('div');
+        formControl.append(label, wrapper);
+
+        return { formControl, wrapper };
+    };
+
+    const section = document.createElement('div');
+    section.className = 'section';
+
+    const modeControl = buildFormControl('😵‍💫 Mode');
+    const modeSelect = document.createElement('select');
+    modeSelect.name = 'udpXrayNoiseMode';
+    [
+        ['base64', 'Base64'],
+        ['rand', 'Random'],
+        ['str', 'String'],
+        ['hex', 'Hex'],
+        ['array', 'Array']
+    ].forEach(([value, text]) => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = text;
+        if (noise.type === value) option.selected = true;
+        modeSelect.append(option);
+    });
+    modeControl.wrapper.append(modeSelect);
+
+    const packetControl = buildFormControl('📦 Packet');
+    const packetInput = document.createElement('input');
+    packetInput.type = 'text';
+    packetInput.name = 'udpXrayNoisePacket';
+    packetInput.value = noise.packet;
+    packetControl.wrapper.append(packetInput);
+
+    const countControl = buildFormControl('🎚️ Count');
+    const countInput = document.createElement('input');
+    countInput.type = 'number';
+    countInput.name = 'udpXrayNoiseCount';
+    countInput.value = noise.count;
+    countInput.min = '1';
+    countInput.required = true;
+    countControl.wrapper.append(countInput);
+
+    const delayControl = buildFormControl('🕞 Delay');
+    delayControl.wrapper.className = 'min-max';
+    const delayMinInput = document.createElement('input');
+    delayMinInput.type = 'number';
+    delayMinInput.name = 'udpXrayNoiseDelayMin';
+    delayMinInput.value = noise.delay.split('-')[0];
+    delayMinInput.min = '1';
+    delayMinInput.required = true;
+    const delaySeparator = document.createElement('span');
+    delaySeparator.textContent = ' - ';
+    const delayMaxInput = document.createElement('input');
+    delayMaxInput.type = 'number';
+    delayMaxInput.name = 'udpXrayNoiseDelayMax';
+    delayMaxInput.value = noise.delay.split('-')[1];
+    delayMaxInput.min = '1';
+    delayMaxInput.required = true;
+    delayControl.wrapper.append(delayMinInput, delaySeparator, delayMaxInput);
+
+    section.append(modeControl.formControl, packetControl.formControl, countControl.formControl, delayControl.formControl);
+
+    container.append(headerContainer, section);
 
     container.querySelector(".delete-noise").addEventListener('click', deleteUdpNoise);
     container.querySelector("select").addEventListener('change', generateUdpNoise);
@@ -1445,7 +1506,7 @@ function deleteUdpNoise(event) {
 }
 
 function renderUdpNoiseBlock(xrayUdpNoises) {
-    document.getElementById("noises").innerHTML = '';
+    document.getElementById("noises").replaceChildren();
     xrayUdpNoises.forEach((noise, index) => {
         addUdpNoise(false, index, noise);
     });

@@ -1,3 +1,16 @@
+/**
+ * C13 核验结论（勿改成 behavior:'classical'）：`Chocolate4U/Iran-clash-rules/release/*.txt` 已实测为
+ * **纯 payload 列表**，不是 ACL4SSR 的 classical 行式（无 `DOMAIN-SUFFIX,` 前缀）：
+ *   - geosite 类（ir/malware/phishing/cryptominers/category-ads-all/nsfw）：逐行 `+.example.com`
+ *   - geoip 类（ircidr/malware-ip/phishing-ip）：逐行裸 CIDR（IPv4 与 IPv6 混排）
+ * 故 routing.ts#addRuleProvider 固定标 `behavior:'domain'`（geosite）/`'ipcidr'`（geoip）是**正确**的：
+ * mihomo 对 domain 规则集按域名模式解析、对 ipcidr 规则集按 CIDR 解析，两者都吃 `+.` 前缀与注释行。
+ * 若改成 'classical'，反而会把这些裸行当成含逗号的规则行而全部失效。
+ * 这些文件的 `# clash rules in text format` 头注释只是格式说明，不构成 behavior 依据。
+ * 本轮离线复核（更可验证的证据）：上游仓库 README 自身的 rule-providers 示例即 `format: text` +
+ * `behavior: domain`（ir/ads/malware 等 .txt），与本文件固定标注同源；geoip 类（*cidr.txt / *-ip.txt）
+ * 为裸 CIDR，对应 'ipcidr'。故 C13 判为「标注与文件格式一致，无需改动」。
+ */
 export function getGeoAssets(): GeoAsset[] {
     const {
         localDNS,

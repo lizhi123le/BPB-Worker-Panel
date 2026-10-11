@@ -1,5 +1,5 @@
 import { isPermanentBlacklisted, recordViolationAndMaybeBan } from "./blacklist";
-import { isPathInDictionary, checkRateLimit, recordRateLimit, writeRateLimitKV } from "./ratelimit";
+import { isPathInDictionary, checkRateLimit, checkRateLimitShared, recordRateLimit, writeRateLimitKV } from "./ratelimit";
 import { camouflageProxy, cf1101Page } from "./camouflage";
 
 /**
@@ -14,6 +14,33 @@ import { camouflageProxy, cf1101Page } from "./camouflage";
 
 interface GuardContext {
     waitUntil(p: Promise<unknown>): void;
+}
+
+/**
+ * WS 升级分支的永久黑名单守卫（H5）：只做永久黑名单检查。
+ *
+ * 路径字典校验不在本函数：F-22 已在 worker.ts 的 WS 分支前置完成（与 HTTP 非内置路径同一判据，
+ *   并豁免根路径与管理员路径），此处不再重复。
+ * 为何不加限流：每一次 WS 连接（含客户端断线自动重连）都是一个请求，
+ *   套用现有「6 次/小时」的路径限流会直接打死所有客户端，可用性损失远大于探测面收益。
+ * 缺 IP / 缺 env.kv 时一律放行：KV 未绑定不能把隧道打死。
+ */
+export async function guardWebsocketBlacklist(request: Request, env: any): Promise<Response | null> {
+    const ip = request.headers.get('CF-Connecting-IP') || '';
+    const kv = env?.kv as KVNamespace | undefined;
+    if (!ip || !kv) return null;
+
+    if (!await isPermanentBlacklisted(ip, kv)) return null;
+
+    console.warn(`[永久黑名单] WS 升级 IP ${ip} 命中永久黑名单，直接拦截`);
+    const reqURL = new URL(request.url);
+    return new Response(await cf1101Page(reqURL.host, ip), {
+        status: 429,
+        headers: {
+            'Content-Type': 'text/html; charset=UTF-8',
+            'Retry-After': '3600'
+        }
+    });
 }
 
 /**
@@ -58,7 +85,9 @@ export async function guardNonBuiltinPath(
     // 2. 路径字典校验 + 限流（字典路径视为合法公开路径，不限流不计数；
     //    仅路径含字典外段才触发限流与违规计数，避免误伤伪装站点正常流量）
     if (!isPathInDictionary(segments)) {
-        if (!checkRateLimit(ip)) {
+        // F17：内存 Map 是 isolate 私有的，换边缘即可把计数清零；内存未超限时再看一次
+        // KV 里的跨边缘计数（每 IP 每窗口至多 1 次读，KV 未绑定/读失败一律放行）。
+        if (!checkRateLimit(ip) || !(await checkRateLimitShared(kv, ip))) {
             console.warn(`[速率限制] IP ${ip} 超过非管理员路径请求限制`);
             if (kv) await writeRateLimitKV(kv, ip, ctx);
             if (ip && kv) ctx.waitUntil(recordViolationAndMaybeBan(ip, kv, ctx));

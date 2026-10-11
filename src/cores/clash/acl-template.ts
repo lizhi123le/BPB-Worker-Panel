@@ -43,6 +43,41 @@ export interface ParsedTemplate {
 const iniTemplateCache = new Map<string, ParsedTemplate | null>();
 const PROVIDER_PREFIX = 'provider_';
 
+/**
+ * ACL 模板接管时被移除的内置分组名（sing-box 出站 tag / Clash proxy-groups 共用同一套命名）。
+ * 两个用途必须同源，否则会留下「组已删除、引用还在」的悬空引用：
+ *   1. `sing-box/configs.ts` 用它把内置分组出站从 outbounds 中过滤掉；
+ *   2. 两端 configs 用它判断 DNS 的 detour 是否指向已被移除的组（见各端 dns.ts#retargetDnsDetour）。
+ * 过滤集合与改写集合一旦不同源，就会出现「组被删了、DNS 引用还在」→ 客户端加载配置失败。
+ */
+export const ACL_BUILTIN_GROUP_TAGS: ReadonlySet<string> = new Set([
+    "✅ Selector",
+    "最佳延迟 🚀",
+    "Warp - 最佳延迟 🚀",
+    "WoW - 最佳延迟 🚀",
+    "🔗 最佳延迟 🚀",
+    "Warp Pro - 最佳延迟 🚀",
+    "WoW Pro - 最佳延迟 🚀"
+]);
+
+/**
+ * 只有 Clash/mihomo 才存在的内置策略名：mihomo 把它们当策略常量解析，但 sing-box 里没有对应出站 tag
+ * （REJECT 是 route 的 action，不是 outbound；PASS/COMPATIBLE/GLOBAL 同理）。
+ * ACL4SSR 默认模板会把 `[]REJECT` 写进分组成员（🛑 广告拦截 等 select 组），透传到 sing-box 即
+ * `selector -> REJECT` 悬空引用、整份配置加载失败。注意 DIRECT 不在此列：它有 sing-box 对应出站
+ * direct，由 generateAclGroups 的 mapMember 归一。
+ */
+const CLASH_ONLY_POLICY_MEMBERS: ReadonlySet<string> = new Set([
+    'REJECT',
+    'REJECT-DROP',
+    'PASS',
+    'COMPATIBLE',
+    'GLOBAL'
+]);
+
+/** Clash/mihomo 恒存在的内置策略名（含 DIRECT），模板规则可直接引用它们。 */
+const CLASH_BUILTIN_POLICIES: ReadonlySet<string> = new Set(['DIRECT', ...CLASH_ONLY_POLICY_MEMBERS]);
+
 /* ----------------------------- INI 文本解析 ----------------------------- */
 
 export function parseIniTemplateText(iniText: string): ParsedTemplate | null {
@@ -236,9 +271,16 @@ export function generateAclGroups(
     opts: GenOptions = {}
 ): GeneratedAcl {
     const { convertLoadBalanceToUrlTest = false, targetClient = 'auto' } = opts;
+    // C4：内置直连 tag 两端不同名——Clash 是内置代理 `DIRECT`（大写），sing-box 是出站 tag `direct`（小写）。
+    // 模板里的 DIRECT 是原样透传的成员名，喂给 sing-box 就变成引用不存在的 tag → 出站解析失败、整份配置不可用。
+    // 故按目标核心给出对应字面量；未显式指定目标核心（auto）时保持历史 Clash 语义（大写 DIRECT）不变。
+    const directTag = targetClient === 'singbox' ? 'direct' : 'DIRECT';
+    // 模板显式书写的内建策略成员（ACL4SSR 常见的 `[]DIRECT`）同样要按核心归一，
+    // Clash 目标下 directTag === 'DIRECT'，此映射恒等 → Clash 输出逐字不变。
+    const mapMember = (name: string) => name === 'DIRECT' ? directTag : name;
     const rulesets = parsed?.rulesets || [];
     const parsedProxyGroups = parsed?.proxyGroups || [];
-    const fallbackNodes = nodeNames.length ? nodeNames : ['DIRECT'];
+    const fallbackNodes = nodeNames.length ? nodeNames : [directTag];
 
     const compileAllRegex = (patterns: (string | undefined)[]) =>
         patterns.map(p => {
@@ -289,10 +331,19 @@ export function generateAclGroups(
                 if (proxyList.length === 0) proxyList = fallbackNodes;
             }
         } else {
-            proxyList = type === 'select' ? ['DIRECT', ...fallbackNodes] : [...fallbackNodes];
+            proxyList = type === 'select' ? [directTag, ...fallbackNodes] : [...fallbackNodes];
         }
-        // 过滤自引用，避免环路
-        proxyList = proxyList.filter(p => p !== pg.name);
+        // 过滤自引用，避免环路；并归一模板里显式书写的大写 DIRECT（仅 sing-box 目标生效）
+        proxyList = proxyList.filter(p => p !== pg.name).map(mapMember);
+        // 仅 sing-box 目标：再滤掉 Clash 专有的内置策略名（如 `[]REJECT`）——它们在 sing-box 里没有出站 tag，
+        // 留着就是 `selector/urltest -> REJECT` 悬空引用。拦截语义不受影响：本过滤只保证配置可加载，
+        // 真正的拦截由 sing-box/configs.ts 前置的 block/bypass reject 规则（buildBlockAndBypassRules）承担。
+        // Clash 目标保留（REJECT 是 mihomo 合法内置策略），故此处只对 singbox 生效。
+        if (targetClient === 'singbox') {
+            proxyList = proxyList.filter(p => !CLASH_ONLY_POLICY_MEMBERS.has(p));
+            // 成员全是哨兵名时（模板只写了 `[]REJECT`）退回节点清单，避免生成 outbounds 为空的组
+            if (proxyList.length === 0) proxyList = fallbackNodes;
+        }
 
         const group: AclGroup = { name: pg.name, type, proxies: proxyList };
         if ((type === 'url-test' || type === 'load-balance' || type === 'fallback') && pg.url) {
@@ -309,7 +360,7 @@ export function generateAclGroups(
         if (g.type === 'select') {
             const idx = g.proxies.indexOf('.*');
             if (idx !== -1) {
-                g.proxies.splice(idx, 1, ...nodeNames, 'DIRECT');
+                g.proxies.splice(idx, 1, ...nodeNames, directTag);
                 g.proxies = [...new Set(g.proxies)].filter(p => p !== g.name);
             }
         }
@@ -322,9 +373,51 @@ export function generateAclGroups(
         ruleProviders.push({ name: `${PROVIDER_PREFIX}${providerIdx++}`, url: item.url, group: item.group });
     }
 
-    const inlineRules = rulesets.filter((r): r is InlineRuleSetEntry => r.type === 'inline');
+    const inlineRules = rulesets
+        .filter((r): r is InlineRuleSetEntry => r.type === 'inline')
+        .filter(r => r.ruleType !== undefined && r.ruleType !== null);
 
     return { groups, ruleProviders, inlineRules };
+}
+
+/* ------------------------- Clash 规则类型白名单 ------------------------- */
+
+/**
+ * C11：mihomo 支持的规则类型白名单（FINAL 单独处理为 MATCH，不在此列）。
+ * ACL4SSR 模板里常见 Clash 不支持的规则行（`SRC-IP-CIDR` / `SRC-PORT` / `IN-PORT` 等），
+ * 原样写入 rules 会被 mihomo 当成未知规则类型而整份配置被拒。故只放行确知支持的类型，
+ * 其余在 buildAclClash 里跳过并 warn（口径与 keepGroup 一致），而不是猜一个替代规则。
+ * 注意：URL-REGEX 是 mihomo 合法类型，模板用它时并不算未知类型。
+ */
+export const CLASH_SUPPORTED_RULE_TYPES: ReadonlySet<string> = new Set([
+    'DOMAIN',
+    'DOMAIN-SUFFIX',
+    'DOMAIN-KEYWORD',
+    'DOMAIN-REGEX',
+    'GEOSITE',
+    'GEOIP',
+    'IP-CIDR',
+    'IP-CIDR6',
+    'IP-SUFFIX',
+    'IP-ASN',
+    'RULE-SET',
+    'PROCESS-NAME',
+    'PROCESS-PATH',
+    'PROCESS-PATH-REGEX',
+    'PROCESS-NAME-REGEX',
+    'UID',
+    'DST-PORT',
+    'SUB-RULE',
+    'MATCH',
+    'AND',
+    'OR',
+    'NOT',
+    'URL-REGEX'
+]);
+
+/** 规则类型是否受 Clash/mihomo 支持（大小写不敏感；模板里 `[]Final` 之类的大小写差异不影响判定）。 */
+export function isSupportedClashRuleType(ruleType: string): boolean {
+    return CLASH_SUPPORTED_RULE_TYPES.has(ruleType.trim().toUpperCase());
 }
 
 /* ------------------------- Clash 组装入口 ------------------------- */
@@ -383,14 +476,35 @@ export async function buildAclClash(
     });
 
     const rules: string[] = [];
+    // 未生成组的规则引用悬空：模板 `ruleset=` 引用的组名必须有对应 `custom_proxy_group`，
+    // 否则 RULE-SET / 普通规则 / MATCH 的策略指向不存在的组（mihomo 加载失败）。
+    // 口径：丢弃该条规则（连同它专属的 rule-provider）并 warn，不猜替代组；
+    // Clash 内置策略（DIRECT/REJECT 等）恒存在，视为已定义。
+    const clashKnownGroups = new Set<string>([...groups.map(g => g.name), ...CLASH_BUILTIN_POLICIES]);
+    const keepGroup = (group: string, ruleLabel: string): boolean => {
+        if (clashKnownGroups.has(group)) return true;
+        console.warn(`[ACL 分组] 丢弃引用未生成分组的规则 ${ruleLabel}: ${group}`);
+        return false;
+    };
     // 1) 规则集引用：RULE-SET,<providerName>,<策略组>
+    const keptProviders: AclRuleProvider[] = [];
     for (const rp of ruleProviders) {
+        if (!keepGroup(rp.group, `RULE-SET,${rp.name}`)) continue;
+        keptProviders.push(rp);
         rules.push(`RULE-SET,${rp.name},${rp.group}`);
     }
-    const providers = buildAclProviders(ruleProviders);
+    const providers = buildAclProviders(keptProviders);
     // 3) 内联规则（模板中 `ruleset=` 的裸规则）仍作为普通规则带策略组
     for (const rule of inlineRules) {
-        if (rule.ruleType.toUpperCase() === 'FINAL') {
+        const isFinal = rule.ruleType.toUpperCase() === 'FINAL';
+        // C11：先按 Clash 支持的规则类型白名单过滤，未知类型原样下发会让 mihomo 拒绝整份配置。
+        // 口径与 keepGroup 一致：丢弃该行并 warn，不猜替代规则（FINAL 走 MATCH，单独放行）。
+        if (!isFinal && !isSupportedClashRuleType(rule.ruleType)) {
+            console.warn(`[ACL 规则] 跳过 Clash 不支持的规则类型 ${rule.ruleType},${rule.ruleVal}: ${rule.group}`);
+            continue;
+        }
+        if (!keepGroup(rule.group, isFinal ? 'MATCH' : `${rule.ruleType},${rule.ruleVal}`)) continue;
+        if (isFinal) {
             rules.push(`MATCH,${rule.group}`);
         } else {
             rules.push(`${rule.ruleType},${rule.ruleVal},${rule.group}`);
@@ -474,7 +588,9 @@ export async function buildAclSingbox(
             return {
                 type: 'selector',
                 tag: g.name,
-                outbounds: [...g.proxies, 'direct'],
+                // C4：g.proxies 的占位展开已注入小写 direct（见 generateAclGroups 的 directTag），
+                // 这里再补一个 direct 可能产生重复成员，故去重（Set 保序，不改变既有成员顺序）
+                outbounds: [...new Set([...g.proxies, 'direct'])],
                 interrupt_exist_connections: false,
             } as SbSelector;
         }
@@ -489,6 +605,17 @@ export async function buildAclSingbox(
         if (g.tolerance) ut.tolerance = g.tolerance;
         return ut as SbUrlTest;
     });
+
+    // 未生成组的规则引用悬空：模板 `ruleset=` 引用的组名必须有对应 `custom_proxy_group`，
+    // 否则 route rule 的 outbound 指向不存在的 tag（sing-box 启动期解析失败、整份配置不可用）。
+    // 口径：丢弃该条规则（URL 规则集连同它的内联 rule_set 一起丢）并 warn，不猜替代组；
+    // 'direct' 是内置直连出站、恒存在，视为已定义。
+    const sbKnownGroups = new Set<string>([...groups.map(g => g.name), 'direct']);
+    const keepGroup = (group: string, ruleLabel: string): boolean => {
+        if (sbKnownGroups.has(group)) return true;
+        console.warn(`[ACL 分组] 丢弃引用未生成分组的规则 ${ruleLabel}: ${group}`);
+        return false;
+    };
 
     // URL provider → inline rule_set
     const ruleSets: AclSingboxResult['ruleSets'] = [];
@@ -510,6 +637,7 @@ export async function buildAclSingbox(
                 ? res.value
                 : { tag: '', rules: [] as Array<Record<string, string[]>>, group: '' };
             if (!val.tag || val.rules.length === 0) return;
+            if (!keepGroup(val.group, `rule_set=${val.tag}`)) return;
             ruleSets.push({ type: 'inline', tag: val.tag, rules: val.rules });
             urlRules.push({ rule_set: val.tag, outbound: val.group });
         });
@@ -523,6 +651,7 @@ export async function buildAclSingbox(
             finalGroup = rule.group || finalGroup;
             continue;
         }
+        if (!keepGroup(rule.group, `${rule.ruleType},${rule.ruleVal}`)) continue;
         const type = rule.ruleType.toLowerCase();
         const ruleObj: RoutingRule = { outbound: rule.group };
         if (type === 'domain') ruleObj.domain = [rule.ruleVal];
@@ -531,11 +660,26 @@ export async function buildAclSingbox(
         else if (type === 'ipcidr' || type === 'ip-cidr') ruleObj.ip_cidr = [rule.ruleVal];
         else if (type === 'geoip') ruleObj.geoip = [rule.ruleVal.toLowerCase()];
         else if (type === 'process') ruleObj.process = [rule.ruleVal];
-        else ruleObj.rule_set = rule.ruleType;
+        else {
+            // C14：未命中已知类型时绝不能把规则类型名（如 `URL-REGEX`）当成 rule_set tag 下发 ——
+            // configs.ts 只并入 blockBypass/acl 的 ruleSets，该 tag 从不定义，sing-box 启动期校验直接失败。
+            // 口径：跳过该条并 warn（与上方 keepGroup / convertClashRulesToSingbox 的未知类型处理一致）。
+            console.warn(`[ACL 规则] 跳过 sing-box 不支持的规则类型 ${rule.ruleType},${rule.ruleVal}: ${rule.group}`);
+            continue;
+        }
         inlineRouteRules.push(ruleObj);
     }
 
-    const final = finalGroup || (groups.length > 0 ? groups[0].name : '✅ Selector');
+    // FINAL 同理：它指向的组必须有定义，否则 route.final 悬空 → 退回下面的默认分组逻辑
+    if (finalGroup && !sbKnownGroups.has(finalGroup)) {
+        console.warn(`[ACL 分组] 丢弃引用未生成分组的规则 FINAL: ${finalGroup}`);
+        finalGroup = undefined;
+    }
+
+    // C3 同源兜底：模板只提供规则、一个分组都没生成时，默认 final 不能是「✅ Selector」——
+    // 接管后该出站已被 sing-box/configs.ts 移除 → route.final 悬空、整份配置加载失败。
+    // 退回 sing-box 一定存在的内置直连出站 direct（它不在 ACL_BUILTIN_GROUP_TAGS 中）。
+    const final = finalGroup || (groups.length > 0 ? groups[0].name : 'direct');
 
     return {
         outboundGroups,

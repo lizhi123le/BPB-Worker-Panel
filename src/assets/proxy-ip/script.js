@@ -8,6 +8,16 @@
 
 loadGeoData();
 
+// 单行提示行（仅静态文案，不承载第三方数据）
+function appendNoticeRow(tableBody, text) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 5;
+    cell.textContent = text;
+    row.appendChild(cell);
+    tableBody.appendChild(row);
+}
+
 async function loadGeoData() {
     const tableBody = document.querySelector("#geo-table tbody");
     try {
@@ -19,11 +29,12 @@ async function loadGeoData() {
         }
 
         if (!body.length) {
-            tableBody.innerHTML = "<tr><td colspan='5'>Failed to get Proxy IPs</td></tr>";
+            tableBody.replaceChildren();
+            appendNoticeRow(tableBody, "Failed to get Proxy IPs");
             return;
         }
 
-        tableBody.innerHTML = "";
+        tableBody.replaceChildren();
 
         body.forEach((item, index) => {
             const row = document.createElement("tr");
@@ -31,24 +42,38 @@ async function loadGeoData() {
                 ? String.fromCodePoint(...[...item.countryCode].map(c => 0x1F1E6 + c.charCodeAt(0) - 65)) 
                 : '';
 
-            row.innerHTML =
-                `
-                    <td>${index + 1}</td>
-                    <td>
-                        <span class="material-symbols-rounded" onclick="copyToClipboard('${item.ip}')">
-                            content_copy
-                        </span>
-                        ${item.ip || "-"}
-                    </td>
-                    <td>${flag} ${item.country || "-"}</td>
-                    <td>${item.city || "-"}</td>
-                    <td>${item.isp || "-"}</td>
-                `;
+            // 第三方字段一律走 textContent / addEventListener，绝不经 innerHTML 或内联事件属性
+            const indexCell = document.createElement("td");
+            indexCell.textContent = index + 1;
+            row.appendChild(indexCell);
+
+            const ipCell = document.createElement("td");
+            const copyIcon = document.createElement("span");
+            copyIcon.className = "material-symbols-rounded";
+            copyIcon.textContent = "content_copy";
+            copyIcon.addEventListener("click", () => copyToClipboard(item.ip));
+            ipCell.appendChild(copyIcon);
+            ipCell.appendChild(document.createTextNode(' ' + (item.ip || "-")));
+            row.appendChild(ipCell);
+
+            const countryCell = document.createElement("td");
+            countryCell.textContent = flag + ' ' + (item.country || "-");
+            row.appendChild(countryCell);
+
+            const cityCell = document.createElement("td");
+            cityCell.textContent = item.city || "-";
+            row.appendChild(cityCell);
+
+            const ispCell = document.createElement("td");
+            ispCell.textContent = item.isp || "-";
+            row.appendChild(ispCell);
+
             tableBody.appendChild(row);
         });
 
     } catch (err) {
-        tableBody.innerHTML = `<tr><td colspan='5'>Error: ${err.message}</td></tr>`;
+        tableBody.replaceChildren();
+        appendNoticeRow(tableBody, `Error: ${err.message}`);
         console.error(err);
     }
 }
