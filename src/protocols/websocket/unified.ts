@@ -109,6 +109,13 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
         console.log(`[${address}:${portWithRandomLog}] ${info}`, event || "");
     };
 
+    // 诊断日志：仅当面板「Log Level」设为 debug 时才输出。
+    // 协议识别是每条连接都会命中的细节，且它揭示客户端用的是 VLESS 还是 Trojan —— 不该进常规 Worker 日志。
+    // 排查首包/填充/early-data 问题时，把面板 Log Level 改成 debug 再复现即可看到。
+    const logDebug = (info: string) => {
+        if (globalThis.settings?.logLevel === 'debug') log(info);
+    };
+
     const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
     const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
 
@@ -333,7 +340,7 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                 const vlResult = tryParseVlHeader(firstChunk, userID!);
                 if (vlResult) {
                     protocolType = 'vless';
-                    log('protocol detected: VLESS');
+                    logDebug('protocol detected: VLESS');
                     // 修复：不能在 write() 回调内再次调用 writableStream.getWriter()（流已被 pipeTo 锁定）
                     // 直接内联处理首包，与 protocolType='vless' 分支逻辑相同
                     const {
@@ -391,7 +398,7 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                 const trResult = await tryParseTrHeader(firstChunk, TrPass!);
                 if (trResult) {
                     protocolType = 'trojan';
-                    log('protocol detected: Trojan');
+                    logDebug('protocol detected: Trojan');
                     // 修复：直接内联处理首包，不重入已锁定的 writableStream
                     const {
                         hasError,
