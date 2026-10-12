@@ -5,7 +5,7 @@ import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutb
 import type { WireguardOutbound, Config, Outbound } from '#types/clash';
 import { buildEntryPortMap, getConfigAddresses, generateRemark, generateWsPath, getProtocols, pickEarlyData, resetRemarkCounter } from '@utils';
 import { sniffer, tun } from './inbounds';
-import { buildAclClash, ACL_BUILTIN_GROUP_TAGS } from './acl-template';
+import { buildAclClash, ACL_BUILTIN_GROUP_TAGS } from '../acl-template';
 import { DEFAULT_ACL_TEMPLATE_URL } from '../../common/defaults';
 
 async function buildConfig(

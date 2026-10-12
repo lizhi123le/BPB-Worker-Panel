@@ -5,7 +5,7 @@ import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutb
 import { Outbound, WireguardEndpoint, Config } from '#types/sing-box';
 import { buildEntryPortMap, getConfigAddresses, generateRemark, generateWsPath, isHttps, getProtocols, pickEarlyData, resetRemarkCounter } from '@utils';
 import { buildMixedInbound, tun } from './inbounds';
-import { buildAclSingbox, ACL_BUILTIN_GROUP_TAGS } from '../clash/acl-template';
+import { buildAclSingbox, ACL_BUILTIN_GROUP_TAGS } from '../acl-template';
 import { DEFAULT_ACL_TEMPLATE_URL } from '../../common/defaults';
 
 async function buildConfig(

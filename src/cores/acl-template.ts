@@ -1,3 +1,14 @@
+/**
+ * ⚠️ 共享模块 —— 本文件同时实现 **Clash** 与 **sing-box** 两端的 ACL4SSR 分组生成，
+ * 因此它位于 `cores/`（两端共同的父目录），而不是 `cores/clash/`。
+ *
+ *   - 共享：模板解析与组展开 —— parseIniTemplateText / fetchAclTemplate / generateAclGroups / ACL_BUILTIN_GROUP_TAGS
+ *   - Clash 专用：buildAclClash / buildAclProviders / CLASH_SUPPORTED_RULE_TYPES / isSupportedClashRuleType
+ *   - sing-box 专用：buildAclSingbox / convertClashRulesToSingbox / AclSingboxResult / REJECT_OUTBOUND_TAG / SbBlockOutbound
+ *
+ * 消费方：cores/clash/configs.ts（buildAclClash）、cores/sing-box/configs.ts（buildAclSingbox）。
+ * 改 sing-box 相关逻辑时**不要只在 `cores/sing-box/` 里 grep** —— 会漏掉本文件（例如曾经的远程规则集字段）。
+ */
 import type {
     Selector as ClashSelector,
     URLTest as ClashUrlTest,
