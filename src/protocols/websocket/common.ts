@@ -1179,7 +1179,11 @@ export function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDat
             const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
 
             if (error) {
-                controller.error(error);
+                // early-data 解析失败：**默认可见**地记一笔（不走 logLevel 门控），
+                // 然后**忽略这段坏数据、继续等真正的首包**。
+                // 改前是 controller.error() 直接断连 —— 客户端随后本可正常发首包，却整条连接被拒，属误伤；
+                // early data 只是可选的加速路径（sec-websocket-protocol），坏掉不该导致连接失败。
+                log(`early data parse failed: ${safeErrorMessage(error)}`);
             } else if (earlyData) {
                 controller.enqueue(earlyData);
             }
