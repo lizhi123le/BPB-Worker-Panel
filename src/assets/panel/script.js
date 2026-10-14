@@ -1176,6 +1176,7 @@ function validateSettings() {
     });
 
     // 出站方式 (qj)：映射为 proxyOnly/proxyDegrade（对齐后端 qj 参数语义）
+    // 下拉显示名：default=Default / only=Proxy Only / no=Direct Target（直连目标）
     const outboundMode = form.outboundMode || 'default';
     form.proxyOnly = outboundMode === 'only';
     form.proxyDegrade = outboundMode === 'no';

@@ -79,7 +79,7 @@ export async function handleWebsocket(request: Request, env: Env): Promise<Respo
         ? queryRm.toLowerCase() !== 'no'
         : (kvRegionMatch ?? true);
 
-    // 3. proxyMode：URL query qj(only=仅走代理/no=代理降级) > KV proxyOnly/proxyDegrade > 默认两者皆 false
+    // 3. proxyMode：URL query qj(only=仅走代理/no=直连目标) > KV proxyOnly/proxyDegrade > 默认两者皆 false
     const effectiveProxyOnly = queryQj === 'only'
         ? true
         : (queryQj === 'no' ? false : (kvProxyOnly ?? false));
@@ -92,17 +92,40 @@ export async function handleWebsocket(request: Request, env: Env): Promise<Respo
         ? [globalThis.wsConfig.envProxyIPs]
         : [];
     // 自定义代理 = 面板手动设置的 proxyIPs 非空，或配置了 env PROXY_IP（envFallbackIPs 非空）。
-    // 写入 wsConfig.hasCustomProxyIPs：未配置自定义代理时直连优先（cfnew 默认策略），
+    // 写入 wsConfig.hasCustomProxyIPs：出站模式用它判断「有没有反代池可走」，
     // 与上方 effectivePanelIPs 的取值链（proxyIPs > envFallbackIPs > DEFAULT_PROXY_IPS）保持一致。
+    // 注意：内置 DEFAULT_PROXY_IPS 属于公共备用中继，不计入 hasCustomProxyIPs。
     const hasCustomProxyIPs = proxyIPs.length > 0 || envFallbackIPs.length > 0;
     const effectivePanelIPs = proxyIPs.length > 0
         ? proxyIPs
         : (envFallbackIPs.length > 0 ? envFallbackIPs : DEFAULT_PROXY_IPS);
+    // 用户显式配置的反代池实体（不含内置 DEFAULT_PROXY_IPS，也不含下方 CF 模式替换的官方直连池）。
+    // CF 模式会把 panelIPs 整份换成官方池，而「仅走代理」要与指定地区保持同一套逻辑
+    // （只要配了反代池就能用），因此单列一份供它拨号。
+    const customProxyPool = hasCustomProxyIPs ? effectivePanelIPs : [];
+
+    // 官方直连 IP 池（面板 officialIPs，未配置则内置 10 个）：只归一化这一次，
+    // 「CF 模式下的 panelIPs」与「出站模式的 CF 内置 IP 池兜底层」共用同一份结果，
+    // 避免两处各算一遍导致内容/顺序不一致。
+    const officialIPsRaw = globalThis.settings.officialIPs?.length
+        ? globalThis.settings.officialIPs
+        : OFFICIAL_DIRECT_IPS;
+    // C-06：非法条目在归一化阶段丢弃；自定义池若整池非法则回退内置官方池，
+    // 避免拨号池为空导致后续选 IP / 拨号直接失败（旧行为是把畸形项当合法 IP 用）。
+    const normalizedOfficial = officialIPsRaw.map(normalizeOfficialIP).filter(Boolean);
+    if (normalizedOfficial.length === 0) {
+        console.warn('[officialIPs] 自定义官方直连条目全部非法，回退内置官方直连池');
+    }
+    const officialPool = normalizedOfficial.length > 0
+        ? normalizedOfficial
+        : OFFICIAL_DIRECT_IPS.map(normalizeOfficialIP).filter(Boolean);
 
     globalThis.wsConfig = {
         ...globalThis.wsConfig,
         proxyMode: proxyIPMode,
         panelIPs: effectivePanelIPs,
+        customProxyPool,
+        officialPool,
         regionMatch: effectiveRegionMatch,
         wkRegion: effectiveWkRegion,
         hasCustomProxyIPs,
@@ -120,18 +143,7 @@ export async function handleWebsocket(request: Request, env: Env): Promise<Respo
     // 出口语义 = 官方 Cloudflare IP（内置 10 个，或面板自定义 officialIPs），
     // 与自定义反代 proxyIPs 无关 —— 反代仅在显式指定地区（wk 非空）时生效。
     if (globalThis.wsConfig.workerRegion === 'CF') {
-        const officialIPs = globalThis.settings.officialIPs?.length
-            ? globalThis.settings.officialIPs
-            : OFFICIAL_DIRECT_IPS;
-        // C-06：非法条目在归一化阶段丢弃；自定义池若整池非法则回退内置官方池，
-        // 避免 panelIPs 为空导致后续选 IP / 拨号直接失败（旧行为是把畸形项当合法 IP 用）。
-        const normalized = officialIPs.map(normalizeOfficialIP).filter(Boolean);
-        if (normalized.length === 0) {
-            console.warn('[officialIPs] 自定义官方直连条目全部非法，回退内置官方直连池');
-        }
-        globalThis.wsConfig.panelIPs = normalized.length > 0
-            ? normalized
-            : OFFICIAL_DIRECT_IPS.map(normalizeOfficialIP).filter(Boolean);
+        globalThis.wsConfig.panelIPs = officialPool;
     }
 
     // 对齐 cfnew：连接时按 workerRegion 动态选择 Proxy IP（服务端选择，不暴露给客户端）

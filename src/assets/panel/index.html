@@ -316,10 +316,11 @@
                             <div class="form-control">
                                 <label for="outboundMode">🚪 Outbound Mode</label>
                                 <div>
-                                    <select id="outboundMode" name="outboundMode">
-                                        <option value="default">Default</option>
-                                        <option value="only">Proxy Only</option>
-                                        <option value="no">Proxy Degrade</option>
+                                    <select id="outboundMode" name="outboundMode"
+                                        title="Proxy priority: upstream proxy > reverse-proxy pool. Default: upstream proxy or reverse-proxy pool configured → proxy first; failures fall back through the reverse-proxy pool and the built-in CF official IP pool, ending with a direct connection. Nothing configured → tries the built-in CF official IP pool first, then a direct connection. Proxy Only: same logic with Worker Region = Official Direct or a specified region — never falls back, any failure closes the connection. Direct Target: direct first — but with Worker Region = Official Direct it uses the built-in CF official IP pool first — then upstream proxy → reverse-proxy pool → CF official IP pool → direct.">
+                                        <option value="default" title="Upstream proxy or reverse-proxy pool configured → proxy first (upstream wins). On failure it falls back to the built-in CF official IP pool, then to a direct connection. Nothing configured → built-in CF official IP pool first, then a direct connection.">Default</option>
+                                        <option value="only" title="Always through a proxy: upstream first, then reverse-proxy pool (the reverse-proxy pool works with Worker Region = Official Direct too, exactly as with a specified region). No fallback — if the proxy fails, the connection is closed. If no proxy is configured at all, the connection is closed immediately.">Proxy Only</option>
+                                        <option value="no" title="Always tries a direct connection to the target first; with Worker Region = Official Direct it uses the built-in CF official IP pool first instead. After a failure or 6s without data it falls back: upstream proxy → reverse-proxy pool → CF official IP pool → direct.">Direct Target</option>
                                     </select>
                                 </div>
                             </div>

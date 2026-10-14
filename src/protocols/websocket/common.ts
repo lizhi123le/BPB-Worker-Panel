@@ -76,11 +76,16 @@ async function connectWithRaceDial(
     targetPort: number,
     rawClientData: ArrayBuffer | undefined,
     log: Function,
-    fetcher?: any
+    fetcher?: any,
+    poolOverride?: string[]
 ): Promise<{ socket: Socket; usedIp: string }> {
     // 1. 获取配置
+    //    poolOverride 供「CF 内置 IP 池」层使用：显式指定官方直连池，
+    //    不读 panelIPs —— 指定地区模式下 panelIPs 是反代池，不是官方池。
     const { panelIPs, envProxyIPs, proxyMode } = globalThis.wsConfig;
-    const proxyIPs = panelIPs?.length ? panelIPs : (envProxyIPs ? [envProxyIPs] : DEFAULT_PROXY_IPS);
+    const proxyIPs = poolOverride?.length
+        ? poolOverride
+        : (panelIPs?.length ? panelIPs : (envProxyIPs ? [envProxyIPs] : DEFAULT_PROXY_IPS));
     
     if (!proxyIPs.length) {
         throw new Error('No proxy IPs available');
@@ -727,6 +732,39 @@ export async function handleTCPOutBound(
     const originalAddress = addressRemote;
     const originalPort = portRemote;
 
+    // —— 出站模式与首跳决策 ——
+    //   hasUpstreamProxy —— 上游 SOCKS5 / HTTP CONNECT 出口代理（settings.upstreamProxy）
+    //   hasProxyPool     —— 用户显式配置的反代池（settings.proxyIPs 或 env PROXY_IP）
+    //                       不含内置 DEFAULT_PROXY_IPS 公共备用中继，也不含 CF 模式下被 handlers
+    //                       替换成的官方直连 IP 池；CF 模式下仅「仅走代理」仍可用它（见下方判定）
+    //   hasOfficialPool  —— CF 内置 / 面板配置的官方直连 IP 池（handlers.ts 归一化后写入 officialPool）
+    //   默认（两者皆 false）→ 有代理则代理首跳（上游优先 → 反代池），否则先打 CF 内置 IP 池；
+    //                        失败一律走回退阶梯（跳过已试级别）→ CF 内置 IP 池 → 直连兜底
+    //   仅走代理（proxyOnly）→ 有代理则代理首跳，失败不回退直接断；一个代理都没配则立即断连，禁止直连出网。
+    //                          逻辑与地区设置无关：官方直连（CF）下同样能用反代池
+    //   直连目标（proxyDegrade，面板显示名 Direct Target）→ 指定地区下恒直连首跳；
+    //                            WK = 官方直连（CF）下首跳改用 CF 内置 IP 池竞速。
+    //                            两者失败后同样按 上游代理 → 反代池 → CF 内置 IP 池 → 直连 回退
+    // 注：proxyIPMode === 'prefix'（NAT64）在上方分支已提前返回，不参与本决策。
+    const { proxyMode, proxyOnly, proxyDegrade, hasCustomProxyIPs, workerRegion } = globalThis.wsConfig as WsConfig;
+    const hasUpstreamProxy = Boolean(globalThis.settings?.upstreamProxy);
+    // 用户显式配置的反代池实体（handlers.ts 已剔除内置 DEFAULT_PROXY_IPS 与 CF 模式的官方直连池）
+    const customProxyPool = globalThis.wsConfig?.customProxyPool?.length ? globalThis.wsConfig.customProxyPool : [];
+    // workerRegion === 'CF'（wk 留空 = 官方直连）时 handlers.ts 会把 panelIPs 换成官方直连 IP 池。
+    // 反代池是否作为代理参与本连接：
+    //   仅走代理（proxyOnly）→ 与指定地区保持同一套逻辑，不受地区设置影响：配了反代池就能用
+    //   默认 / 直连目标       → 只在指定地区生效；CF 模式下反代池不参与，改走官方直连池
+    const hasProxyPool = Boolean(hasCustomProxyIPs) && (proxyOnly || workerRegion !== 'CF');
+    // 「反代池」这一级实际拨的池：指定地区用 panelIPs（handlers 已按 wk 地区收敛候选）；
+    // CF 模式下 panelIPs 已被官方直连池覆盖，仅走代理必须改用用户配置的反代池。
+    const proxyPoolForDial = workerRegion === 'CF' ? customProxyPool : undefined;
+    const hasAnyProxy = hasUpstreamProxy || hasProxyPool;
+    const officialPool = globalThis.wsConfig?.officialPool?.length ? globalThis.wsConfig.officialPool : [];
+    const hasOfficialPool = officialPool.length > 0;
+
+    // 已尝试过的出口级别：回退时跳过，避免对同一级重复拨号（直连兜底不在此列，允许最后重试一次）
+    const triedHops = new Set<'upstream' | 'pool' | 'official'>();
+
     async function connectAndWriteLocal(address: string, port: number, fetcher?: any): Promise<Socket> {
         // if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(address)) address = `${atob('d3d3Lg==')}${address}${atob('LnNzbGlwLmlv')}`;
         const tcpSocket = connectSocket({
@@ -752,74 +790,103 @@ export async function handleTCPOutBound(
         return tcpSocket;
     }
 
-    let hasRetryTriggered = false;
+    let retryInFlight = false;
 
     async function handleRetryConnection(): Promise<void> {
-        if (hasRetryTriggered) return;
-        hasRetryTriggered = true;
+        // 重入保护：回退阶梯本身是异步的，避免并发触发多条回退连接
+        if (retryInFlight) return;
+        retryInFlight = true;
+        try {
+            // 1. 仅走代理（proxyOnly）：任何失败都不回退直连，直接断（防 IP 泄漏，对齐 cfnew 处理重试连接 L4816-4819）
+            if (proxyOnly) {
+                log(`retry: proxy-only mode, closing without fallback for ${originalAddress}:${originalPort}`);
+                safeCloseWebSocket(webSocket);
+                return;
+            }
 
-        // 1. 只走代理模式（proxyOnly）且配置了上游代理：失败即关闭，不回退直连（防 IP 泄漏，对齐 cfnew 处理重试连接 L4816-4819）
-        if (proxyOnly && hasUpstreamProxy) {
-            safeCloseWebSocket(webSocket);
-            return;
-        }
+            // 2. 上游代理：直连目标模式（proxyDegrade）的第一级回退 / 默认模式的第二级（对齐 cfnew L4820-4827）
+            //    回退顺序同样是 上游代理 > 反代池，与首跳优先级一致
+            if (hasUpstreamProxy && !triedHops.has('upstream')) {
+                triedHops.add('upstream');
+                try {
+                    log(`retry: attempting upstream proxy for ${originalAddress}:${originalPort}`);
+                    const upstreamSocket = await connectThroughUpstreamProxy(originalAddress, originalPort, rawClientData, fetcher);
+                    if (upstreamSocket) {
+                        upstreamSocket.closed
+                            .catch(error => console.log('retry upstream-proxy TCP socket closed error', error))
+                            .finally(() => safeCloseWebSocket(webSocket));
 
-        // 2. 代理降级模式（proxyDegrade）且配置了上游代理：直连失败后回退上游代理（对齐 cfnew L4820-4827）
-        if (proxyDegrade && hasUpstreamProxy) {
-            try {
-                log(`retry: attempting upstream proxy for ${originalAddress}:${originalPort}`);
-                const upstreamSocket = await connectThroughUpstreamProxy(originalAddress, originalPort, rawClientData, fetcher);
-                if (upstreamSocket) {
-                    upstreamSocket.closed
-                        .catch(error => console.log('retry upstream-proxy TCP socket closed error', error))
+                        log(`retry upstream-proxy connected to ${originalAddress}:${originalPort}`);
+                        remoteSocket.value = upstreamSocket;
+                        remoteSocketToWS(upstreamSocket, webSocket, VLResponseHeader, null, log);
+                        return;
+                    }
+                    log('retry: upstream proxy unavailable (empty or invalid config)');
+                } catch (upstreamErr) {
+                    log(`retry upstream proxy failed: ${safeErrorMessage(upstreamErr)}`);
+                }
+            }
+
+            // 3. 反代池竞速回退（仅用户显式配置且当前模式生效的反代池）
+            if (hasProxyPool && !triedHops.has('pool')) {
+                triedHops.add('pool');
+                try {
+                    log(`retry: attempting reverse-proxy pool race dial for ${originalAddress}:${originalPort}`);
+                    const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, proxyPoolForDial);
+
+                    tcpSocket.closed
+                        .catch(error => console.log('reverse-proxy pool TCP socket closed error', error))
                         .finally(() => safeCloseWebSocket(webSocket));
 
-                    log(`retry upstream-proxy connected to ${originalAddress}:${originalPort}`);
-                    remoteSocket.value = upstreamSocket;
-                    remoteSocketToWS(upstreamSocket, webSocket, VLResponseHeader, null, log);
+                    log(`reverse-proxy pool connected via ${usedIp}:${originalPort}`);
+                    remoteSocket.value = tcpSocket;
+                    remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
                     return;
+                } catch (poolErr) {
+                    log(`retry: reverse-proxy pool failed: ${safeErrorMessage(poolErr)}`);
+                    console.warn(`Reverse-proxy pool failed: ${poolErr}`);
                 }
-            } catch (upstreamErr) {
-                log(`retry upstream proxy failed: ${safeErrorMessage(upstreamErr)}`);
             }
-        }
 
-        // 3. 代理竞速回退（对齐 cfnew 回退地址 / 备用地址回退 L4829-4869）：直连失败后回退代理 IP 池
-        try {
-            log(`retry: attempting proxy race dial fallback for ${originalAddress}:${originalPort}`);
-            const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
+            // 4. CF 内置 IP 池竞速回退（官方直连池：面板 officialIPs，未配置则内置 10 个）
+            if (hasOfficialPool && !triedHops.has('official')) {
+                triedHops.add('official');
+                try {
+                    log(`retry: attempting CF official IP pool race dial for ${originalAddress}:${originalPort}`);
+                    const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool);
 
-            tcpSocket.closed
-                .catch(error => console.log('proxy race dial fallback TCP socket closed error', error))
-                .finally(() => safeCloseWebSocket(webSocket));
+                    tcpSocket.closed
+                        .catch(error => console.log('CF official pool TCP socket closed error', error))
+                        .finally(() => safeCloseWebSocket(webSocket));
 
-            log(`proxy race dial fallback connected via ${usedIp}:${originalPort}`);
-            remoteSocket.value = tcpSocket;
-            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
-            return;
-        } catch (proxyErr) {
-            log(`retry: proxy race dial fallback failed: ${safeErrorMessage(proxyErr)}`);
-            console.warn(`Proxy race dial fallback failed: ${proxyErr}`);
-        }
+                    log(`CF official pool connected via ${usedIp}:${originalPort}`);
+                    remoteSocket.value = tcpSocket;
+                    remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+                    return;
+                } catch (officialErr) {
+                    log(`retry: CF official pool failed: ${safeErrorMessage(officialErr)}`);
+                    console.warn(`CF official pool failed: ${officialErr}`);
+                }
+            }
 
-        // 4. 直连兜底（最后策略）
-        try {
-            log(`retry: falling back to direct connection for ${originalAddress}:${originalPort}`);
-            const tcpSocket = await connectAndWriteLocal(originalAddress, originalPort, fetcher);
-            tcpSocket.closed
-                .catch(error => console.log('direct TCP socket closed error', error))
-                .finally(() => safeCloseWebSocket(webSocket));
-            remoteSocket.value = tcpSocket;
-            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
-            return;
-        } catch (finalDirectError) {
-            console.error('retry: All connection strategies failed:', finalDirectError);
-            webSocket.close(1011, `All connection strategies failed: ${safeErrorMessage(finalDirectError)}`);
+            // 5. 直连兜底（最后策略）
+            try {
+                log(`retry: falling back to direct connection for ${originalAddress}:${originalPort}`);
+                const tcpSocket = await connectAndWriteLocal(originalAddress, originalPort, fetcher);
+                tcpSocket.closed
+                    .catch(error => console.log('direct TCP socket closed error', error))
+                    .finally(() => safeCloseWebSocket(webSocket));
+                remoteSocket.value = tcpSocket;
+                remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+                return;
+            } catch (finalDirectError) {
+                console.error('retry: All connection strategies failed:', finalDirectError);
+                webSocket.close(1011, `All connection strategies failed: ${safeErrorMessage(finalDirectError)}`);
+            }
+        } finally {
+            retryInFlight = false;
         }
     }
-
-    // 获取 proxyMode 与首跳决策配置（对齐 cfnew 处理值值384 首跳决策）
-    const { proxyMode, proxyOnly, proxyDegrade } = globalThis.wsConfig as WsConfig;
 
     // 模式 1: prefix (NAT64) - 仅前端显式选择时使用（原逻辑不变，失败不回退）
     if (proxyMode === 'prefix') {
@@ -843,56 +910,119 @@ export async function handleTCPOutBound(
         }
     }
 
-    // 对齐 cfnew 首跳决策（处理值值384 L4873）：
-    //   首跳走代理 = 仅走代理 && 实际代理已启用 ? true : 代理降级 ? false : 实际代理已启用
-    // 在 cfnew 中，“代理已启用”严格指代 SOCKS5 / HTTP 上游代理（参数 s / settings.upstreamProxy）。
-    // p（自定义反代 IP / 备用地址池）为回退备用，首跳直连失败或超时才走 p。
-    // 仅走代理（proxyOnly）→ 必走上游代理，失败即关闭（防 IP 泄漏，不回退直连）
-    // 代理降级（proxyDegrade）→ 首跳直连优先，失败回退上游代理，再回退反代 IP
-    // 默认（无代理/未配置上游代理）→ 首跳直连优先，直连失败或无响应超时（6s）回退反代 IP
-    const hasUpstreamProxy = Boolean(globalThis.settings?.upstreamProxy);
-    const firstHopProxy = proxyOnly && hasUpstreamProxy ? true : proxyDegrade ? false : hasUpstreamProxy;
+    // 首跳决策：
+    //   默认有代理 → 代理首跳（上游优先 → 反代池）
+    //   默认无代理 → 先打 CF 内置 IP 池（官方直连），失败再直连兜底
+    //   仅走代理   → 有代理则代理首跳（与地区设置无关，官方直连下同样可用反代池）；
+    //                一个代理都没配 = 立即断连（禁止直连出网）
+    //   直连目标   → 指定地区下恒直连首跳；WK = 官方直连（CF）下先打 CF 内置 IP 池
+    const firstHopProxy = !proxyDegrade && hasAnyProxy;
+    // 首跳改用 CF 内置 IP 池竞速（其余情况首跳直连目标）的两种情况：
+    //   1) 默认模式：上游代理与反代池都没有 —— 任何地区模式下都是「先打官方池，失败/6s 再直连兜底」
+    //   2) 直连目标模式（proxyDegrade）+ WK = 官方直连（CF）：该模式下没有反代池可走，
+    //      「直连优先」这一层的首跳也统一改成官方池竞速，失败/6s 再走阶梯（上游代理 → 直连兜底）
+    // 显式配置的代理优先级不变：有上游代理 / 反代池时，默认模式仍是代理首跳。
+    const firstHopOfficialPool = hasOfficialPool && (
+        (!proxyDegrade && !proxyOnly && !hasAnyProxy)
+        || (proxyDegrade && workerRegion === 'CF')
+    );
 
-    // 首跳走代理（配置了上游代理，且非代理降级模式）
+    // 仅走代理但没有任何代理可用：配置缺失时不允许静默直连出网（真实流量会从 Worker 出口 IP 泄漏）
+    if (proxyOnly && !hasAnyProxy) {
+        log(`proxy-only: no usable proxy (upstream=${hasUpstreamProxy}, pool=${hasProxyPool}, workerRegion=${workerRegion}) for ${originalAddress}:${originalPort}`);
+        webSocket.close(1011, 'Proxy-only mode: no proxy configured');
+        return;
+    }
+
+    // 首跳走代理
     if (firstHopProxy) {
-        try {
-            log(`proxy-first: attempting upstream proxy for ${originalAddress}:${originalPort}`);
-            const upstreamSocket = await connectThroughUpstreamProxy(originalAddress, originalPort, rawClientData, fetcher);
-            if (upstreamSocket) {
-                upstreamSocket.closed
-                    .catch(error => console.log('upstream-proxy TCP socket closed error', error))
-                    .finally(() => safeCloseWebSocket(webSocket));
+        let proxySocket: Socket | null = null;
 
-                log(`upstream-proxy connected to ${originalAddress}:${originalPort}`);
-                remoteSocket.value = upstreamSocket;
-                // 传 retry 回调以便 FIRST_BYTE_TIMEOUT 超时触发回退
-                remoteSocketToWS(upstreamSocket, webSocket, VLResponseHeader, () => {
-                    log(`upstream-proxy: no data within FIRST_BYTE_TIMEOUT, retrying fallback`);
-                    try { upstreamSocket.close?.(); } catch {}
-                    handleRetryConnection();
-                }, log);
-                return;
+        // 优先级：上游代理 > 反代池 —— 上一级可用就不再尝试下一级；两级都失败才进入回退/断连
+        // 第一优先：上游代理
+        if (hasUpstreamProxy) {
+            triedHops.add('upstream');
+            try {
+                log(`proxy-first: attempting upstream proxy for ${originalAddress}:${originalPort}`);
+                proxySocket = await connectThroughUpstreamProxy(originalAddress, originalPort, rawClientData, fetcher);
+                if (!proxySocket) log('proxy-first: upstream proxy unavailable (empty or invalid config)');
+            } catch (upstreamError) {
+                log(`upstream-proxy failed: ${safeErrorMessage(upstreamError)}`);
+                console.warn(`Upstream proxy failed: ${upstreamError}`);
             }
-            // proxyOnly：上游代理配置非空但非法/解析失败时 connectThroughUpstreamProxy 返回 null（不抛错），
-            // 此处必须阻断，否则会穿透到下方直连竞速拨号，真实流量从 Worker 出口 IP 泄漏
-            if (!upstreamSocket && proxyOnly) {
-                log(`proxy-only: upstream proxy unavailable for ${originalAddress}:${originalPort}`);
-                webSocket.close(1011, 'Proxy-only mode: upstream proxy unavailable');
-                return;
+        }
+
+        // 第二优先：用户配置的反代池
+        if (!proxySocket && hasProxyPool) {
+            triedHops.add('pool');
+            try {
+                log(`proxy-first: attempting race dial through reverse-proxy pool for ${originalAddress}:${originalPort}`);
+                const { socket } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, proxyPoolForDial);
+                proxySocket = socket;
+            } catch (poolError) {
+                log(`reverse-proxy pool failed: ${safeErrorMessage(poolError)}`);
+                console.warn(`Reverse-proxy pool failed: ${poolError}`);
             }
-        } catch (upstreamError) {
-            log(`upstream-proxy failed: ${safeErrorMessage(upstreamError)}`);
-            console.warn(`Upstream proxy failed: ${upstreamError}`);
-            if (proxyOnly) {
-                webSocket.close(1011, `Proxy-only mode failed: ${safeErrorMessage(upstreamError)}`);
-                return;
-            }
+        }
+
+        if (proxySocket) {
+            const activeSocket = proxySocket;
+            activeSocket.closed
+                .catch(error => console.log('proxy-first TCP socket closed error', error))
+                .finally(() => safeCloseWebSocket(webSocket));
+
+            log(`proxy-first connected to ${originalAddress}:${originalPort}`);
+            remoteSocket.value = activeSocket;
+            // 传 retry 回调以便 FIRST_BYTE_TIMEOUT 超时触发回退（仅走代理时回调内直接断连）
+            remoteSocketToWS(activeSocket, webSocket, VLResponseHeader, () => {
+                log(`proxy-first: no data within FIRST_BYTE_TIMEOUT, retrying fallback`);
+                try { activeSocket.close?.(); } catch {}
+                handleRetryConnection();
+            }, log);
+            return;
+        }
+
+        // 首跳代理不可用
+        if (proxyOnly) {
+            log(`proxy-only: first hop proxy failed for ${originalAddress}:${originalPort}, closing`);
+            webSocket.close(1011, 'Proxy-only mode: proxy connection failed');
+            return;
+        }
+
+        // 默认模式：首跳代理全失败 → 回退阶梯（反代池 → CF 内置 IP 池 → 直连兜底）
+        await handleRetryConnection();
+        return;
+    }
+
+    // 首跳打 CF 内置 IP 池（默认模式无代理 / 官方直连模式下的直连目标模式）：
+    // 失败或 6s 无首字节 → 回退阶梯；默认模式无代理时阶梯里只剩直连兜底
+    if (firstHopOfficialPool) {
+        triedHops.add('official');
+        try {
+            log(`official-pool-first: attempting CF official IP pool race dial for ${originalAddress}:${originalPort}`);
+            const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool);
+
+            tcpSocket.closed
+                .catch(error => console.log('official-pool-first TCP socket closed error', error))
+                .finally(() => safeCloseWebSocket(webSocket));
+
+            log(`official-pool-first connected via ${usedIp}:${originalPort}`);
+            remoteSocket.value = tcpSocket;
+            remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, () => {
+                log('official-pool-first: no data within FIRST_BYTE_TIMEOUT, retrying fallback');
+                try { tcpSocket.close?.(); } catch {}
+                handleRetryConnection();
+            }, log);
+            return;
+        } catch (officialFirstErr) {
+            log(`official-pool-first failed: ${safeErrorMessage(officialFirstErr)}`);
+            console.warn(`CF official pool first hop failed: ${officialFirstErr}`);
             await handleRetryConnection();
             return;
         }
     }
 
-    // 首跳走直连（默认策略 / 代理降级首跳）：直连竞速拨号
+    // 首跳打目标直连（指定地区下的直连目标模式 / 官方池不可用）：直连竞速拨号
     try {
         log(`attempting direct race dial for ${originalAddress}:${originalPort}`);
         const { socket: tcpSocket, usedIp } = await connectWithDirectRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
