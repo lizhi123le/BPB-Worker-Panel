@@ -1276,3 +1276,145 @@ export function selectProxyIPByRegion(proxyIPs: string[], workerRegion: string):
     proxyIpRoundRobin = (proxyIpRoundRobin + 1) % RR_MOD;
     return tagged[idx].entry;
 }
+
+// ── 目标是否为 Cloudflare 承载（出站模式「目标识别式」首跳决策用） ──
+// 网段来源：Cloudflare 官方 https://api.cloudflare.com/client/v4/ips
+// （etag 38f79d050aa027e3be3865e495dcc9bc：v4 15 段 + v6 7 段）。
+// 与仓库其它地址表一致，用 base64 存放避免静态特征；官方调整网段时需同步更新这两条常量。
+const 官方CF网段V4 = atob('MTczLjI0NS40OC4wLzIwLDEwMy4yMS4yNDQuMC8yMiwxMDMuMjIuMjAwLjAvMjIsMTAzLjMxLjQuMC8yMiwxNDEuMTAxLjY0LjAvMTgsMTA4LjE2Mi4xOTIuMC8xOCwxOTAuOTMuMjQwLjAvMjAsMTg4LjExNC45Ni4wLzIwLDE5Ny4yMzQuMjQwLjAvMjIsMTk4LjQxLjEyOC4wLzE3LDE2Mi4xNTguMC4wLzE1LDEwNC4xNi4wLjAvMTMsMTA0LjI0LjAuMC8xNCwxNzIuNjQuMC4wLzEzLDEzMS4wLjcyLjAvMjI=');
+const 官方CF网段V6 = atob('MjQwMDpjYjAwOjovMzIsMjYwNjo0NzAwOjovMzIsMjgwMzpmODAwOjovMzIsMjQwNTpiNTAwOjovMzIsMjQwNTo4MTAwOjovMzIsMmEwNjo5OGMwOjovMjksMmMwZjpmMjQ4OjovMzI=');
+
+/** IPv4 点分十进制 → 32 位无符号整数；非法返回 null */
+function ipv4ToInt(ip: string): number | null {
+    const parts = ip.trim().split('.');
+    if (parts.length !== 4) return null;
+    let value = 0;
+    for (const part of parts) {
+        if (!/^\d{1,3}$/.test(part)) return null;
+        const octet = Number(part);
+        if (octet > 255) return null;
+        value = value * 256 + octet;
+    }
+    return value;
+}
+
+/** IPv6 文本 → 8 段 16 位数组；非法返回 null（不支持 ::ffff:127.0.0.1 这类内嵌 IPv4 写法） */
+function ipv6ToWords(ip: string): number[] | null {
+    let text = ip.trim();
+    if (text.startsWith('[') && text.endsWith(']')) text = text.slice(1, -1);
+    if (text.includes('%')) text = text.split('%')[0];   // 去掉 zone id
+    if (!text.includes(':')) return null;
+
+    const halves = text.split('::');
+    if (halves.length > 2) return null;
+
+    const parseGroups = (value: string): number[] | null => {
+        if (!value) return [];
+        const groups: number[] = [];
+        for (const group of value.split(':')) {
+            if (!/^[0-9a-fA-F]{1,4}$/.test(group)) return null;
+            groups.push(parseInt(group, 16));
+        }
+        return groups;
+    };
+
+    const head = parseGroups(halves[0]);
+    const tail = halves.length === 2 ? parseGroups(halves[1]) : [];
+    if (!head || !tail) return null;
+    if (halves.length === 1) return head.length === 8 ? head : null;
+
+    const missing = 8 - head.length - tail.length;
+    if (missing < 1) return null;
+    return [...head, ...new Array<number>(missing).fill(0), ...tail];
+}
+
+/** IPv6 地址是否落在 base/prefix 网段内 */
+function ipv6InPrefix(words: number[], base: number[], prefix: number): boolean {
+    let remaining = prefix;
+    for (let i = 0; i < 8 && remaining > 0; i++) {
+        if (remaining >= 16) {
+            if (words[i] !== base[i]) return false;
+            remaining -= 16;
+        } else {
+            const mask = (0xffff << (16 - remaining)) & 0xffff;
+            if ((words[i] & mask) !== (base[i] & mask)) return false;
+            remaining = 0;
+        }
+    }
+    return true;
+}
+
+/** 解析 Cloudflare v4 网段表 → [起始, 结束] 区间（非法条目丢弃） */
+const CF_V4_RANGES: [number, number][] = 官方CF网段V4.split(',').flatMap(cidr => {
+    const [base, lenRaw] = cidr.trim().split('/');
+    const start = ipv4ToInt(base ?? '');
+    const len = Number(lenRaw);
+    if (start === null || !Number.isInteger(len) || len < 0 || len > 32) return [];
+    return [[start, start + 2 ** (32 - len) - 1] as [number, number]];
+});
+
+/** 解析 Cloudflare v6 网段表（非法条目丢弃） */
+const CF_V6_RANGES: { base: number[]; prefix: number }[] = 官方CF网段V6.split(',').flatMap(cidr => {
+    const [base, lenRaw] = cidr.trim().split('/');
+    const words = ipv6ToWords(base ?? '');
+    const prefix = Number(lenRaw);
+    if (!words || !Number.isInteger(prefix) || prefix < 0 || prefix > 128) return [];
+    return [{ base: words, prefix }];
+});
+
+/** IP 是否落在 Cloudflare 公布的网段内（v4 + v6） */
+export function isCloudflareIP(ip: string): boolean {
+    const clean = ip.trim().replace(/^\[|\]$/g, '');
+    if (!clean) return false;
+    const v4 = ipv4ToInt(clean);
+    if (v4 !== null) return CF_V4_RANGES.some(([start, end]) => v4 >= start && v4 <= end);
+    const words = ipv6ToWords(clean);
+    if (!words) return false;
+    return CF_V6_RANGES.some(range => ipv6InPrefix(words, range.base, range.prefix));
+}
+
+// 目标域名解析缓存：出站模式的目标分类与直连竞速共用，同一域名不再重复 DoH。
+// TTL 与既有 DoH 结果缓存同口径（有结果 10 分钟、空结果 30 秒）。
+const _targetDnsCache = new Map<string, { ipv4: string[]; ipv6: string[]; time: number; empty: boolean }>();
+const TARGET_DNS_TTL = 10 * 60 * 1000;
+const TARGET_DNS_EMPTY_TTL = 30 * 1000;
+const TARGET_DNS_CACHE_MAX = 200;
+
+/** 目标域名解析（A + AAAA，带 LRU 缓存） */
+export async function resolveTargetDNS(domain: string): Promise<DnsResult> {
+    const key = domain.toLowerCase();
+    const cached = _targetDnsCache.get(key);
+    if (cached && Date.now() - cached.time < (cached.empty ? TARGET_DNS_EMPTY_TTL : TARGET_DNS_TTL)) {
+        _targetDnsCache.delete(key);   // 命中即刷新 LRU 顺序
+        _targetDnsCache.set(key, cached);
+        return { ipv4: cached.ipv4, ipv6: cached.ipv6 };
+    }
+    if (cached) _targetDnsCache.delete(key);
+
+    const result = await resolveDNS(domain, false);
+    _targetDnsCache.set(key, {
+        ipv4: result.ipv4,
+        ipv6: result.ipv6,
+        time: Date.now(),
+        empty: result.ipv4.length === 0 && result.ipv6.length === 0,
+    });
+    if (_targetDnsCache.size > TARGET_DNS_CACHE_MAX) {
+        _targetDnsCache.delete(_targetDnsCache.keys().next().value!);
+    }
+    return result;
+}
+
+/** 目标是否由 Cloudflare 承载：IP 字面量直接判段，域名解析后 A / AAAA 任一命中 CF 网段即为真。
+ *  解析失败或解析不到地址 → false（首跳按直连目标处理）。
+ *  注意：误判不会导致断流 —— 池虽然从首跳消失，但仍留在回退阶梯里兜底。 */
+export async function isCloudflareTarget(address: string): Promise<boolean> {
+    const clean = (address || '').trim();
+    if (!clean) return false;
+    if (ipv4ToInt(clean) !== null || ipv6ToWords(clean)) return isCloudflareIP(clean);
+    try {
+        const { ipv4, ipv6 } = await resolveTargetDNS(clean);
+        return ipv4.some(isCloudflareIP) || ipv6.some(isCloudflareIP);
+    } catch {
+        return false;
+    }
+}

@@ -1,4 +1,4 @@
-import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS } from '@utils';
+import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget } from '@utils';
 import { safeErrorMessage, randomUserAgent } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
@@ -253,8 +253,10 @@ async function connectWithDirectRaceDial(
         pool = [targetAddress];
     } else {
         log(`resolving ${targetAddress} via DoH for direct dial...`);
-        const { ipv4, ipv6 } = await resolveDNS(targetAddress, true);
-        pool = [...ipv4, ...ipv6.map(v6 => `[${v6}]`)];
+        // 与出站模式的目标分类共用同一份解析缓存（A + AAAA），同一域名不再重复 DoH；
+        // 这里只取 IPv4，保持既有拨号语义（原 resolveDNS(..., true) 同样只返回 v4）
+        const { ipv4 } = await resolveTargetDNS(targetAddress);
+        pool = [...ipv4];
     }
 
     if (pool.length === 0) {
@@ -738,12 +740,14 @@ export async function handleTCPOutBound(
     //                       不含内置 DEFAULT_PROXY_IPS 公共备用中继，也不含 CF 模式下被 handlers
     //                       替换成的官方直连 IP 池；CF 模式下仅「仅走代理」仍可用它（见下方判定）
     //   hasOfficialPool  —— CF 内置 / 面板配置的官方直连 IP 池（handlers.ts 归一化后写入 officialPool）
-    //   默认（两者皆 false）→ 配了上游代理则上游代理首跳，否则直连目标首跳；
-    //                        失败一律走回退阶梯（跳过已试级别）→ 上游代理 → 反代池 → 官方池 → 直连兜底
+    //   默认（两者皆 false）→ 配了上游代理则上游代理首跳；否则按目标分类：
+    //                        目标命中 Cloudflare 网段 → 池首跳（反代池 → 官方池），否则直连目标首跳
     //   仅走代理（proxyOnly）→ 有代理则代理首跳（上游优先 → 反代池），失败不回退、直接断；
     //                          一个代理都没配则退化为直连目标首跳
     //   直连目标（proxyDegrade，面板显示名 Direct Target）→ 恒直连目标首跳，失败按同一阶梯回退
-    // 注：反代池 / 官方池只承载 Cloudflare CDN 目标，任何模式都不拿它们做首跳（见下方首跳决策注释）。
+    // 注：反代池 / 官方池只承载 Cloudflare CDN 目标，所以只有「目标命中 CF 网段、未配上游代理、
+    //     且非仅走代理/直连目标」时才拿它们做首跳；其余情况池一律留在回退阶梯里兜底。
+    //     首跳失败后统一按 上游代理 → 反代池 → 官方池 → 直连 回退（跳过已试级别）。
     // 注：proxyIPMode === 'prefix'（NAT64）在上方分支已提前返回，不参与本决策。
     const { proxyMode, proxyOnly, proxyDegrade, hasCustomProxyIPs, workerRegion } = globalThis.wsConfig as WsConfig;
     const hasUpstreamProxy = Boolean(globalThis.settings?.upstreamProxy);
@@ -909,18 +913,25 @@ export async function handleTCPOutBound(
         }
     }
 
-    // 首跳决策（反代池 / 官方池一律只作回退，不做首跳）：
-    //   默认     → 配了上游代理则上游代理首跳，否则直连目标首跳
+    // 首跳决策（池只在「目标确实由 Cloudflare 承载」时才做首跳）：
+    //   默认     → 配了上游代理则上游代理首跳；否则先解析目标：
+    //              命中 Cloudflare 网段 → 池首跳（反代池优先 → 官方池）；否则直连目标首跳
     //   直连目标 → 恒直连目标首跳
     //   仅走代理 → 有代理（上游或反代池）则代理首跳；一个代理都没配则退化为直连目标首跳
     //
-    // 为什么池不能做首跳：反代池与官方池都只承载 Cloudflare CDN 目标
+    // 为什么必须做目标识别：反代池与官方池都只承载 Cloudflare CDN 目标
     // （docs/configuration/vless-trojan「Proxy IP」节：for connecting to Cloudflare CDN addresses），
     // 拨号时写进池 socket 的载荷是 VLESS 头之后的字节、不含目标地址
     // （resolveProxyIPPool 只把 targetDomain 当缓存键与洗牌种子，不参与路由）。
-    // 一旦把它提成首跳，非 CF 目标就会拿到错误路由；而池 socket 的 TCP 是通的、会有数据回来，
-    // 首字节超时（6s）不会触发，回退也就不会发生 —— 表现为节点整体不通。
+    // 对非 CF 目标，池 socket 的 TCP 可能是通的、还会有数据回来，6s 首字节兜底不触发、回退不发生，
+    // 表现为节点整体不通 —— 所以非 CF 目标必须直连优先，CF 目标才先走池。
     const firstHopProxy = !proxyDegrade && (proxyOnly ? hasAnyProxy : hasUpstreamProxy);
+    const hasAnyPool = hasProxyPool || hasOfficialPool;
+    const needsTargetProbe = !proxyDegrade && !proxyOnly && !hasUpstreamProxy && hasAnyPool;
+    const targetIsCF = needsTargetProbe ? await isCloudflareTarget(originalAddress) : false;
+    if (needsTargetProbe) {
+        log(`target-check: ${originalAddress} → ${targetIsCF ? 'Cloudflare range, pool-first' : 'non-Cloudflare, direct-first'}`);
+    }
 
     // 仅走代理但一个代理都没配：退化为直连目标首跳（不再硬断，避免配置缺失直接不可用）
     if (proxyOnly && !hasAnyProxy) {
@@ -982,12 +993,60 @@ export async function handleTCPOutBound(
             return;
         }
 
-        // 默认模式：首跳代理全失败 → 回退阶梯（反代池 → CF 内置 IP 池 → 直连兜底）
+        // 首跳代理全失败（默认模式配了上游代理）→ 回退阶梯（反代池 → 官方池 → 直连兜底）
         await handleRetryConnection();
         return;
     }
 
-    // 首跳打目标直连（默认模式未配上游代理 / 直连目标模式 / 仅走代理但无代理可退）：
+    // 首跳走池：目标命中 Cloudflare 网段（池才是这类目标的正确通道）
+    if (needsTargetProbe && targetIsCF) {
+        let poolSocket: Socket | null = null;
+
+        // 优先级：反代池 > 官方池
+        if (hasProxyPool) {
+            triedHops.add('pool');
+            try {
+                log(`pool-first: reverse-proxy pool race dial for ${originalAddress}:${originalPort}`);
+                const { socket } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, proxyPoolForDial);
+                poolSocket = socket;
+            } catch (poolError) {
+                log(`pool-first reverse-proxy pool failed: ${safeErrorMessage(poolError)}`);
+            }
+        }
+        if (!poolSocket && hasOfficialPool) {
+            triedHops.add('official');
+            try {
+                log(`pool-first: CF official IP pool race dial for ${originalAddress}:${originalPort}`);
+                const { socket } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool);
+                poolSocket = socket;
+            } catch (officialError) {
+                log(`pool-first CF official pool failed: ${safeErrorMessage(officialError)}`);
+            }
+        }
+
+        if (poolSocket) {
+            const activeSocket = poolSocket;
+            activeSocket.closed
+                .catch(error => console.log('pool-first TCP socket closed error', error))
+                .finally(() => safeCloseWebSocket(webSocket));
+
+            log(`pool-first connected to ${originalAddress}:${originalPort}`);
+            remoteSocket.value = activeSocket;
+            remoteSocketToWS(activeSocket, webSocket, VLResponseHeader, () => {
+                log('pool-first: no data within FIRST_BYTE_TIMEOUT, retrying fallback');
+                try { activeSocket.close?.(); } catch {}
+                handleRetryConnection();
+            }, log);
+            return;
+        }
+
+        // 池全失败 → 回退阶梯（此处未配上游代理，阶梯里只剩直连兜底）
+        log(`pool-first: all pools failed for ${originalAddress}:${originalPort}, falling back`);
+        await handleRetryConnection();
+        return;
+    }
+
+    // 首跳打目标直连（默认模式未配上游代理且目标非 CF / 直连目标模式 / 仅走代理但无代理可退）：
     // 直连竞速拨号；失败或 6s 无首字节 → 回退阶梯（上游代理 → 反代池 → 官方池 → 直连兜底）
     try {
         log(`attempting direct race dial for ${originalAddress}:${originalPort}`);
