@@ -41,14 +41,12 @@ declare global {
         // 仅「仅走代理」保持与指定地区同一套逻辑（配了反代池就能用 customProxyPool 拨号）。
         hasCustomProxyIPs?: boolean;
         // 出站模式首跳决策（面板 Outbound Mode / URL query qj）
-        // proxyOnly=true    → 有代理（上游代理或自定义反代池）则代理首跳，失败不回退、直接断；
-        //                     与地区设置无关（官方直连下同样可用自定义反代池）；
-        //                     一个代理都没配则立即断连，禁止直连出网（防 IP 泄漏）
-        // proxyDegrade=true（面板显示名 Direct Target / 直连目标）→ 指定地区下恒直连首跳；
-        //                     WK = 官方直连（CF）下首跳改用 CF 内置 IP 池竞速。
-        //                     两者失败后按 上游代理 → 反代池 → CF 内置 IP 池 → 直连 回退
-        // 两者皆 false（默认）→ 有代理则代理首跳（上游优先 → 反代池），否则首跳先打 CF 内置 IP 池；
-        //                     失败一律走回退阶梯（跳过已试级别）→ CF 内置 IP 池 → 直连兜底
+        // 反代池与官方直连池只承载 Cloudflare CDN 目标，因此任何模式都不拿它们做首跳，只作回退。
+        // proxyOnly=true    → 有代理（上游代理或反代池）则代理首跳，失败不回退、直接断；
+        //                     一个代理都没配则退化为直连目标首跳
+        // proxyDegrade=true（面板显示名 Direct Target / 直连目标）→ 恒直连目标首跳
+        // 两者皆 false（默认）→ 配了上游代理则上游代理首跳，否则直连目标首跳
+        // 首跳失败后统一按 上游代理 → 反代池 → CF 内置 IP 池 → 直连 回退
         proxyOnly?: boolean;
         proxyDegrade?: boolean;
     }
