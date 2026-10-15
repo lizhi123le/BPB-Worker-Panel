@@ -369,7 +369,24 @@ export async function resolveUrlEntries(entries: string[], env?: Env): Promise<s
 
 // ── DoH dual-source constants (对齐 edgetunnel DoH 双源: Cloudflare + Google) ──
 const CF_DOH = 'https://cloudflare-dns.com/dns-query';
-const GOOGLE_DOH = 'https://dns.google/dns-query';
+// ★ 修的是「第二源恒死」，**不是** IPv6 症状的成因（不要误读本条注释）：
+//   原值 `https://dns.google/dns-query` 是 RFC8484 的线格式端点，不接受 name/type 参数 ——
+//   实测 `https://dns.google/dns-query?name=ipv6.test-ipv6.com&type=AAAA` 恒返回 HTTP 400，响应体是
+//   HTML（"RFC8484 handler at /dns-query received parameter 'name', which it does not accept.
+//   Did you intend to pass the 'dns' parameter, or call the JSON handler at /resolve"），
+//   于是本文件 fetchDNSRecords 里 response.json() 直接抛错 → dualSourceResolve 的 allSettled 把该源
+//   判为 rejected，**第二源从未生效**（dohQueryRaw 的 `.william` TXT 兜底同理，一直是死代码）。
+//   但 dualSourceResolve 是「先 CF 后 Google，取第一个非空」，而 CF_DOH 这个 JSON DoH 端点本身可用
+//   （Cloudflare 官方文档的 dns-json 用法），所以生产上 A/AAAA 一直由 CF 提供：本改动只是**补回
+//   冗余**（CF DoH 取不到 / 被墙时还有 AAAA 来源），IPv6 症状的根因在
+//   protocols/websocket/common.ts#connectWithDirectRaceDial 丢掉 AAAA。
+//   代价（须知）：dualSourceResolve 用 Promise.allSettled 会等**两个源都返回**，改前死源是快速 400
+//   失败，改后若某机房到 dns.google 不通，每个记录类型最多多等一次 AbortSignal.timeout(10s)；
+//   该源是必要的冗余，但若想彻底零风险可只保留 CF 单源。
+//   正确值与 cfnew 一致（cfnew L193 `https://dns.google/resolve`）。
+//   /resolve 实测：`https://dns.google/resolve?name=ipv6.test-ipv6.com&type=AAAA`
+//   → {"Status":0,...,"Answer":[{"type":28,"data":"2400:8905::2000:6bff:fe22:d426"}]}，字段形状与 CF 一致。
+const GOOGLE_DOH = 'https://dns.google/resolve';
 
 export async function resolveDNS(domain: string, onlyIPv4 = false): Promise<DnsResult> {
     const cfBase = `${CF_DOH}?name=${encodeURIComponent(domain)}`;
@@ -626,6 +643,69 @@ export function isIPv6(address: string): boolean {
     const ipv6BracketPattern = /^\[(?:(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,7}:|::(?:[a-fA-F0-9]{1,4}:){0,7}|(?:[a-fA-F0-9]{1,4}:){1,6}:[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,5}(?::[a-fA-F0-9]{1,4}){1,2}|(?:[a-fA-F0-9]{1,4}:){1,4}(?::[a-fA-F0-9]{1,4}){1,3}|(?:[a-fA-F0-9]{1,4}:){1,3}(?::[a-fA-F0-9]{1,4}){1,4}|(?:[a-fA-F0-9]{1,4}:){1,2}(?::[a-fA-F0-9]{1,4}){1,5}|[a-fA-F0-9]{1,4}:(?::[a-fA-F0-9]{1,4}){1,6})\](?:\/(1[0-1][0-9]|12[0-8]|[0-9]?[0-9]))?$/;
     const ipv6RawPattern = /^(?:(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,7}:|::(?:[a-fA-F0-9]{1,4}:){0,7}|(?:[a-fA-F0-9]{1,4}:){1,6}:[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,5}(?::[a-fA-F0-9]{1,4}){1,2}|(?:[a-fA-F0-9]{1,4}:){1,4}(?::[a-fA-F0-9]{1,4}){1,3}|(?:[a-fA-F0-9]{1,4}:){1,3}(?::[a-fA-F0-9]{1,4}){1,4}|(?:[a-fA-F0-9]{1,4}:){1,2}(?::[a-fA-F0-9]{1,4}){1,5}|[a-fA-F0-9]{1,4}:(?::[a-fA-F0-9]{1,4}){1,6})(?:\/(1[0-1][0-9]|12[0-8]|[0-9]?[0-9]))?$/;
     return ipv6BracketPattern.test(address) || ipv6RawPattern.test(address);
+}
+
+/**
+ * IPv6 文本 → 16 字节原始地址（RFC 4291 文本表示），用于 SOCKS5 的 ATYP=4 地址字段这类
+ * 「需要二进制地址」的场合。非法输入返回 null，由调用方决定回退策略（绝不抛错）。
+ *
+ * 接受：完整 8 段、`::` 压缩（至多一处、至少压缩一个 0 段）、尾部内嵌 IPv4
+ * （`::ffff:1.2.3.4` / `64:ff9b::1.2.3.4`）、外层方括号、大小写混合、各段 1-4 位十六进制。
+ * 拒绝：非 IPv6（不含 `:`）、zone/scope 后缀（`fe80::1%eth0` —— 它不是地址的一部分，
+ * 无法映射到 16 字节）、段数超 8、多于一处 `::`、空段、内嵌 IPv4 含前导 0 或越界。
+ *
+ * 刻意不复用 ipv6ToWords：那个函数服务于 Cloudflare 网段判定、明确不支持内嵌 IPv4，
+ * 改它会连带改变 isCloudflareIP 的判定口径（进而影响首跳路由），不属于本次修复范围。
+ */
+export function ipv6ToBytes(address: string): Uint8Array | null {
+    let text = String(address ?? '').trim();
+    if (text.startsWith('[') && text.endsWith(']')) text = text.slice(1, -1);
+    if (!text || text.includes('%') || !text.includes(':')) return null;
+
+    // 尾部内嵌 IPv4 先折成两个 16 位段，后续只处理十六进制写法
+    const lastColon = text.lastIndexOf(':');
+    const tail = text.slice(lastColon + 1);
+    if (tail.includes('.')) {
+        const octets = tail.split('.');
+        if (octets.length !== 4) return null;
+        // 只接受规范十进制（无前导 0），避免 010 这类歧义写法被误读
+        const nums = octets.map(o => (/^(0|[1-9][0-9]{0,2})$/.test(o) ? Number(o) : NaN));
+        if (nums.some(n => !Number.isInteger(n) || n > 255)) return null;
+        const folded = `${(((nums[0] << 8) | nums[1]) >>> 0).toString(16)}:${(((nums[2] << 8) | nums[3]) >>> 0).toString(16)}`;
+        text = `${text.slice(0, lastColon + 1)}${folded}`;
+    }
+
+    const halves = text.split('::');
+    if (halves.length > 2) return null;
+    const parseSide = (side: string): number[] | null => {
+        if (side === '') return [];
+        const groups: number[] = [];
+        for (const part of side.split(':')) {
+            if (!/^[0-9a-fA-F]{1,4}$/.test(part)) return null;
+            groups.push(parseInt(part, 16));
+        }
+        return groups;
+    };
+    const left = parseSide(halves[0]);
+    if (!left) return null;
+    let words: number[];
+    if (halves.length === 1) {
+        if (left.length !== 8) return null;
+        words = left;
+    } else {
+        const right = parseSide(halves[1]);
+        if (!right) return null;
+        const zeros = 8 - left.length - right.length;
+        if (zeros < 1) return null;   // `::` 至少要压缩掉一段
+        words = [...left, ...new Array(zeros).fill(0), ...right];
+    }
+
+    const bytes = new Uint8Array(16);
+    words.forEach((word, index) => {
+        bytes[index * 2] = (word >> 8) & 0xff;
+        bytes[index * 2 + 1] = word & 0xff;
+    });
+    return bytes;
 }
 
 /** C-14：「单个可拨号地址」判定 —— 在 isIPv4/isIPv6 基础上排除 CIDR 后缀。

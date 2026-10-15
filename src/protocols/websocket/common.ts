@@ -1,4 +1,4 @@
-import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget } from '@utils';
+import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes } from '@utils';
 import { safeErrorMessage, randomUserAgent } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
@@ -253,10 +253,37 @@ async function connectWithDirectRaceDial(
         pool = [targetAddress];
     } else {
         log(`resolving ${targetAddress} via DoH for direct dial...`);
-        // 与出站模式的目标分类共用同一份解析缓存（A + AAAA），同一域名不再重复 DoH；
-        // 这里只取 IPv4，保持既有拨号语义（原 resolveDNS(..., true) 同样只返回 v4）
-        const { ipv4 } = await resolveTargetDNS(targetAddress);
-        pool = [...ipv4];
+        // 与出站模式的目标分类共用同一份解析缓存（A + AAAA），同一域名不再重复 DoH。
+        // ★ IPv6 修复一（对齐 cfnew「解析域名获取IP池」L167-220 / L184 `[${data}]`）：原实现只取
+        //   ipv4 而**丢掉 AAAA**，于是「只发布 AAAA 记录」的目标解析出的池恒为空，本函数在
+        //   **一个候选都没拨号**的情况下就抛 'DNS resolution failed for direct target'
+        //   （已由 tmp/verify-ipv6-dial/run.ts 固定在改前源码上：拨号记录为空 + 抛错）。
+        //   而 test-ipv6.com 判「有没有 IPv6」只认这类域名 —— 其官方 FAQ：测试是客户端 JS 向
+        //   「force the use of IPv6 only」的 DNS 名字发 ajax，且**耗时也参与判定**；实测
+        //   ipv6. / v6. / mtu1280. / aaaa.test-ipv6.com 均只有 AAAA、无 A
+        //   （test-ipv6.com 主站则是 A=4、无 AAAA，官方说明是刻意的）。
+        //   顺序：IPv4 在前（保持既有「v4 优先」语义与故障域，双栈目标行为不变），IPv6 追加在后，
+        //   以方括号形式承载 —— 与 resolveProxyIPPool 的 `[${data}]` 口径一致：黑名单键
+        //   `${ip}:${port}` 不会与 IPv4 混淆，拨号前统一由 `ip.replace(/^\[|\]$/g, '')` 去括号。
+        //
+        // ★ IPv6 修复二（对齐 edgetunnel 直连路径的关键做法）：候选里**始终附上未解析的原始目标
+        //   域名**，由 Workers 运行时自己去做 A + AAAA 解析与连接。edgetunnel 就是这么干的 ——
+        //   它的候选列表放的是原始地址而非 IP 字面量（`构建预加载竞速候选列表` L5752-5754 与
+        //   `connectDirect` L5769 都返回 `{ hostname: address, port }`），所以它从来不存在
+        //   「预先解析漏掉 AAAA」这个问题。只把 AAAA 放进 IP 池仍不够稳：
+        //     ① 我们自己那一路 DoH（cloudflare-dns.com / dns.google）抖动或被墙时，池里就没有 AAAA；
+        //     ② 万一「按 IP 字面量拨号」这条路存在运行时限制，纯 v6 目标依旧连不上，
+        //        于是又掉进回退阶梯，被只承载 Cloudflare 目标的反代池 / 官方池把首包（**不含目标
+        //        地址**）投给不匹配的对端 —— 那种错投在浏览器侧正表现为 TLS 握手失败
+        //        （如 ERR_SSL_VERSION_OR_CIPHER_MISMATCH）。域名候选让直连恒有第三条腿，不必再兜底。
+        //   窗口保证：候选窗口只有 RACE_DIAL_MAX_BATCHES × DIRECT_RACE_CONCURRENCY 个，故把 IP 部分
+        //   截到「窗口 - 1」，域名恒定占据窗口内最后一个位置，任何情况下都一定会被尝试到。
+        const { ipv4, ipv6 } = await resolveTargetDNS(targetAddress);
+        const window = RACE_DIAL_MAX_BATCHES * DIRECT_RACE_CONCURRENCY;
+        const ipCandidates = [...ipv4, ...ipv6.map(ip => `[${ip}]`)].slice(0, Math.max(1, window - 1));
+        // cfnew 同款兜底（cfnew L213 `if (已去重.length === 0) return [域名]`）：A / AAAA 一条都没
+        // 解析出来时也要有一个可拨候选。非空地址才附域名，空地址维持下面原有的抛错。
+        pool = targetAddress ? [...ipCandidates, targetAddress] : ipCandidates;
     }
 
     if (pool.length === 0) {
@@ -386,9 +413,32 @@ async function connectWithPrefixFallback(
 
     const prefix = getRandomValue(prefixes);
     
-    // 解析目标域名获取 IPv4
+    // 解析目标 IPv4。正常路径**逐字沿用** resolveDNS(targetAddress, true)：只查 A、不碰 AAAA、
+    // 不吃 resolveTargetDNS 的 10 分钟缓存 —— 即「有 A 记录的目标」在 prefix 模式下与改动前完全一致
+    // （含 IP 轮换的时效性，不会被缓存拖成 10 分钟前的地址）。NAT64 本身也只对 IPv4 目标成立。
     const { ipv4 } = await resolveDNS(targetAddress, true);
     if (!ipv4.length) {
+        // ★ IPv6 修复（与 connectWithDirectRaceDial 同一类缺陷）：NAT64 只能把 **IPv4** 映射进前缀，
+        //   对「只发布 AAAA 记录」的目标（test-ipv6.com 的 ipv6. / v6. / mtu1280. / aaaa.test-ipv6.com
+        //   —— 该站判「有没有 IPv6」正是靠这些纯 v6 域名）以及 IPv6 字面量目标，压根没有可映射的 IPv4。
+        //   原实现一律抛 'Unable to find IPv4 in DNS records for prefix fallback'，而 prefix 模式
+        //   「失败不回退」（调用点直接 close 1011），于是这类目标在 prefix 模式下 100% 不可达 ——
+        //   尽管它本来就是 IPv6 可达的。此时本就不需要 NAT64：把原始目标交给运行时解析器直连即可。
+        //
+        //   但必须区分两种「没有 IPv4」：resolveDNS 在任何 DoH 故障下都返回空数组
+        //   （dualSourceResolve 用 allSettled 把所有拒绝吞成 []），那是「解析不出来」而不是
+        //   「目标没有 IPv4」。若无条件改走直连，一次 DNS 抖动就会让**双栈目标**静默绕过用户
+        //   显式选择的 NAT64 出口（本模式的契约恰恰是失败不回退，防的就是这种绕过）。故只有在
+        //   没有 A 记录时**额外**查一次 A + AAAA 取证，拿到「目标确实是 IPv6 目标」的证据
+        //   （IPv6 字面量，或确实解析出了 AAAA）才直连；证据不足时保持原有 fail-closed 抛错，
+        //   行为与改动前一致。取证只在「本来就要失败」的这条分支上发生，不影响任何正常路径。
+        const isV6Literal = isIPLiteral(targetAddress) && targetAddress.includes(':');
+        const hasV6Record = isV6Literal ? true : (await resolveTargetDNS(targetAddress)).ipv6.length > 0;
+        if (hasV6Record) {
+            log(`no IPv4 record for ${targetAddress}; dialing target directly (NAT64 mapping not applicable)`);
+            const directSocket = await connectAndWrite(targetAddress, targetPort, rawClientData, fetcher);
+            return { socket: directSocket, usedIp: targetAddress };
+        }
         throw new Error('Unable to find IPv4 in DNS records for prefix fallback');
     }
     const targetIPv4 = ipv4[0];
@@ -572,12 +622,26 @@ async function socks5Connect(
         take(2);
     }
 
-    // Step 4: CONNECT request — always domain-type (ATYP=3) — cfnew L5560-5565
-    // Comment from cfnew: 统一用域名型寻址：交给代理自己解析更稳妥
+    // Step 4: CONNECT request — 按目标类型选 ATYP。
+    // cfnew 原先是**恒用域名型寻址**（ATYP=3：长度前缀 + 把地址当域名发出去），口径是
+    // 「交给代理自己解析更稳妥」：对真正的域名成立，但对 **IPv6 字面量不成立** ——
+    // `2001:db8::1` 不是合法 DNS 名，上游拿它去解析必然失败（normalizeTargetAddress 只去掉方括号，
+    // 并不改变这一点），于是「客户端自己解析后按 IPv6 字面量连」的场景一走上游代理就整条断。
+    // 现按 RFC 1928 选类型：4 = IPv6（紧跟 16 字节原始地址，上游无需解析）。
+    //
+    // 只对 IPv6 特判，IPv4 字面量与域名**一律维持 ATYP=3 的既有行为**，理由：
+    //   `1.2.3.4` 这种数字串几乎所有解析器都直接认（getaddrinfo 与常见 DNS 都会原样返回该地址），
+    //   而改成 ATYP=1 会让「只实现域名型寻址」的少数上游从可用变不可用 —— 对本次要修的问题零收益。
+    // ipv6ToBytes 解不出字节时（畸形/带 zone 后缀等）退回 ATYP=3 原样发送，保持改动前行为，
+    // 不新增任何失败面。
     const encoder = new TextEncoder();
-    const targetBytes = encoder.encode(normalizeTargetAddress(targetAddress));
+    const v6Bytes = targetAddress.includes(':') ? ipv6ToBytes(targetAddress) : null;
+    const atyp = v6Bytes ? 4 : 3;
+    const addrBytes = v6Bytes ?? encoder.encode(normalizeTargetAddress(targetAddress));
     await writer.write(new Uint8Array([
-        5, 1, 0, 3, targetBytes.length, ...targetBytes,
+        5, 1, 0, atyp,
+        ...(atyp === 3 ? [addrBytes.length] : []),
+        ...addrBytes,
         targetPort >> 8, targetPort & 255
     ]));
 
