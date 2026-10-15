@@ -728,13 +728,17 @@ function parseAddressEntry(value) {
 }
 
 function validateMultipleHostNames() {
+    // cleanIPs 允许代理条目（socks / socks5 / http(s)，由服务端生成独立可选节点）；
+    // customCdnAddrs 仍是纯地址列表，代理写法在那里没有意义，继续按主机名校验。
     const invalidValues = [
-        'cleanIPs',
-        'customCdnAddrs'
-    ].flatMap(parseElmValues)
-        .filter(v => !v.startsWith('http://') && !v.startsWith('https://'))
-        .map(parseAddressEntry)
-        .filter(value => !isValidHostName(value));
+        { id: 'cleanIPs', allowProxy: true },
+        { id: 'customCdnAddrs', allowProxy: false }
+    ].flatMap(({ id, allowProxy }) => parseElmValues(id).filter(value => {
+        // http(s):// 交给服务端 resolveUrlEntries / 代理识别处理，不做主机名校验
+        if (/^https?:\/\//i.test(value)) return false;
+        if (allowProxy && /^socks5?:\/\//i.test(value)) return false;
+        return !isValidHostName(parseAddressEntry(value));
+    }));
 
     if (invalidValues.length) {
         alert(
