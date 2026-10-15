@@ -1,6 +1,8 @@
 import {
     base64ToDecimal,
     buildEntryPortMap,
+    isBareIPv4,
+    isBareIPv6,
     isHttps,
     toRange,
     selectSniHost,
@@ -230,11 +232,15 @@ export function buildWarpOutbound(
  */
 export function buildCleanProxyOutbound(proxy: CleanProxyEntry, tag: string): Outbound {
     const isHttpsProxy = proxy.protocol === 'https';
+    // IP 主机上证书几乎不可能有效（无 iPAddress SAN），且 SNI 规范上不允许是 IP 字面量：
+    // 这种情况不校验证书、也不下发 serverName；域名主机保持严格校验 + SNI = 主机名。
+    const isIPHost = isBareIPv4(proxy.server) || isBareIPv6(proxy.server);
     const streamSettings: StreamSettings = {
         network: 'tcp',
         security: isHttpsProxy ? 'tls' : 'none',
-        // HTTPS 代理：对代理本身做 TLS，SNI 取代理主机名，不做 insecure 放行
-        tlsSettings: isHttpsProxy ? buildTlsSettings(proxy.server, undefined, false, false) : undefined,
+        tlsSettings: isHttpsProxy
+            ? buildTlsSettings(isIPHost ? '' : proxy.server, undefined, isIPHost, false)
+            : undefined,
         sockopt: buildSockopt(false, false, 'UseIPv4')
     };
 

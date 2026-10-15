@@ -1,4 +1,4 @@
-import { isHttps, buildEntryPortMap, parseHostPort, pickEarlyData, pickRandomEch, selectSniHost, type CleanProxyEntry } from '@utils';
+import { isHttps, buildEntryPortMap, parseHostPort, pickEarlyData, pickRandomEch, selectSniHost, isBareIPv4, isBareIPv6, type CleanProxyEntry } from '@utils';
 import {
     BaseOutbound,
     HttpOutbound,
@@ -205,10 +205,15 @@ function resolveChainEarlyData(usedEds?: Set<number>): number {
 /** Clean IPs / Domains 里的 socks / socks5 / http(s) 代理条目 → 独立可选节点 */
 export function buildCleanProxyOutbound(proxy: CleanProxyEntry, name: string): HttpOutbound | SocksOutbound {
     const isHttpsProxy = proxy.protocol === 'https';
+    // IP 主机的 https 代理证书校验必然失败 → skip-cert-verify；域名主机保持严格校验
+    const isIPHost = isBareIPv4(proxy.server) || isBareIPv6(proxy.server);
 
     if (proxy.protocol === 'http' || isHttpsProxy) {
         // HTTPS 代理在 clash 里是 type: http + tls: true
-        return buildOutbound<HttpOutbound>(name, 'http', proxy.server, proxy.port, false, false, isHttpsProxy ? { tls: true } : {}, {}, {
+        const tlsOpts: Partial<TLS> = isHttpsProxy
+            ? (isIPHost ? { tls: true, 'skip-cert-verify': true } : { tls: true })
+            : {};
+        return buildOutbound<HttpOutbound>(name, 'http', proxy.server, proxy.port, false, false, tlsOpts, {}, {
             username: proxy.username,
             password: proxy.password
         });

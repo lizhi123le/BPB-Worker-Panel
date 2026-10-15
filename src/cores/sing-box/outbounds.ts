@@ -5,6 +5,8 @@ import {
     parseHostPort,
     selectSniHost,
     isDomain,
+    isBareIPv4,
+    isBareIPv6,
     pickRandomEch,
     pickEarlyData,
     type CleanProxyEntry
@@ -194,8 +196,12 @@ export function getChainExplicitEarlyData(): number | undefined {
 /** Clean IPs / Domains 里的 socks / socks5 / http(s) 代理条目 → 独立可选节点出站 */
 export function buildCleanProxyOutbound(proxy: CleanProxyEntry, tag: string): HttpOutbound | SocksOutbound {
     const isHttpsProxy = proxy.protocol === 'https';
-    // HTTPS 代理：对代理本身做 TLS，SNI 取代理主机名
-    const tls = isHttpsProxy ? buildTLS('tls', false, false, proxy.server, false) : undefined;
+    // IP 主机的 https 代理：证书校验必然失败、SNI 不允许是 IP → 不校验、不下发 server_name；
+    // 域名主机保持严格校验 + SNI = 主机名
+    const isIPHost = isBareIPv4(proxy.server) || isBareIPv6(proxy.server);
+    const tls = isHttpsProxy
+        ? buildTLS('tls', false, isIPHost, isIPHost ? '' : proxy.server, false)
+        : undefined;
 
     if (proxy.protocol === 'http' || isHttpsProxy) {
         return buildOutbound<HttpOutbound>(tag, 'http', proxy.server, proxy.port, false, {
