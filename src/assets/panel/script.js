@@ -1204,9 +1204,17 @@ function validateSettings() {
                 return [line];
             });
             // 去重（保持先后顺序），URL 或普通条目归一化防重
+            // 代理条目（socks/socks5/http(s) 带凭据或 host:port）必须保留大小写：
+            // user/pass 大小写敏感，整体 toLowerCase 会静默改坏认证信息。
+            const isProxyEntry = (item) => {
+                if (/^socks5?:\/\//i.test(item)) return true;
+                if (!/^https?:\/\//i.test(item)) return false;
+                if (/^https?:\/\/[^@\s/?#]*@/i.test(item)) return true;              // 带凭据
+                return /^https?:\/\/[^:/\s?#]+:\d+\/?$/i.test(item);                  // host:port（无路径）
+            };
             const seen = new Set();
             items = items.filter(item => {
-                const norm = (item.startsWith('http://') || item.startsWith('https://'))
+                const norm = (item.startsWith('http://') || item.startsWith('https://')) && !isProxyEntry(item)
                     ? item.toLowerCase()
                     : item;
                 if (seen.has(norm)) return false;

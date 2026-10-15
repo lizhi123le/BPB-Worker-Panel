@@ -6,7 +6,8 @@ import {
     selectSniHost,
     isDomain,
     pickRandomEch,
-    pickEarlyData
+    pickEarlyData,
+    type CleanProxyEntry
 } from '@utils';
 import { NODE_DNS_TAG } from './dns';
 
@@ -188,6 +189,27 @@ export function getChainExplicitEarlyData(): number | undefined {
     } catch {
         return undefined;
     }
+}
+
+/** Clean IPs / Domains 里的 socks / socks5 / http(s) 代理条目 → 独立可选节点出站 */
+export function buildCleanProxyOutbound(proxy: CleanProxyEntry, tag: string): HttpOutbound | SocksOutbound {
+    const isHttpsProxy = proxy.protocol === 'https';
+    // HTTPS 代理：对代理本身做 TLS，SNI 取代理主机名
+    const tls = isHttpsProxy ? buildTLS('tls', false, false, proxy.server, false) : undefined;
+
+    if (proxy.protocol === 'http' || isHttpsProxy) {
+        return buildOutbound<HttpOutbound>(tag, 'http', proxy.server, proxy.port, false, {
+            username: proxy.username,
+            password: proxy.password
+        }, tls, undefined, true);
+    }
+
+    return buildOutbound<SocksOutbound>(tag, 'socks', proxy.server, proxy.port, false, {
+        username: proxy.username,
+        password: proxy.password,
+        version: '5',
+        network: 'tcp'
+    }, undefined, undefined, true);
 }
 
 export function buildChainOutbound(usedEds?: Set<number>): ChainOutbound | undefined {

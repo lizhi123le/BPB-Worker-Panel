@@ -4,7 +4,8 @@ import {
     isHttps,
     toRange,
     selectSniHost,
-    pickRandomEch
+    pickRandomEch,
+    type CleanProxyEntry
 } from '@utils';
 
 import {
@@ -223,6 +224,40 @@ export function buildWarpOutbound(
 }
 
 // earlyData：链式出站同样启用 early-data，由调用点用 pickEarlyData(usedEds) 抽取，与主出站共用去重池
+/**
+ * Clean IPs / Domains 里的 socks / socks5 / http(s) 代理条目 → 独立可选节点出站。
+ * 与链式出站的区别：不挂 dialerProxy、不做链式，就是这个节点自己的出站。
+ */
+export function buildCleanProxyOutbound(proxy: CleanProxyEntry, tag: string): Outbound {
+    const isHttpsProxy = proxy.protocol === 'https';
+    const streamSettings: StreamSettings = {
+        network: 'tcp',
+        security: isHttpsProxy ? 'tls' : 'none',
+        // HTTPS 代理：对代理本身做 TLS，SNI 取代理主机名，不做 insecure 放行
+        tlsSettings: isHttpsProxy ? buildTlsSettings(proxy.server, undefined, false, false) : undefined,
+        sockopt: buildSockopt(false, false, 'UseIPv4')
+    };
+
+    const hasCredentials = Boolean(proxy.username || proxy.password);
+
+    return buildOutbound<HttpSocksSettings>(
+        // xray 的 socks 出站协议名为 socks（socks / socks5 都归它）
+        (proxy.protocol === 'http' || isHttpsProxy) ? 'http' : 'socks',
+        tag,
+        true,
+        {
+            servers: [{
+                address: proxy.server,
+                port: proxy.port,
+                ...(hasCredentials ? {
+                    users: [{ user: proxy.username ?? '', pass: proxy.password ?? '' }]
+                } : {})
+            }]
+        },
+        streamSettings
+    );
+}
+
 export function buildChainOutbound(earlyData: number): Outbound | undefined {
     const {
         dict: { _VL_, _TR_, _SS_, _VM_ },
@@ -400,7 +435,7 @@ function buildSockopt(
 
 function buildTlsSettings(
     serverName: string,
-    fingerprint: Fingerprint,
+    fingerprint: Fingerprint | undefined,
     allowInsecure: boolean,
     enableECH: boolean,
     echServerName?: string,
@@ -418,7 +453,8 @@ function buildTlsSettings(
         serverName,
         // G13-C9：xray.d.ts 的 Fingerprint 联合类型已含 "randomized"（xray.d.ts:16-26），
         // 本端可直接原样下发；Clash 才需要映射成 "random"（只需一端做映射，此处保持直通）。
-        fingerprint: fingerprint,
+        // 无 fingerprint（HTTPS 代理这类只需校验证书的场景）时不写该字段。
+        ...(fingerprint ? { fingerprint } : {}),
         // 与 sing-box 的 insecure / Clash 的 skip-cert-verify 同源同值：仅当地址来自 customCdnAddrs 时为 true
         allowInsecure,
         alpn: alpn?.split(','),

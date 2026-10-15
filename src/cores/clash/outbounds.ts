@@ -1,4 +1,4 @@
-import { isHttps, buildEntryPortMap, parseHostPort, pickEarlyData, pickRandomEch, selectSniHost } from '@utils';
+import { isHttps, buildEntryPortMap, parseHostPort, pickEarlyData, pickRandomEch, selectSniHost, type CleanProxyEntry } from '@utils';
 import {
     BaseOutbound,
     HttpOutbound,
@@ -200,6 +200,24 @@ function resolveChainEarlyData(usedEds?: Set<number>): number {
     if (usedEds && !usedEds.has(earlyData)) usedEds.add(earlyData);
 
     return earlyData;
+}
+
+/** Clean IPs / Domains 里的 socks / socks5 / http(s) 代理条目 → 独立可选节点 */
+export function buildCleanProxyOutbound(proxy: CleanProxyEntry, name: string): HttpOutbound | SocksOutbound {
+    const isHttpsProxy = proxy.protocol === 'https';
+
+    if (proxy.protocol === 'http' || isHttpsProxy) {
+        // HTTPS 代理在 clash 里是 type: http + tls: true
+        return buildOutbound<HttpOutbound>(name, 'http', proxy.server, proxy.port, false, false, isHttpsProxy ? { tls: true } : {}, {}, {
+            username: proxy.username,
+            password: proxy.password
+        });
+    }
+
+    return buildOutbound<SocksOutbound>(name, 'socks5', proxy.server, proxy.port, false, false, {}, {}, {
+        username: proxy.username,
+        password: proxy.password
+    });
 }
 
 export function buildChainOutbound(usedEds?: Set<number>): ChainOutbound | undefined {

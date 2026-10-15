@@ -83,9 +83,120 @@ export function entryName(entry: string): string | undefined {
     return entry.slice(idx + 1).trim() || undefined;
 }
 
-/** Map entries to clean address array */
+// ── Clean IPs / Domains 里的代理条目（socks / socks5 / http / https） ──
+// 这类条目不是「节点地址」，而是可直接使用的代理：订阅生成时按各客户端格式输出成**独立可选节点**，
+// 同时必须从 VLESS/Trojan 的地址链路里剔除（entryAddresses / buildEntryPortMap / findNameForAddress），
+// 否则会生成指向 socks 主机的畸形 WS 节点。
+
+export type CleanProxyProtocol = 'socks' | 'socks5' | 'http' | 'https';
+
+export interface CleanProxyEntry {
+    protocol: CleanProxyProtocol;
+    server: string;      // 已剥离 IPv6 方括号
+    port: number;
+    username?: string;
+    password?: string;
+    name?: string;       // 条目 #备注
+    raw: string;         // 原始条目
+}
+
+const CLEAN_PROXY_DEFAULT_PORTS: Record<string, number> = {
+    socks: 1080,
+    socks5: 1080,
+    http: 80,
+    https: 443
+};
+
+/** scheme://[userinfo@]host[:port][/path] —— userinfo 不含 @ / 空白；IPv6 主机可带方括号 */
+const CLEAN_PROXY_RE = /^(socks5?|https?):\/\/(?:([^@\s/?#]*)@)?(\[[0-9a-fA-F:.]+\]|[^:/\s?#]+)(?::(\d+))?([^?#\s]*)/i;
+
+/**
+ * 解析 Clean IPs / Domains 里的代理条目；非代理返回 null。
+ * 启发式区分（http(s) 兼作「远程清单 URL」的写法）：
+ *   - socks:// / socks5:// 一律视为代理；
+ *   - http(s):// 仅在「带凭据 user:pass@」或「显式端口且无路径」或「无路径的 IP 字面量」时视为代理，
+ *     其余（带路径、无凭据、非 IP）继续按远程清单 URL 交给 resolveUrlEntries 拉取。
+ */
+export function parseCleanProxy(entry: string): CleanProxyEntry | null {
+    const raw = (entry || '').trim();
+    if (!raw) return null;
+    const matched = raw.match(CLEAN_PROXY_RE);
+    if (!matched) return null;
+
+    const scheme = matched[1].toLowerCase();
+    const userinfo = matched[2] || '';
+    const server = (matched[3] || '').replace(/^\[|\]$/g, '');
+    const portRaw = matched[4] || '';
+    const path = matched[5] || '';
+    if (!server) return null;
+
+    if (scheme !== 'socks' && scheme !== 'socks5') {
+        const hasCreds = userinfo.length > 0;
+        const hasPath = path.length > 1;   // 仅 "/" 不算路径
+        const isIPHost = ipv4ToInt(server) !== null || ipv6ToWords(server) !== null;
+        if (!hasCreds && !(portRaw && !hasPath) && !(!hasPath && isIPHost)) return null;
+    }
+
+    const port = portRaw ? Number(portRaw) : CLEAN_PROXY_DEFAULT_PORTS[scheme];
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+
+    let username: string | undefined;
+    let password: string | undefined;
+    if (userinfo) {
+        const sep = userinfo.indexOf(':');
+        if (sep === -1) {
+            username = userinfo;
+        } else {
+            username = userinfo.slice(0, sep);
+            password = userinfo.slice(sep + 1);
+        }
+    }
+
+    return {
+        protocol: scheme as CleanProxyProtocol,
+        server,
+        port,
+        username: username || undefined,
+        password: password || undefined,
+        name: entryName(raw),
+        raw
+    };
+}
+
+/** 按输入顺序取出列表里的代理条目；同协议+同主机+同端口+同凭据只保留第一条 */
+export function cleanProxyEntries(entries: string[]): CleanProxyEntry[] {
+    const result: CleanProxyEntry[] = [];
+    const seen = new Set<string>();
+    for (const entry of entries || []) {
+        const proxy = parseCleanProxy(entry);
+        if (!proxy) continue;
+        const key = `${proxy.protocol}|${proxy.server.toLowerCase()}|${proxy.port}|${proxy.username || ''}|${proxy.password || ''}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        result.push(proxy);
+    }
+    return result;
+}
+
+/** 代理条目的分享链接（Raw 订阅用）：socks5://base64(user:pass)@host:port#备注 */
+export function cleanProxyShareLink(proxy: CleanProxyEntry): string {
+    // 与既有的 Chain Proxy 链接约定一致：凭据整体 base64 后作为 userinfo
+    const credentials = (proxy.username || proxy.password)
+        ? `${btoa(`${proxy.username || ''}:${proxy.password || ''}`)}@`
+        : '';
+    const host = proxy.server.includes(':') ? `[${proxy.server}]` : proxy.server;
+    const remark = proxy.name ? `#${encodeURIComponent(proxy.name)}` : '';
+    return `${proxy.protocol}://${credentials}${host}:${proxy.port}${remark}`;
+}
+
+/** 代理节点的备注：条目 #备注 优先，否则 主机:端口 */
+export function cleanProxyRemark(proxy: CleanProxyEntry): string {
+    return proxy.name || `${proxy.server}:${proxy.port}`;
+}
+
+/** Map entries to clean address array（代理条目不是地址，直接跳过） */
 export function entryAddresses(entries: string[]): string[] {
-    return entries.map(entryAddress).filter(Boolean);
+    return entries.map(entry => parseCleanProxy(entry) ? '' : entryAddress(entry)).filter(Boolean);
 }
 
 /** Build port map from entry lists — maps bare address → array of explicit ports */
@@ -93,6 +204,7 @@ export function buildEntryPortMap(): Record<string, number[]> {
     const { settings: { cleanIPs, customCdnAddrs } } = globalThis;
     const map: Record<string, number[]> = {};
     for (const e of [...cleanIPs, ...customCdnAddrs]) {
+        if (parseCleanProxy(e)) continue;   // 代理条目自带端口，不参与地址端口表
         const port = entryPort(e);
         if (port) {
             const addr = entryAddress(e);
@@ -107,15 +219,16 @@ export function buildEntryPortMap(): Record<string, number[]> {
 
 /** Find custom name for an address across multiple entry lists, with optional port matching */
 export function findNameForAddress(entries: string[], address: string, port?: number): string | undefined {
+    const candidates = entries.filter(e => !parseCleanProxy(e));   // 代理条目不对应任何地址
     if (port) {
-        for (const e of entries) {
+        for (const e of candidates) {
             if (entryAddress(e) === address && entryPort(e) === port) {
                 const name = entryName(e);
                 if (name) return name;
             }
         }
     }
-    for (const e of entries) {
+    for (const e of candidates) {
         if (entryAddress(e) === address) {
             const name = entryName(e);
             if (name) return name;
@@ -296,9 +409,11 @@ export async function resolveUrlEntries(entries: string[], env?: Env): Promise<s
     }
 
     // 2. 提取所有唯一 URL，并发拉取或读取 KV 缓存
+    //    已是代理条目的 http(s) 写法（带凭据 / 端口且无路径 / 无路径 IP）不当远程清单 URL
     const urlSet = new Set<string>();
     expandedEntries.forEach(e => {
         if (e.startsWith('http://') || e.startsWith('https://')) {
+            if (parseCleanProxy(e)) return;
             urlSet.add(e);
         }
     });
@@ -447,7 +562,16 @@ function envSpeedtestAddress(): string | undefined {
     return raw.trim() || undefined;
 }
 
-export async function getConfigAddresses(isFragment: boolean): Promise<string[]> {
+/** 订阅节点序列的一项：普通地址（生成 VLESS/Trojan 节点）或代理条目（生成独立代理节点） */
+export type ConfigItem =
+    | { kind: 'address'; value: string }
+    | { kind: 'proxy'; value: CleanProxyEntry };
+
+/**
+ * 订阅节点的**有序**序列：先域名 / 测速域名 / DNS 解析出的 IP，再按 cleanIPs 的**输入顺序**
+ * 交替给出普通地址与代理条目（节点顺序 = 输入框顺序），最后是 customCdnAddrs。
+ */
+export async function getConfigItems(isFragment: boolean): Promise<ConfigItem[]> {
     const {
         httpConfig: { hostName },
         settings: { enableIPv6, customCdnAddrs, cleanIPs }
@@ -461,23 +585,49 @@ export async function getConfigAddresses(isFragment: boolean): Promise<string[]>
         ipv6.length > 0 ? filterReachableIPs(ipv6) : Promise.resolve([] as string[]),
     ]);
 
-    const speedtestAddress = envSpeedtestAddress();
-    const addrs = [
-        hostName,
-        ...(speedtestAddress ? [speedtestAddress] : []),
-        ...reachableIPv4,
-        ...reachableIPv6.map((ip: string) => `[${ip}]`),
-        ...entryAddresses(cleanIPs)
-    ];
-
-    const allAddrs = addrs.concatIf(!isFragment, entryAddresses(customCdnAddrs));
+    const items: ConfigItem[] = [];
     const seen = new Set<string>();
-    return allAddrs.filter(addr => {
+    const pushAddress = (addr: string) => {
+        if (!addr) return;
         const key = addr.toLowerCase();
-        if (seen.has(key)) return false;
+        if (seen.has(key)) return;
         seen.add(key);
-        return true;
-    });
+        items.push({ kind: 'address', value: addr });
+    };
+    const pushEntries = (entries: string[]) => {
+        for (const entry of entries) {
+            const proxy = parseCleanProxy(entry);
+            if (proxy) {
+                // 代理条目按「协议+主机+端口+凭据」去重，与地址去重互不干扰
+                const key = `proxy:${proxy.protocol}|${proxy.server.toLowerCase()}|${proxy.port}|${proxy.username || ''}|${proxy.password || ''}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                items.push({ kind: 'proxy', value: proxy });
+                continue;
+            }
+            pushAddress(entryAddress(entry));
+        }
+    };
+
+    pushAddress(hostName);
+    const speedtestAddress = envSpeedtestAddress();
+    if (speedtestAddress) pushAddress(speedtestAddress);
+    reachableIPv4.forEach(pushAddress);
+    reachableIPv6.forEach((ip: string) => pushAddress(`[${ip}]`));
+
+    pushEntries(cleanIPs);
+    // customCdnAddrs 仍只作地址（既有语义不变），代理写法在 entryAddresses 里被跳过
+    if (!isFragment) entryAddresses(customCdnAddrs).forEach(pushAddress);
+
+    return items;
+}
+
+/** 兼容旧调用：只要序列里的普通地址 */
+export async function getConfigAddresses(isFragment: boolean): Promise<string[]> {
+    const items = await getConfigItems(isFragment);
+    return items
+        .filter((item): item is { kind: 'address'; value: string } => item.kind === 'address')
+        .map(item => item.value);
 }
 
 const remarkCounter: Record<string, number> = {};

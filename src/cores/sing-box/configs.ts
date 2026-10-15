@@ -1,9 +1,9 @@
 import { getDataset } from '@kv';
 import { buildDNS, retargetDnsDetour } from './dns';
 import { buildRoutingRules, buildBlockAndBypassRules, buildBaseRoutingRules } from './routing';
-import { buildChainOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound, getChainExplicitEarlyData, redrawChainEarlyData } from './outbounds.js';
+import { buildChainOutbound, buildCleanProxyOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound, getChainExplicitEarlyData, redrawChainEarlyData } from './outbounds.js';
 import { Outbound, WireguardEndpoint, Config } from '#types/sing-box';
-import { buildEntryPortMap, getConfigAddresses, generateRemark, generateWsPath, isHttps, getProtocols, pickEarlyData, resetRemarkCounter } from '@utils';
+import { buildEntryPortMap, getConfigItems, cleanProxyEntries, cleanProxyRemark, generateRemark, generateWsPath, isHttps, getProtocols, pickEarlyData, resetRemarkCounter } from '@utils';
 import { buildMixedInbound, tun } from './inbounds';
 import { buildAclSingbox, ACL_BUILTIN_GROUP_TAGS } from '../acl-template';
 import { DEFAULT_ACL_TEMPLATE_URL } from '../../common/defaults';
@@ -93,7 +93,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
     resetRemarkCounter();
     const { outProxy, ports, upstreamParams: { upstreamServer, upstreamPort } } = globalThis.settings;
     const protocols = getProtocols();
-    const hosts = await getConfigAddresses(isFragment);
+    const items = await getConfigItems(isFragment);
     const entryPortMap = buildEntryPortMap();
     const totalPorts = ports.filter(port => !isFragment || isHttps(port));
     // 已占用路径池词集合：每个 ws 出站各抽一个互不相同的伪装路径
@@ -109,7 +109,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
 
     if (upstreamServer && upstreamPort && !isFragment) {
         totalPorts.unshift(upstreamPort);
-        hosts.unshift(upstreamServer);
+        items.unshift({ kind: 'address', value: upstreamServer });
     }
 
     const proxyTags: string[] = [];
@@ -118,8 +118,19 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
 
     const selectorTags = ["最佳延迟 🚀"].concatIf(isChain, "🔗 最佳延迟 🚀");
 
-    for (const protocol of protocols) {
-        for (const host of hosts) {
+    // 按 cleanIPs 的输入顺序遍历：普通地址生成 VLESS/Trojan 节点，代理条目生成独立 socks/http(s) 节点
+    //（只做节点：不设 detour、不进链式分支）
+    for (const item of items) {
+        if (item.kind === 'proxy') {
+            const tag = cleanProxyRemark(item.value);
+            outbounds.push(buildCleanProxyOutbound(item.value, tag));
+            proxyTags.push(tag);
+            selectorTags.push(tag);
+            continue;
+        }
+
+        const host = item.value;
+        for (const protocol of protocols) {
             const addrPorts = entryPortMap[host]?.length ? entryPortMap[host] : totalPorts;
 
             for (const port of addrPorts) {
@@ -264,8 +275,17 @@ export async function getSbWarpConfig(request: Request, env: Env): Promise<Respo
         outbounds.push(warpOutbound, wowOutbound);
     });
 
+    // Clean IPs / Domains 里的代理条目 → 独立可选节点（只做节点：不设 detour、不进链式分组）
+    const extraOutbounds: Outbound[] = [];
+    for (const proxy of cleanProxyEntries(globalThis.settings.cleanIPs || [])) {
+        const tag = cleanProxyRemark(proxy);
+        extraOutbounds.push(buildCleanProxyOutbound(proxy, tag));
+        proxyTags.push(tag);
+        selectorTags.push(tag);
+    }
+
     const config = await buildConfig(
-        [],
+        extraOutbounds,
         outbounds,
         selectorTags,
         proxyTags,

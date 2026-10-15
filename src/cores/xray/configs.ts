@@ -5,6 +5,7 @@ import type { Balancer, Config, Observatory, Outbound } from '#types/xray';
 import { buildDokodemoInbound, buildMixedInbound } from './inbounds';
 import {
     buildChainOutbound,
+    buildCleanProxyOutbound,
     buildWebsocketOutbound,
     buildWarpOutbound,
     buildFreedomOutbound
@@ -12,7 +13,9 @@ import {
 
 import {
     buildEntryPortMap,
-    getConfigAddresses,
+    getConfigItems,
+    cleanProxyEntries,
+    cleanProxyRemark,
     generateRemark,
     generateWsPath,
     pickEarlyData,
@@ -275,23 +278,37 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     // 已占用 early-data 阈值集合：与 usedPaths 同粒度、同批次共享，保证任意两个节点的 ed 两两不同
     const usedEds = new Set<number>();
     const chainProxy = outProxy ? buildChainOutbound(pickEarlyData(usedEds)) : undefined;
-    const hosts = await getConfigAddresses(isFragment);
+    const items = await getConfigItems(isFragment);
     const entryPortMap = buildEntryPortMap();
     const totalPorts = ports.filter(port => !isFragment || isHttps(port));
     const protocols = getProtocols();
 
     if (upstreamServer && upstreamPort && !isFragment) {
         totalPorts.unshift(upstreamPort);
-        hosts.unshift(upstreamServer);
+        items.unshift({ kind: 'address', value: upstreamServer });
     }
 
     const configs: Config[] = [];
     const proxies: Outbound[] = [];
     const chains: Outbound[] = [];
+    // 最佳延迟组只由 WS 地址节点组成（代理条目是独立节点，不参与）
+    const hosts = items
+        .filter((item): item is { kind: 'address'; value: string } => item.kind === 'address')
+        .map(item => item.value);
     let index = 1;
 
-    for (const protocol of protocols) {
-        for (const host of hosts) {
+    // 按 cleanIPs 的输入顺序遍历：普通地址生成 VLESS/Trojan 节点，代理条目生成该协议自己的独立节点
+    for (const item of items) {
+        if (item.kind === 'proxy') {
+            const remark = cleanProxyRemark(item.value);
+            const outbound = buildCleanProxyOutbound(item.value, `cleanproxy-${index}`);
+            configs.push(await buildConfig(remark, [outbound], false, false, false, false, false, [item.value.server]));
+            index++;
+            continue;
+        }
+
+        const host = item.value;
+        for (const protocol of protocols) {
             const addrPorts = entryPortMap[host]?.length ? entryPortMap[host] : totalPorts;
 
             for (const port of addrPorts) {
@@ -388,6 +405,23 @@ export async function getXrWarpConfigs(
         // warp / WoW 出站无 wsSettings，不涉及 early-data，故 usedEds 传 undefined
         const chain = modifyOutbound(wowOutbound, `chain-${index + 1}`, undefined, `proxy-${index + 1}`);
         chains.push(chain);
+    }
+
+    // Clean IPs / Domains 里的代理条目 → 独立可选节点
+    //（只做节点：不挂 dialerProxy、不进 proxies/chains 数组，因此不参与链式与最佳延迟组）
+    let cleanProxyIndex = 1;
+    for (const proxy of cleanProxyEntries(globalThis.settings.cleanIPs || [])) {
+        const outbound = buildCleanProxyOutbound(proxy, `cleanproxy-${cleanProxyIndex++}`);
+        configs.push(await buildConfig(
+            cleanProxyRemark(proxy),
+            [outbound],
+            false,
+            false,
+            false,
+            true,
+            false,
+            [proxy.server]
+        ));
     }
 
     const warpBestPing = await buildConfig(

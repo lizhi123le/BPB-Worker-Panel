@@ -124,7 +124,8 @@ interface Mux {
 
 export interface TlsSettings {
     serverName: string;
-    fingerprint: Fingerprint;
+    // xray 的 tlsSettings.fingerprint 本身可选：只用标准证书校验、不做 uTLS 指纹时不下发
+    fingerprint?: Fingerprint;
     alpn?: string[];
     echConfigList?: string;
 }
@@ -274,7 +275,8 @@ export interface HttpSocksSettings {
     servers: [{
         address: string;
         port: number;
-        users: [{
+        // 无认证的 socks/http 代理不写 users（xray 视为匿名），故可选
+        users?: [{
             user: string;
             pass: string;
         }];

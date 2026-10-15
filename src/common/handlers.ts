@@ -8,7 +8,7 @@ import { getXrCustomConfigs, getXrWarpConfigs } from "@xray/configs";
 import { fetchWarpAccounts } from "@warp";
 import { UnifiedWSHandler, getXPaddingIdentifier } from "@unified";
 import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, HttpStatus, respond, safeErrorMessage, securityHeaders } from "@common";
-import { buildEntryPortMap, countryToRegion, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigAddresses, OFFICIAL_DIRECT_IPS, parseHostPort, parseProxyIPWithRegion, pickEarlyData, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
+import { buildEntryPortMap, countryToRegion, cleanProxyEntries, cleanProxyShareLink, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigItems, OFFICIAL_DIRECT_IPS, parseHostPort, parseProxyIPWithRegion, pickEarlyData, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
 /**
@@ -892,17 +892,25 @@ export async function getURLConfigs() {
         return config.href;
     }
 
-    let VLConfs = '', TRConfs = '', chainProxy = '';
-    const addrs = await getConfigAddresses(false);
+    let nodeConfs = '', chainProxy = '';
+    const items = await getConfigItems(false);
 
     if (upstreamServer && upstreamPort) {
         ports.unshift(upstreamPort);
-        addrs.unshift(upstreamServer);
+        items.unshift({ kind: 'address', value: upstreamServer });
     }
 
     const entryPortMap = buildEntryPortMap();
 
-    for (const addr of addrs) {
+    // 按 cleanIPs 的输入顺序输出节点：普通地址出 VLESS/Trojan 链接，代理条目出该协议自己的分享链接
+    //（只做节点，不参与链式；链式仍由 outProxy 单独承担）
+    for (const item of items) {
+        if (item.kind === 'proxy') {
+            nodeConfs += `${cleanProxyShareLink(item.value)}\n`;
+            continue;
+        }
+
+        const addr = item.value;
         const addrPorts = entryPortMap[addr]?.length ? entryPortMap[addr] : ports;
 
         for (const port of addrPorts) {
@@ -912,13 +920,13 @@ export async function getURLConfigs() {
             if (VLConfigs) {
                 const remark = generateRemark(port, addr, _VL_, false, false);
                 const vlConfig = buildConfig(atob('dmxlc3M='), addr, port, host, sni, remark, allowInsecure);
-                VLConfs += `${vlConfig}\n`;
+                nodeConfs += `${vlConfig}\n`;
             }
 
             if (TRConfigs) {
                 const remark = generateRemark(port, addr, _TR_, false, false);
                 const trConfig = buildConfig(atob('dHJvamFu'), addr, port, host, sni, remark, allowInsecure);
-                TRConfs += `${trConfig}\n`;
+                nodeConfs += `${trConfig}\n`;
             }
         }
     }
@@ -938,7 +946,7 @@ export async function getURLConfigs() {
     }
 
     const customConfs = joinConfigSections(customConfigs.join("\n"), await fetchCustomSubs(customSubs));
-    const configs = base64EncodeUtf8(joinConfigSections(VLConfs, TRConfs, chainProxy, customConfs));
+    const configs = base64EncodeUtf8(joinConfigSections(nodeConfs, chainProxy, customConfs));
 
     return new Response(configs, {
         status: 200,
