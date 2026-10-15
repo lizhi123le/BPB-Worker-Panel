@@ -727,6 +727,31 @@ function parseAddressEntry(value) {
     return value.includes('#') ? value.split('#')[0].trim() : value;
 }
 
+/**
+ * 条目是否为代理写法。与后端 parseCleanProxy 的启发式保持一致（忽略 #备注）：
+ *   socks:// / socks5:// 一律是代理；
+ *   http(s):// 仅在「带凭据」或「有端口且无路径」或「无路径的 IP 字面量」时是代理，
+ *   其余（带路径、无凭据、非 IP）仍是远程清单 URL。
+ * 用途：代理条目大小写敏感（user/pass、#备注），提交去重时不得 toLowerCase。
+ */
+function isProxyLikeEntry(item) {
+    if (/^socks5?:\/\//i.test(item)) return true;
+    if (!/^https?:\/\//i.test(item)) return false;
+
+    const afterScheme = item.slice(item.indexOf('://') + 3);
+    const authority = afterScheme.split('#')[0];
+    if (authority.includes('@')) return true;   // 带凭据 → 代理
+
+    const pathIndex = authority.search(/[/?]/);
+    const hasPath = pathIndex !== -1 && authority.slice(pathIndex).replace(/^\//, '') !== '';
+    if (hasPath) return false;                  // 带路径 → 远程清单 URL
+
+    const hasPort = /:\d+$/.test(authority);
+    const isIpLiteral = /^\d{1,3}(\.\d{1,3}){3}(?::\d+)?$/.test(authority)
+        || /^\[[0-9a-fA-F:.]+\](?::\d+)?$/.test(authority);
+    return hasPort || isIpLiteral;
+}
+
 function validateMultipleHostNames() {
     // cleanIPs 允许代理条目（socks / socks5 / http(s)，由服务端生成独立可选节点）；
     // customCdnAddrs 仍是纯地址列表，代理写法在那里没有意义，继续按主机名校验。
@@ -1208,17 +1233,10 @@ function validateSettings() {
                 return [line];
             });
             // 去重（保持先后顺序），URL 或普通条目归一化防重
-            // 代理条目（socks/socks5/http(s) 带凭据或 host:port）必须保留大小写：
-            // user/pass 大小写敏感，整体 toLowerCase 会静默改坏认证信息。
-            const isProxyEntry = (item) => {
-                if (/^socks5?:\/\//i.test(item)) return true;
-                if (!/^https?:\/\//i.test(item)) return false;
-                if (/^https?:\/\/[^@\s/?#]*@/i.test(item)) return true;              // 带凭据
-                return /^https?:\/\/[^:/\s?#]+:\d+\/?$/i.test(item);                  // host:port（无路径）
-            };
+            // 代理条目大小写敏感（user/pass、#备注），整体 toLowerCase 会静默改坏它们。
             const seen = new Set();
             items = items.filter(item => {
-                const norm = (item.startsWith('http://') || item.startsWith('https://')) && !isProxyEntry(item)
+                const norm = (item.startsWith('http://') || item.startsWith('https://')) && !isProxyLikeEntry(item)
                     ? item.toLowerCase()
                     : item;
                 if (seen.has(norm)) return false;
