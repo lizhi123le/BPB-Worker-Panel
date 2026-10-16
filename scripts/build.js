@@ -1,12 +1,12 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname as pathDirname } from 'path';
 import { fileURLToPath } from 'url';
+import { spawnSync } from 'node:child_process';
 import { build } from 'esbuild';
 import { globSync } from 'glob';
 import { minify as jsMinify } from 'terser';
 import { minify as htmlMinify } from 'html-minifier';
 import JSZip from "jszip";
-import obfs from 'javascript-obfuscator';
 import pkg from '../package.json' with { type: 'json' };
 import { gzipSync } from 'zlib';
 
@@ -18,6 +18,13 @@ const __dirname = pathDirname(__filename);
 
 const ASSET_PATH = join(__dirname, '../src/assets');
 const DIST_PATH = join(__dirname, '../dist/');
+const WORKER_PATH = join(DIST_PATH, 'worker.js');
+const ZIP_PATH = join(DIST_PATH, 'worker.zip');
+// 构建中间产物（混淆前基准、构建报告、smoke 会话快照）刻意放在 dist/ **之外**：
+// dist/ 是会被整体部署/上传的目录，把未混淆的 worker.reference.js 留在里面等于把
+// 明文包一起发出去。.build/ 不被 .gitignore 的白名单收录，也不会进任何部署路径。
+const BUILD_DIR = join(__dirname, '../.build/');
+const REFERENCE_PATH = join(BUILD_DIR, 'worker.reference.js');
 
 const green = '\x1b[32m';
 const red = '\x1b[31m';
@@ -213,9 +220,15 @@ async function buildWorker() {
 
     console.log(`${success} Worker built successfuly!`);
 
-    const minifyCode = async (code) => {
+    // mangle 默认开启（传统 mangle 模式用）；交给 js-confuser 混淆时**必须关掉**：
+    // terser 会把形参和 catch 参数复用成同一个短名（例如 `async function Kt(e){...catch(e){}}`），
+    // 而 js-confuser 2.0 的 renameVariables 是按名字解析绑定的，遇到这种同名不同绑定
+    // 就会把闭包里的引用改到错误的绑定上 —— 实测表现为 `env.kv` 变成别的对象的属性，
+    // KV 读取全部 500。让 js-confuser 面对未压缩的标识符，重命名由它自己统一完成。
+    const minifyCode = async (code, { mangle = true } = {}) => {
         const minified = await jsMinify(code, {
             module: true,
+            mangle,
             output: {
                 comments: false
             },
@@ -225,7 +238,7 @@ async function buildWorker() {
             }
         });
 
-        console.log(`${success} Worker minified successfuly!`);
+        console.log(`${success} Worker minified successfuly!${mangle ? '' : '（保留标识符，交给 js-confuser 改名）'}`);
         return minified;
     }
 
@@ -237,57 +250,83 @@ async function buildWorker() {
         const minifiedCode = await minifyCode(junkCode + code.outputFiles[0].text);
         finalCode = minifiedCode.code;
     } else {
-        const minifiedCode = await minifyCode(code.outputFiles[0].text);
-        const obfuscationResult = obfs.obfuscate(minifiedCode.code, {
-            compact: true,
-            controlFlowFlattening: false,
-            controlFlowFlatteningThreshold: 0,
-            deadCodeInjection: false,
-            stringArray: true,
-            stringArrayEncoding: ['base64'],
-            stringArrayThreshold: 1.0,
-            stringArrayRotate: true,
-            stringArrayShuffle: true,
-            stringArrayWrappersCount: 2,
-            stringArrayWrappersChainedCalls: false,
-            stringArrayWrappersParametersMaxCount: 3,
-            renameGlobals: true,
-            identifierNamesGenerator: 'mangled-shuffled',
-            identifierNamesCache: null,
-            identifiersPrefix: '',
-            renameProperties: false,
-            renamePropertiesMode: 'safe',
-            ignoreImports: false,
-            target: 'browser',
-            numbersToExpressions: false,
-            simplify: false,
-            splitStrings: true,
-            splitStringsChunkLength: 1,
-            transformObjectKeys: false,
-            unicodeEscapeSequence: true,
-            selfDefending: false,
-            debugProtection: false,
-            debugProtectionInterval: 0,
-            disableConsoleOutput: false,
-            domainLock: []
-        });
-
-        console.log(`${success} Worker obfuscated successfuly!`);
-        finalCode = obfuscationResult.getObfuscatedCode();
+        const minifiedCode = await minifyCode(code.outputFiles[0].text, { mangle: false });
+        finalCode = minifiedCode.code;
     }
 
-    const worker = `${jszipRuntime}${finalCode}`.replace(/\/\/ .*/g, '').replace(/\n+/g, '');
-    mkdirSync(DIST_PATH, { recursive: true });
-    writeFileSync('./dist/worker.js', worker, 'utf8');
+    // 混淆前的基准产物：esbuild 打包 + terser 压缩 + JSZip 运行时。
+    // 它同时是 obfuscate 的输入、verify/smoke 的比对参考，所以先落盘再进入混淆阶段。
+    const reference = `${jszipRuntime}${finalCode}`.replace(/\/\/ .*/g, '').replace(/\n+/g, '');
+    mkdirSync(pathDirname(REFERENCE_PATH), { recursive: true });
+    writeFileSync(REFERENCE_PATH, reference, 'utf8');
+    console.log(`${success} Pre-obfuscation reference written: ${REFERENCE_PATH} (${reference.length} bytes)`);
 
+    if (mangleMode) {
+        // 传统 mangle 模式（NODE_ENV=mangle）：垃圾代码 + terser，不做字符串密文化。
+        writeFileSync(WORKER_PATH, reference, 'utf8');
+    } else {
+        await obfuscateWithGates();
+    }
+
+    const worker = readFileSync(WORKER_PATH, 'utf8');
     const zip = new JSZip();
     zip.file('_worker.js', worker);
-    zip.generateAsync({
-        type: 'nodebuffer',
-        compression: 'DEFLATE'
-    }).then(nodebuffer => writeFileSync('./dist/worker.zip', nodebuffer));
+    // 必须 await：之前是 fire-and-forget，进程有可能先退出，zip 永远写不出来。
+    const nodebuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    writeFileSync(ZIP_PATH, nodebuffer);
 
-    console.log(`${success} Done!`);
+    console.log(
+        `${success} Done! worker.js ${worker.length} bytes, worker.zip ${nodebuffer.length} bytes`
+    );
+}
+
+/**
+ * 混淆 + 双层闸门 + 重试。
+ *
+ * 每次尝试都用一条**全新的随机 ChaCha20 密钥**，所以重试出来的产物互不相同；
+ * 静态闸门（verify）与行为闸门（smoke）都过了才接受这一份。
+ * 闸门跑在独立进程里（stdio inherit），这样单个闸门崩溃不会污染构建进程。
+ */
+async function obfuscateWithGates() {
+    const attempts = Math.max(1, Number(process.env.HARDEN_ATTEMPTS || 3));
+    const smokeEvery = process.env.SMOKE_EVERY !== '0';
+
+    const run = (script, args = []) => {
+        const result = spawnSync(process.execPath, [join(__dirname, '..', script), ...args], {
+            stdio: 'inherit',
+            cwd: join(__dirname, '..')
+        });
+        if (result.error) throw result.error;
+        return result.status === 0;
+    };
+
+    // 先验证密码本身（ChaCha20 已知答案向量 + 编解码往返），再花时间跑整包混淆。
+    if (!run('tools/cipher.test.mjs')) {
+        throw new Error('ChaCha20 密文自检未通过 —— 先修 tools/cipher.mjs，不要继续构建');
+    }
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        console.log(`\n${success} 混淆尝试 ${attempt}/${attempts}`);
+        if (!run('scripts/obfuscate.mjs', ['.build/worker.reference.js', 'dist/worker.js'])) {
+            console.error(`${failure} obfuscate 失败，重试`);
+            continue;
+        }
+        if (!run('scripts/verify.mjs')) {
+            console.error(`${failure} verify 未通过，换一条密钥重试`);
+            continue;
+        }
+        if (smokeEvery && !run('scripts/smoke.mjs')) {
+            console.error(`${failure} smoke 未通过，换一条密钥重试`);
+            continue;
+        }
+        return;
+    }
+
+    throw new Error(
+        `混淆产物连续 ${attempts} 次未通过验证闸门 —— 不要部署 dist/worker.js。` +
+            `可调 HARDEN_STRINGS / HARDEN_OPAQUE / HARDEN_MAX_STRING 降低激进程度，` +
+            `或设 SMOKE_EVERY=0 先只跑静态闸门看具体报错。`
+    );
 }
 
 buildWorker().catch(err => {

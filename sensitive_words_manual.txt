@@ -1,0 +1,12 @@
+# 指纹观察词表（仅提示，不会让构建失败）
+#
+# 这些属于"希望被隐藏、但不阻塞构建"的特征串。verify.mjs 命中时只打印 WARN，
+# 便于你观察某一版产物是否把某个特征漏在了外面。
+# 注意：运行时全局名（如 DecompressionStream）是标识符而不是字符串字面量，
+# js-confuser 的 stringConcealing 管不到它们，因此不要把它们放进硬性词表。
+
+speedtest.net
+dns-query
+proxy-ip
+workers.dev
+pages.dev

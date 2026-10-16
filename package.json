@@ -7,14 +7,21 @@
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",
-    "build": "node scripts/build.js"
+    "build": "node scripts/build.js",
+    "test:cipher": "node tools/cipher.test.mjs",
+    "obfuscate": "node scripts/obfuscate.mjs",
+    "verify": "node scripts/verify.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:bench": "node scripts/smoke.mjs --bench=200"
   },
   "devDependencies": {
+    "@babel/parser": "^7.26.3",
     "@eslint/css": "^1.3.0",
     "@eslint/js": "^10.0.1",
     "@eslint/markdown": "^8.0.2",
     "@types/node": "^25.9.1",
     "eslint": "^10.4.1",
+    "js-confuser": "2.0.0",
     "typescript": "^6.0.3"
   },
   "dependencies": {
@@ -23,7 +30,6 @@
     "glob": "^13.0.6",
     "globals": "^17.6.0",
     "html-minifier": "^4.0.0",
-    "javascript-obfuscator": "latest",
     "jose": "^6.2.3",
     "jszip": "^3.10.1",
     "terser": "^5.48.0"

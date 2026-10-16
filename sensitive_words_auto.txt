@@ -1,0 +1,20 @@
+# 硬性禁止词表（verify.mjs 命中即构建失败）
+#
+# 这些词必须在本仓库产物里彻底消失（明文、注释、标识符、转义串都不许出现）。
+# 用途：
+#  1) verify.mjs 的明文泄露检查；
+#  2) HARDEN_STRINGS=false 时，obfuscate.mjs 只隐藏"包含这些词"的字符串。
+# 大小写不敏感，按子串 / 词边界匹配。每行一个，空行与 # 开头行忽略。
+
+bpb
+bpb-worker-panel
+bia-pain-bache
+yousef.isegaro
+isegaro
+vless
+trojan
+shadowsocks
+vmess
+v2ray
+cloudflare-ech.com
+bpb.yousef

@@ -5,7 +5,11 @@
 !src/
 !src/**
 !scripts/
-!scripts/build.js
+!scripts/**
+!tools/
+!tools/**
+!sensitive_words_auto.txt
+!sensitive_words_manual.txt
 !.github/
 !.github/**
 !README_fa.md
