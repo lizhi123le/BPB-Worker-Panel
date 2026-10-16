@@ -723,6 +723,14 @@ hr {
     color: var(--color-brand-hover);
 }
 
+/* tbody 改成 flex 之后表格不再参与 table 布局，<table> 会退化成收缩宽度，
+   行（连同 hover 底色、行分隔线）只包住左侧客户端列，右侧留出一大片空白。
+   显式 block + 100% 让表格铺满 .table-container，行才撑到最右边。 */
+.table-container table {
+    display: block;
+    width: 100%;
+}
+
 .table-container tbody {
     display: flex;
     flex-direction: column;
@@ -731,6 +739,7 @@ hr {
 .table-container tr {
     display: flex;
     flex-direction: row;
+    width: 100%;
     padding: var(--space-lg);
     gap: var(--space-sm);
 }
@@ -739,12 +748,16 @@ table tr:not(:last-child) {
     border-bottom: 1px solid var(--color-border-accent);
 }
 
+/* 左侧客户端列吃掉剩余宽度，把操作按钮列顶到深色容器的右边缘 */
 .table-container tr td:first-child {
     white-space: nowrap;
+    flex: 1 1 auto;
 }
 
 .table-container tr td:nth-child(2) {
+    flex: 0 0 auto;
     flex-direction: row;
+    justify-content: flex-end;
     gap: 8px;
     width: fit-content;
 }
