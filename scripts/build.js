@@ -349,7 +349,7 @@ async function obfuscateWithGates() {
         // 最后一组：reference 行为闸门（只依赖混淆前产物，故只在这一份已过静态+行为闸门的
         // 产物上跑一次，不随重试重复）。任何一项失败都直接终止：换密钥不会让源码行为变对。
         for (const { script, label } of referenceGates) {
-            console.log(`\n${success} reference 行为闸门 ${attempt}/${attempts}：${script}`);
+            console.log(`\n${success} reference 行为闸门（本次混淆尝试 ${attempt}/${attempts} 的产物）：${script}`);
             console.log(`      ${label}`);
             if (!run(script)) {
                 throw new Error(

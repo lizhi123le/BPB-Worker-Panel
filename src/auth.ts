@@ -1,5 +1,5 @@
 import { SignJWT, jwtVerify } from 'jose';
-import { HttpStatus, isKvBound, respond } from '@common';
+import { HttpStatus, isKvBound, respond, safeErrorMessage } from '@common';
 import { checkAuthRateLimit, recordAuthFailure, resetAuthRateLimit } from './common/ratelimit';
 
 /** 会话生命周期（秒）：JWT 过期时间与 Cookie Max-Age 必须同源，否则浏览器会拿着已过期令牌反复请求（F9） */
@@ -183,7 +183,10 @@ export async function Authenticate(request: Request, env: Env): Promise<boolean>
 
         return true;
     } catch (error) {
-        console.log(error);
+        // 只留一行原因，**不要**打整个 Error：这条路径对任何携带伪造/过期 jwtToken 的请求都会走到
+        // （/panel/* 在鉴权前就可达），打 Error 会把完整堆栈写进 Worker 日志 —— 一个 Cookie 就能灌日志。
+        // jose 验签失败带 code（如 ERR_JWS_SIGNATURE_VERIFICATION_FAILED），优先用它，便于日志检索。
+        console.log(`Authentication failed: ${(error as { code?: string })?.code || safeErrorMessage(error)}`);
         return false;
     }
 }

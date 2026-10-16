@@ -29,8 +29,22 @@ const ORIGIN = 'https://panel.example.com';
 const BUNDLE = '.build/worker.reference.js';
 
 let failures = 0;
+/**
+ * 接管 console：Worker 的日志全部收进 workerLogs。
+ *   · 断言用：能区分"旧会话因验签失败被拒"与"这次请求根本没带 token"（两者都是 401，只看状态码是假绿）；
+ *   · 构建日志用：npm run build 的闸门输出只剩 PASS/FAIL，失败时才把捕获的日志回放出来（与
+ *     tools/ws-firstpacket.test.mjs 同一套做法）。
+ */
+const out = (...args) => process.stdout.write(args.join(' ') + '\n');
+const workerLogs = [];
+for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
+    console[level] = (...args) => { workerLogs.push(args.map((a) => (a && a.message) ? a.message : String(a)).join(' ')); };
+}
+process.on('exit', () => {
+    if (failures > 0) process.stdout.write('\n--- 捕获到的 Worker 日志 ---\n' + workerLogs.join('\n') + '\n');
+});
 const check = (name, ok, detail = '') => {
-    console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !detail ? '' : `\n      ${detail}`}`);
+    out(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !detail ? '' : `\n      ${detail}`}`);
     if (!ok) failures++;
 };
 
@@ -50,13 +64,31 @@ function makeKv(seed = {}) {
     };
 }
 
+/**
+ * 预置两个形状合法的 WARP 账号：settings 路径走 KV 命中，测试就不会真的去 POST 注册接口。
+ * 否则 fetch 桩返回的是伪装页 HTML，response.json() 撞上 '<' 抛 SyntaxError，构造日志里会多出一条
+ * 「Failed to fetch new WARP accounts: Unexpected token '<'…」——那是测试环境产物，不是被测行为。
+ * 形状对齐 normalizeWarpAccounts/isValidWarpAccount 的守卫（四个字段都必须是非空字符串）。
+ */
+const WARP_ACCOUNT = {
+    privateKey: 'YI9lLc0S3z4PqyZ7wJk6v1Bn2Xm5Tg8RhQdVcFbAeUs=',
+    publicKey: 'Q2FzZVVuaXRRdWlja0Jyb3duRm94SnVtcHNPdmVyTGF6eURvZz0=',
+    warpIPv6: '2606:4700:110:8a1b::1/128',
+    reserved: 'AbCd'
+};
+const WARP_SEED = {
+    warpAccounts: JSON.stringify([WARP_ACCOUNT, { ...WARP_ACCOUNT, privateKey: 'Zk8yN2J4cTZ3eDFCbjJYbTVUZzhSaFFkVmNGYkFlVXM=' }])
+};
+/** KV 桩：预置合法 warpAccounts（不出站），其余行为与生产 KV 一致 */
+const makeTestKv = () => makeKv(WARP_SEED);
+
 globalThis.fetch = async () => new Response('<!DOCTYPE html><html><body>upstream</body></html>', { headers: { 'content-type': 'text/html' } });
 
 let handler;
 try {
     handler = (await import(pathToFileURL(BUNDLE).href)).default;
 } catch (error) {
-    console.error(`找不到可加载的 ${BUNDLE} —— 请先构建：npm run build\n${error.message}`);
+    out(`找不到可加载的 ${BUNDLE} —— 请先构建：npm run build\n${error.message}`);
     process.exit(1);
 }
 if (!handler || typeof handler.fetch !== 'function') throw new Error(`${BUNDLE} 没有 default.fetch()`);
@@ -80,7 +112,7 @@ const post = (body) => ({ method: 'POST', headers: { 'Content-Type': 'text/plain
 const modeOf = (html) => html.match(/<body[^>]*data-auth-mode=(["']?)([a-z-]+)\1/)?.[2];
 
 // ================================================ 1) KV 已绑定但还没设口令：登录页给设置表单
-const env = makeEnv(makeKv());
+const env = makeEnv(makeTestKv());
 let res = await call(env, '/login');
 let html = await res.text();
 check('空口令时 GET /login = 200', res.status === 200, `status=${res.status}`);
@@ -156,7 +188,7 @@ res = await call(noKvEnv, '/panel');
 check('未绑定 KV 时 /panel 仍是原错误页（行为未变）', res.status === 500, `status=${res.status}`);
 
 // ================================================ 5) 缺必填凭据：登录页照旧给错误页（C-13 未放宽）
-const noCredEnv = { kv: makeKv() };
+const noCredEnv = { kv: makeTestKv() };
 res = await call(noCredEnv, '/login');
 const credBody = await res.text();
 check('缺 UUID / Trojan 口令时 /login 仍是凭据错误页', res.status === 500 && credBody.includes('/secrets'), `status=${res.status}`);
@@ -165,7 +197,7 @@ check('缺 UUID / Trojan 口令时 /login 仍是凭据错误页', res.status ===
 // 6a) 无口令时 /panel 302 到 /login；/panel/settings 未认证不下发任何部署状态
 // 6b) 未设口令时，未登录直接打 /panel/reset-password 也必须被拒（冗余入口已封闭）
 // 6c) 首访设好口令后，已登录改密仍可用，且改密即吊销旧会话（既有 F9 语义）
-const panelEnv = makeEnv(makeKv());
+const panelEnv = makeEnv(makeTestKv());
 res = await call(panelEnv, '/panel');
 check('无口令时 GET /panel 302 到 /login（不再渲染面板外壳）',
     res.status === 302 && (res.headers.get('location') || '').endsWith('/login'), `status=${res.status} loc=${res.headers.get('location')}`);
@@ -193,8 +225,17 @@ res = await call(panelEnv, '/panel/reset-password', { method: 'POST', headers: {
 json = await res.json();
 check('已登录改密仍可用（/panel/reset-password）', json.success === true && panelEnv.kv.store.get('pwd') === 'Panel-pass-2', JSON.stringify(json).slice(0, 140));
 
+// 6c) 改密即吊销旧会话（F9：轮换签名密钥）——除了 401，还要钉住**被拒的原因**：
+//     必须是验签失败（旧密钥签的 token 已失效），而不是"这次请求根本没带 token"。
+//     后者同样是 401，只看状态码会让这条断言变成假绿。
+workerLogs.length = 0;
 res = await call(panelEnv, '/panel/settings', { headers: { cookie: `jwtToken=${panelCookie}` } });
+const revokeLogs = workerLogs.join('\n');
 check('改密即吊销旧会话（F9：轮换签名密钥）', res.status === 401, `status=${res.status}`);
+check('旧会话被拒的原因是验签失败，而非未携带 token',
+    /ERR_JWS_SIGNATURE_VERIFICATION_FAILED|signature verification failed/i.test(revokeLogs)
+        && !/Token not available/i.test(revokeLogs),
+    revokeLogs.slice(0, 240));
 
 res = await call(panelEnv, '/login/set-password', post('Hijack-pass-1'));
 json = await res.json();
@@ -205,10 +246,18 @@ json = await res.json();
 check('改密后的新口令可以直接在 /login 登录', json.success === true, JSON.stringify(json).slice(0, 140));
 
 // 6d) 反向：/login 首访设好口令后，未带会话的 /panel 一样是 302 到 /login（不再有「白送面板外壳」的中间态）
+//     env 的口令在第 2 节已设好，所以这次请求会真正走到 token 检查（而不是"KV 里还没有 pwd"就提前返回）。
+workerLogs.length = 0;
 res = await call(env, '/panel/settings');
 check('/login 首访设好口令后 /panel/settings 未带会话仍是 401（面板走登录重定向）', res.status === 401, `status=${res.status}`);
+// 与 F9 那条互为对照：同样是 401，这里的原因必须是「未携带 token」，不能是验签失败。
+// 两条一起才证明「按日志区分两种拒绝原因」本身有效（否则新加的那条会退化成永远为真）。
+check('未认证被拒的原因是「未携带 token」（与 F9 的验签失败可区分）',
+    /Token not available/i.test(workerLogs.join('\n'))
+        && !/signature verification failed|ERR_JWS/i.test(workerLogs.join('\n')),
+    workerLogs.join('\n').slice(0, 200));
 res = await call(env, '/panel');
 check('/login 首访设好口令后未带会话 GET /panel 重定向到 /login', res.status === 302 && (res.headers.get('location') || '').endsWith('/login'), `status=${res.status} loc=${res.headers.get('location')}`);
 
-console.log(failures === 0 ? '\nlogin-firstrun: OK' : `\nlogin-firstrun: ${failures} 项失败`);
+out(failures === 0 ? '\nlogin-firstrun: OK' : `\nlogin-firstrun: ${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);
