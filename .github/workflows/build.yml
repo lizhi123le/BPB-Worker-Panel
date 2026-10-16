@@ -32,7 +32,14 @@ jobs:
           node-version: "24"
 
       - name: Install dependencies
-        run: npm install --production
+        # 构建链本身就是 devDependencies：js-confuser（混淆）与 @babel/parser（静态闸门）都在
+        # devDependencies 里，`--production` 会把它们整段跳过，构建必然在 import 阶段失败。
+        # 本镜像又自带全局 tsc，会让 `npm run check` 在缺本地 typescript 时照样显示成功，
+        # 把问题一路掩盖到构建阶段——所以这里显式 --include=dev，再用 ensure-deps 复查一次：
+        # 一旦发现缺包就自己执行 npm install --include=dev 补齐（scripts/build.js 里还会再查）。
+        run: |
+          npm install --include=dev --no-audit --no-fund
+          npm run ensure-deps
 
       - name: Type check
         run: npm run check

@@ -2,13 +2,19 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname as pathDirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'node:child_process';
-import { build } from 'esbuild';
-import { globSync } from 'glob';
-import { minify as jsMinify } from 'terser';
-import { minify as htmlMinify } from 'html-minifier';
-import JSZip from "jszip";
 import pkg from '../package.json' with { type: 'json' };
 import { gzipSync } from 'zlib';
+import { ensureDeps } from './ensure-deps.mjs';
+
+// 构建期依赖先自检/自补，再动态 import。
+// 静态 import 会在"包根本没装"时于模块链接阶段就抛 ERR_MODULE_NOT_FOUND，那时这段自检
+// 根本执行不到 —— 正是 `npm install --production` 漏装 devDependencies 时的现场。
+await ensureDeps();
+const { build } = await import('esbuild');
+const { globSync } = await import('glob');
+const { minify: jsMinify } = await import('terser');
+const { minify: htmlMinify } = await import('html-minifier');
+const { default: JSZip } = await import('jszip');
 
 const env = process.env.NODE_ENV || 'obfuscate';
 const mangleMode = env === 'mangle';
@@ -257,7 +263,12 @@ async function buildWorker() {
     // 混淆前的基准产物：esbuild 打包 + terser 压缩 + JSZip 运行时。
     // 它同时是 obfuscate 的输入、verify/smoke 的比对参考，所以先落盘再进入混淆阶段。
     const reference = `${jszipRuntime}${finalCode}`.replace(/\/\/ .*/g, '').replace(/\n+/g, '');
-    mkdirSync(pathDirname(REFERENCE_PATH), { recursive: true });
+    // dist/ 与 .build/ 都不在版本控制里（.gitignore 只放行源码），全新检出时并不存在。
+    // 这里必须把 dist/ 一起建出来：mangle 模式直接写 WORKER_PATH，混淆模式由
+    // scripts/obfuscate.mjs 写 dist/worker.js、最后还要写 dist/worker.zip ——
+    // 少了这个 mkdir，本地有 dist/ 时看不出来，CI 上必然 ENOENT。
+    mkdirSync(BUILD_DIR, { recursive: true });
+    mkdirSync(DIST_PATH, { recursive: true });
     writeFileSync(REFERENCE_PATH, reference, 'utf8');
     console.log(`${success} Pre-obfuscation reference written: ${REFERENCE_PATH} (${reference.length} bytes)`);
 
