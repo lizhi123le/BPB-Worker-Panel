@@ -1,14 +1,14 @@
-import { Authenticate, generateJWTToken, resetPassword } from "@auth";
+import { Authenticate, clearSessionCookieHeader, generateJWTToken, initializePassword, resetPassword } from "@auth";
 import { getDataset, updateDataset, InvalidSettingsError } from "@kv";
-import { setKvCache, clearKvCache } from "../kv-cache";
+import { setKvCache } from "../kv-cache";
 import { DEFAULT_SETTINGS, setSettings } from "@init";
 import { getClNormalConfig, getClWarpConfig } from "@clash/configs";
 import { getSbCustomConfig, getSbWarpConfig } from "@sing-box/configs";
 import { getXrCustomConfigs, getXrWarpConfigs } from "@xray/configs";
 import { fetchWarpAccounts } from "@warp";
 import { UnifiedWSHandler, getXPaddingIdentifier } from "@unified";
-import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, HttpStatus, respond, safeErrorMessage, securityHeaders } from "@common";
-import { buildEntryPortMap, countryToRegion, cleanProxyEntries, cleanProxyShareLink, DEFAULT_PROXY_IPS, entryPort, generateRemark, generateWsPath, getConfigItems, OFFICIAL_DIRECT_IPS, parseHostPort, parseProxyIPWithRegion, pickEarlyData, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
+import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, HttpStatus, isKvBound, respond, safeErrorMessage, securityHeaders } from "@common";
+import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, DEFAULT_PROXY_IPS, generateRemark, generateWsPath, getConfigItems, isHttps, OFFICIAL_DIRECT_IPS, parseHostPort, parseProxyIPWithRegion, pickEarlyData, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
 /**
@@ -149,7 +149,7 @@ export async function handleWebsocket(request: Request, env: Env): Promise<Respo
     // 对齐 cfnew：连接时按 workerRegion 动态选择 Proxy IP（服务端选择，不暴露给客户端）
     // 仅当列表含 @ 地区标签时收敛到匹配域名（纯 IP/IP:port 列表不收敛，全部参与 IP 池轮询）
     // CF 为 anycast，无地区选择概念：跳过收敛，避免 countryToRegion('CF')→'SG' 把 10 IP 池塌缩成 1 个
-    if (effectiveRegionMatch && globalThis.wsConfig.workerRegion !== 'CF' && globalThis.wsConfig.workerRegion && effectivePanelIPs.length > 0) {
+    if (effectiveRegionMatch && globalThis.wsConfig.workerRegion !== 'CF' && effectivePanelIPs.length > 0) {
         const hasRegionTags = effectivePanelIPs.some(p => parseProxyIPWithRegion(p).region);
         if (hasRegionTags) {
             const selected = selectProxyIPByRegion(effectivePanelIPs, globalThis.wsConfig.workerRegion);
@@ -284,16 +284,22 @@ export async function handleLogin(request: Request, env: Env): Promise<Response>
         return await generateJWTToken(request, env);
     }
 
+    // 首访「设置管理员口令」：只在 KV 尚无 pwd 时可用，成功后直接签发会话
+    if (pathName === '/login/set-password') {
+        return await initializePassword(request, env);
+    }
+
     return await fallback(request);
 }
 
 export function logout(): Response {
-    // F19：Cookie 属性与登录（auth.ts 的 `HttpOnly; Secure; Max-Age; Path=/; SameSite=Strict`）对齐。
+    // F19：清 Cookie 与登录（auth.ts 的 `HttpOnly; Secure; Max-Age; Path=/; SameSite=Strict`）对齐。
     // 旧值 `SameSite=None` 且缺 HttpOnly：任意跨站 `<img src=".../logout">` 即可强制登出。
+    // 现在登出与改密吊销共用 auth.ts 的 clearSessionCookieHeader()，不再各写一份。
     // 注：`/logout` 的「GET 也可触发 / 无鉴权」属 worker.ts 路由层（`case 'logout'` 直接调用本函数、
     // 不传 request），不在本次可改文件范围内。
     return respond(true, HttpStatus.OK, 'Successfully logged out!', null, {
-        'Set-Cookie': 'jwtToken=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
+        'Set-Cookie': clearSessionCookieHeader(),
         'Content-Type': 'text/plain'
     });
 }
@@ -435,13 +441,12 @@ async function resetSettings(request: Request, env: Env): Promise<Response> {
 }
 
 async function getSettings(request: Request, env: Env): Promise<Response> {
-    const isPassSet = Boolean(await env.kv.get('pwd'));
     const auth = await Authenticate(request, env);
 
     if (!auth) {
-        // F20：未鉴权时不再下发 isPassSet（未授权访客可据此精确判定「尚未设口令」，直接衔接抢注）。
-        // 仍返回空对象而非 null：面板脚本 panel/script.js:31 直接读 `body.isPassSet`，
-        // body 为 null 会抛 TypeError 并中断首访「设置口令」弹窗流程（见回报中的取舍说明）。
+        // F20：未鉴权一律不下发任何部署状态。这里原先带 isPassSet（未授权访客可据此判定「尚未设口令」
+        // 直接衔接抢注），首访引导收敛到 /login 的设置表单后已无消费方，连同那次 KV 读一并删掉。
+        // body 用空对象而非 null：调用方会直接读 body 上的字段。
         return respond(false, HttpStatus.UNAUTHORIZED, 'Unauthorized or expired session.', {});
     }
 
@@ -451,7 +456,6 @@ async function getSettings(request: Request, env: Env): Promise<Response> {
 
         const data = {
             proxySettings: dataset.settings,
-            isPassSet,
             subPath: subPath
         };
 
@@ -647,14 +651,18 @@ export async function serveIcon(): Promise<Response> {
 }
 
 async function renderPanel(request: Request, env: Env): Promise<Response> {
+    const { urlOrigin } = globalThis.httpConfig;
     const pwd = await env.kv.get('pwd');
 
-    if (pwd) {
-        const auth = await Authenticate(request, env);
-        if (!auth) {
-            const { urlOrigin } = globalThis.httpConfig;
-            return Response.redirect(`${urlOrigin}/login`, 302);
-        }
+    // 首访引导统一在 /login：KV 里还没有 `pwd` 时，面板页不再把面板外壳发给未授权访客
+    // （连「先渲染再让弹窗设口令」这条中间态一起收掉），直接 302 到 /login 的「设置管理员口令」页。
+    if (pwd === null) {
+        return Response.redirect(`${urlOrigin}/login`, 302);
+    }
+
+    const auth = await Authenticate(request, env);
+    if (!auth) {
+        return Response.redirect(`${urlOrigin}/login`, 302);
     }
 
     const html = await decompressHtml(__PANEL_HTML_CONTENT__, false);
@@ -670,7 +678,19 @@ async function renderLogin(request: Request, env: Env): Promise<Response> {
         return Response.redirect(`${urlOrigin}/panel`, 302);
     }
 
-    const html = await decompressHtml(__LOGIN_HTML_CONTENT__, false);
+    // 首访引导：全新部署首次访问 /login 时，给「设置管理员口令」表单而不是登录表单。
+    // 原现象：KV 里还没有 pwd，登录页却让用户输入一个并不存在的口令 —— 无论输什么都 401 Wrong password。
+    // 现在首访只有这一个入口：/panel 在无口令时也 302 回本页（见 renderPanel），面板弹窗只承担「已登录改密」。
+    // 判据只在服务端：KV 无 `pwd` ⇔ 尚未设置管理员口令。前端只把这个标记当界面开关，
+    // 真正允许「未登录写入口令」的是 /login/set-password（见 auth.ts，它在 pwd 不为空时一律 401），
+    // 所以标记过期（打开页面的同时口令被别人设走）只会退化成一个 401，不会造成越权覆盖。
+    // KV 未绑定时也按「尚未设置」渲染：本路径豁免了 initHttp 的 KV 校验（见 assertRequiredCredentials），
+    // 页面照常给设置表单，提交后由 /login/set-password 明确回一句「先绑定 KV」（而不是崩溃成 HTML 错误页）。
+    // 取字符串形态（asString=true）而不是流：要往页面里替换 __AUTH_MODE__ 标记
+    const isFirstRun = !isKvBound(env) || (await env.kv.get('pwd')) === null;
+    const html = (await decompressHtml(__LOGIN_HTML_CONTENT__, true) as string)
+        .replace('__AUTH_MODE__', isFirstRun ? 'setup' : 'login');
+
     return new Response(html, {
         headers: {
             'Content-Type': 'text/html; charset=utf-8',
@@ -812,7 +832,6 @@ export async function getURLConfigs() {
     resetRemarkCounter();
     const {
         globalConfig: { userID, TrPass },
-        httpConfig: { defaultHttpsPorts },
         dict: { _VL_, _TR_, _project_ },
         settings: {
             fingerprint,
@@ -841,7 +860,7 @@ export async function getURLConfigs() {
     const usedEds = new Set<number>();
 
     const buildConfig = (protocol: string, addr: string, port: number, host: string, sni: string, remark: string, allowInsecure: boolean) => {
-        const isTLS = defaultHttpsPorts.includes(port) || addr === upstreamServer || Object.values(entryPortMap).some(ports => ports.includes(port));
+        const isTLS = isHttps(port) || addr === upstreamServer || Object.values(entryPortMap).some(ports => ports.includes(port));
         const security = isTLS ? 'tls' : 'none';
         const config = new URL(`${protocol}://config`);
 

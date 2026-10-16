@@ -28,12 +28,6 @@ fetch('/panel/settings')
     .then(async response => response.json())
     .then(({ success, status, message, body }) => {
 
-        if (status === 401 && !body.isPassSet) {
-            const closeBtn = document.querySelector(".close");
-            openResetPass();
-            closeBtn.style.display = 'none';
-        }
-
         if (!success) {
             throw new Error(`status ${status} - ${message}`);
         }

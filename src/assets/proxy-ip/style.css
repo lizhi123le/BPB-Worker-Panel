@@ -56,15 +56,6 @@ body.has-fallback::before {
     background: var(--color-bg-main);
 }
 
-body.is-loading {
-    cursor: wait;
-}
-
-body.is-loading * {
-    cursor: wait !important;
-    pointer-events: none;
-}
-
 *,
 *::before,
 *::after {
@@ -82,11 +73,6 @@ h1 {
 
 .icon {
     height: 2.5rem;
-}
-
-#panel-version {
-    align-self: flex-start;
-    font-size: large;
 }
 
 table {
@@ -150,21 +136,4 @@ td:nth-child(4) {
 
 .material-symbols-rounded:hover {
     scale: calc(1.2);
-}
-
-.header {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.panel-version {
-    align-self: flex-start;
-    font-size: large;
-}
-.table-wrapper {
-    overflow-x: auto;
-    width: 100%;
-    text-align: center;
-    padding: var(--space-md);
 }

@@ -1,4 +1,4 @@
-import { withTimeout } from "@common";
+import { evictOldest, withTimeout } from "@common";
 
 /**
  * 永久黑名单 — IP 累计违规超过阈值后永久封禁（内存缓存 + KV 持久化）。
@@ -98,11 +98,8 @@ export async function recordViolationAndMaybeBan(
 
         let record = violationPool.get(ip);
         if (!record) {
-            while (violationPool.size >= VIOLATION_MEMORY_MAX_IPS) {
-                const oldest = violationPool.keys().next();
-                if (oldest.done) break;
-                violationPool.delete(oldest.value);
-            }
+            // 插入前腾位置（传 MAX-1），插入后内存条目不超过 VIOLATION_MEMORY_MAX_IPS
+            evictOldest(violationPool, VIOLATION_MEMORY_MAX_IPS - 1);
             record = { count: 0, loadedAt: 0, written: 0 };
             violationPool.set(ip, record);
         }

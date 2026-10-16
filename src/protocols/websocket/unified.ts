@@ -6,6 +6,7 @@ import {
     WS_READY_STATE_OPEN,
     connectSocket
 } from './common';
+import { evictOldest } from '@common';
 
 // 对齐 cfnew c0eb20c（明文源吗 L33-40）：隐私增强 —— 智能剥离随机填充前缀
 // 客户端首包可能携带 [0xED 0x7F][2 字节 padLen][padLen 字节随机填充]，若不剥离直接做
@@ -195,6 +196,126 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
         } catch (_) { /* 已关闭或正在关闭，忽略 */ }
     };
 
+    /**
+     * 首包（隐私填充已剥离）的协议处理 —— 原先这里有两份调用路径 × 两个协议共四段复制粘贴：
+     * 「协议已锁定」路径与「首包探测」路径各写了一份 VLESS / Trojan 处理，本函数是唯一实现。
+     *  - buffer：两条路径传的是同一个值，只是变量名不同（chunk / firstChunk）；
+     *  - onInvalid：探测路径额外把「首包非法」显式收口（close 1008 + 服务端日志），
+     *    已锁定协议那条只抛错（由 pipeTo 的隐式取消关掉，行为与改动前一致）；
+     *  - preParsed：探测路径已经解析过一次的结果（tryParse* 的返回值）。传进来就复用，
+     *    不再解析第二遍 —— Trojan 的 SHA-224 是纯 JS 实现，二次解析等于白算一次 56 字节哈希；
+     *  - 函数内的 return 只结束本函数：两条调用路径在调用点之后都没有尾部代码，
+     *    因此与原先直接 return 出 write() 等价。
+     */
+    const handleFirstPacket = async (
+        protocol: 'vless' | 'trojan',
+        buffer: ArrayBuffer,
+        onInvalid?: (reason: string) => void,
+        preParsed?: ReturnType<typeof parseVlHeader> | Awaited<ReturnType<typeof parseTrHeader>>
+    ): Promise<void> => {
+        const { userID, TrPass } = globalThis.globalConfig;
+
+        if (protocol === 'vless') {
+            const {
+                hasError,
+                message,
+                portRemote = 443,
+                addressRemote = "",
+                rawDataIndex,
+                VLVersion = new Uint8Array([0, 0]),
+                isUDP,
+            } = (preParsed as ReturnType<typeof parseVlHeader> | undefined) ?? parseVlHeader(buffer, userID!);
+
+            address = addressRemote;
+            portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? "udp " : "tcp "} `;
+
+            if (hasError) {
+                onInvalid?.(`vless header: ${String(message)}`);
+                throw new Error(message);
+            }
+
+            const VLResponseHeader = new Uint8Array([VLVersion[0], 0]);
+            const rawClientData = buffer.slice(rawDataIndex);
+
+            if (isUDP) {
+                if (portRemote === 53) {
+                    isDns = true;
+                    const { write } = await handleUDPOutBound(webSocket, VLResponseHeader, log, 'vless', fetcher);
+                    udpStreamWrite = write;
+                    await udpStreamWrite(rawClientData);
+                    return;
+                } else {
+                    throw new Error("UDP proxy only enable for DNS which is port 53");
+                }
+            }
+
+            // 测速拦截：无上游代理时本地 204 响应（对齐 cfnew L4679-4681）
+            if (isSpeedTestSite(addressRemote) && !globalThis.settings?.upstreamProxy) {
+                await enableWsLocalSpeedTestMode(webSocket, VLResponseHeader, rawClientData);
+                return;
+            }
+
+            await handleTCPOutBound(
+                remoteSocketWrapper,
+                addressRemote,
+                portRemote,
+                rawClientData,
+                webSocket,
+                VLResponseHeader,
+                log,
+                fetcher
+            );
+            return;
+        }
+
+        const {
+            hasError,
+            message,
+            portRemote = 443,
+            addressRemote = "",
+            rawClientData,
+            trAddrHeader,
+            isUDP,
+        } = (preParsed as Awaited<ReturnType<typeof parseTrHeader>> | undefined) ?? await parseTrHeader(buffer, TrPass!);
+
+        address = addressRemote;
+        portWithRandomLog = `${portRemote}--${Math.random()} tcp`;
+
+        if (hasError) {
+            onInvalid?.(`trojan header: ${String(message)}`);
+            throw new Error(message);
+        }
+
+        if (isUDP) {
+            if (portRemote === 53) {
+                isDns = true;
+                const { write } = await handleUDPOutBound(webSocket, null, log, 'trojan', fetcher, trAddrHeader);
+                udpStreamWrite = write;
+                await udpStreamWrite(rawClientData);
+                return;
+            } else {
+                throw new Error("UDP proxy only enable for DNS which is port 53");
+            }
+        }
+
+        // 测速拦截：无上游代理时本地 204 响应（对齐 cfnew L4703-4705）
+        if (isSpeedTestSite(addressRemote) && !globalThis.settings?.upstreamProxy) {
+            await enableWsLocalSpeedTestMode(webSocket, null, rawClientData);
+            return;
+        }
+
+        await handleTCPOutBound(
+            remoteSocketWrapper,
+            addressRemote,
+            portRemote,
+            rawClientData,
+            webSocket,
+            null,
+            log,
+            fetcher
+        );
+    };
+
     const writableStream = new WritableStream({
         async write(chunk) {
             // 对齐 cfnew c0eb20c：0xED7F 魔数+随机填充只在本次连接的首包上判定/剥离一次。
@@ -236,100 +357,9 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
             const { userID, TrPass } = globalThis.globalConfig;
 
             if (protocolType === 'vless') {
-                const {
-                    hasError,
-                    message,
-                    portRemote = 443,
-                    addressRemote = "",
-                    rawDataIndex,
-                    VLVersion = new Uint8Array([0, 0]),
-                    isUDP,
-                } = parseVlHeader(chunk, userID!);
-
-                address = addressRemote;
-                portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? "udp " : "tcp "} `;
-
-                if (hasError) {
-                    throw new Error(message);
-                }
-
-                const VLResponseHeader = new Uint8Array([VLVersion[0], 0]);
-                const rawClientData = chunk.slice(rawDataIndex);
-
-                if (isUDP) {
-                    if (portRemote === 53) {
-                        isDns = true;
-                        const { write } = await handleUDPOutBound(webSocket, VLResponseHeader, log, 'vless', fetcher);
-                        udpStreamWrite = write;
-                        await udpStreamWrite(rawClientData);
-                        return;
-                    } else {
-                        throw new Error("UDP proxy only enable for DNS which is port 53");
-                    }
-                }
-
-                // 测速拦截：无上游代理时本地 204 响应（对齐 cfnew L4679-4681）
-                if (isSpeedTestSite(addressRemote) && !globalThis.settings?.upstreamProxy) {
-                    await enableWsLocalSpeedTestMode(webSocket, VLResponseHeader, rawClientData);
-                    return;
-                }
-
-                await handleTCPOutBound(
-                    remoteSocketWrapper,
-                    addressRemote,
-                    portRemote,
-                    rawClientData,
-                    webSocket,
-                    VLResponseHeader,
-                    log,
-                    fetcher
-                );
+                await handleFirstPacket('vless', chunk);
             } else if (protocolType === 'trojan') {
-                const {
-                    hasError,
-                    message,
-                    portRemote = 443,
-                    addressRemote = "",
-                    rawClientData,
-                    trAddrHeader,
-                    isUDP,
-                } = await parseTrHeader(chunk, TrPass!);
-
-                address = addressRemote;
-                portWithRandomLog = `${portRemote}--${Math.random()} tcp`;
-
-                if (hasError) {
-                    throw new Error(message);
-                }
-
-                if (isUDP) {
-                    if (portRemote === 53) {
-                        isDns = true;
-                        const { write } = await handleUDPOutBound(webSocket, null, log, 'trojan', fetcher, trAddrHeader);
-                        udpStreamWrite = write;
-                        await udpStreamWrite(rawClientData);
-                        return;
-                    } else {
-                        throw new Error("UDP proxy only enable for DNS which is port 53");
-                    }
-                }
-
-                // 测速拦截：无上游代理时本地 204 响应（对齐 cfnew L4703-4705）
-                if (isSpeedTestSite(addressRemote) && !globalThis.settings?.upstreamProxy) {
-                    await enableWsLocalSpeedTestMode(webSocket, null, rawClientData);
-                    return;
-                }
-
-                await handleTCPOutBound(
-                    remoteSocketWrapper,
-                    addressRemote,
-                    portRemote,
-                    rawClientData,
-                    webSocket,
-                    null,
-                    log,
-                    fetcher
-                );
+                await handleFirstPacket('trojan', chunk);
             } else {
                 // 零长度帧不构成首包（客户端可发零长度 WS 消息），更不构成「非法首包」：
                 // 忽略并继续等待，避免把「首包尚未到达」误判为非法而主动断开。
@@ -341,57 +371,8 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                 if (vlResult) {
                     protocolType = 'vless';
                     logDebug('protocol detected: VLESS');
-                    // 修复：不能在 write() 回调内再次调用 writableStream.getWriter()（流已被 pipeTo 锁定）
-                    // 直接内联处理首包，与 protocolType='vless' 分支逻辑相同
-                    const {
-                        hasError,
-                        message,
-                        portRemote = 443,
-                        addressRemote = "",
-                        rawDataIndex,
-                        VLVersion = new Uint8Array([0, 0]),
-                        isUDP,
-                    } = parseVlHeader(firstChunk, userID!);
-
-                    address = addressRemote;
-                    portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? "udp " : "tcp "} `;
-
-                    if (hasError) {
-                        closeInvalidFirstPacket(`vless header: ${String(message)}`);
-                        throw new Error(message);
-                    }
-
-                    const VLResponseHeader = new Uint8Array([VLVersion[0], 0]);
-                    const rawClientData = firstChunk.slice(rawDataIndex);
-
-                    if (isUDP) {
-                        if (portRemote === 53) {
-                            isDns = true;
-                            const { write } = await handleUDPOutBound(webSocket, VLResponseHeader, log, 'vless', fetcher);
-                            udpStreamWrite = write;
-                            await udpStreamWrite(rawClientData);
-                            return;
-                        } else {
-                            throw new Error("UDP proxy only enable for DNS which is port 53");
-                        }
-                    }
-
-                    // 测速拦截：无上游代理时本地 204 响应（对齐 cfnew L4679-4681）
-                    if (isSpeedTestSite(addressRemote) && !globalThis.settings?.upstreamProxy) {
-                        await enableWsLocalSpeedTestMode(webSocket, VLResponseHeader, rawClientData);
-                        return;
-                    }
-
-                    await handleTCPOutBound(
-                        remoteSocketWrapper,
-                        addressRemote,
-                        portRemote,
-                        rawClientData,
-                        webSocket,
-                        VLResponseHeader,
-                        log,
-                        fetcher
-                    );
+                    // 判据里已经解析过一次，结果直接复用（preParsed），不再解析第二遍
+                    await handleFirstPacket('vless', firstChunk, closeInvalidFirstPacket, vlResult);
                     return;
                 }
 
@@ -399,53 +380,8 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
                 if (trResult) {
                     protocolType = 'trojan';
                     logDebug('protocol detected: Trojan');
-                    // 修复：直接内联处理首包，不重入已锁定的 writableStream
-                    const {
-                        hasError,
-                        message,
-                        portRemote = 443,
-                        addressRemote = "",
-                        rawClientData,
-                        trAddrHeader,
-                        isUDP,
-                    } = await parseTrHeader(firstChunk, TrPass!);
-
-                    address = addressRemote;
-                    portWithRandomLog = `${portRemote}--${Math.random()} tcp`;
-
-                    if (hasError) {
-                        closeInvalidFirstPacket(`trojan header: ${String(message)}`);
-                        throw new Error(message);
-                    }
-
-                    if (isUDP) {
-                        if (portRemote === 53) {
-                            isDns = true;
-                            const { write } = await handleUDPOutBound(webSocket, null, log, 'trojan', fetcher, trAddrHeader);
-                            udpStreamWrite = write;
-                            await udpStreamWrite(rawClientData);
-                            return;
-                        } else {
-                            throw new Error("UDP proxy only enable for DNS which is port 53");
-                        }
-                    }
-
-                    // 测速拦截：无上游代理时本地 204 响应（对齐 cfnew L4703-4705）
-                    if (isSpeedTestSite(addressRemote) && !globalThis.settings?.upstreamProxy) {
-                        await enableWsLocalSpeedTestMode(webSocket, null, rawClientData);
-                        return;
-                    }
-
-                    await handleTCPOutBound(
-                        remoteSocketWrapper,
-                        addressRemote,
-                        portRemote,
-                        rawClientData,
-                        webSocket,
-                        null,
-                        log,
-                        fetcher
-                    );
+                    // 同上：口令 SHA-224 已经算过一次，parseTrHeader 复用该哈希
+                    await handleFirstPacket('trojan', firstChunk, closeInvalidFirstPacket, trResult);
                     return;
                 }
 
@@ -560,7 +496,6 @@ function parseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
     return {
         hasError: false,
         addressRemote: addressValue,
-        addressType,
         portRemote,
         rawDataIndex: addressValueIndex + addressLength,
         VLVersion: version,
@@ -568,11 +503,18 @@ function parseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
     };
 }
 
-function tryParseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
+/**
+ * VLESS 首包探测：判据与原先**逐字一致**（长度 / UUID / command / addressType 范围），
+ * 判据成立时把 `parseVlHeader` 的**完整解析结果**一并返回 —— 探测路径因此不必再解析第二遍。
+ *
+ * 判据刻意比 parseVlHeader 的成功条件宽（例如 domain 长度为 0 时判据成立而 parse 报 hasError）：
+ * 那种包今天就是「先认出 VLESS → 再由 handleFirstPacket 报头畸形」，合并后行为不变。
+ * parse 调用放在 try 之外：与改动前一样，解析期的异常照旧向 write() 冒泡，不被这里的 catch 吞掉。
+ */
+function tryParseVlHeader(VLBuffer: ArrayBuffer, userID: string): ReturnType<typeof parseVlHeader> | null {
     if (VLBuffer.byteLength < 24) return null;
 
     try {
-        const version = new Uint8Array(VLBuffer.slice(0, 1));
         const slicedBuffer = new Uint8Array(VLBuffer.slice(1, 17));
         const slicedBufferString = stringify(slicedBuffer);
         if (slicedBufferString !== userID) return null;
@@ -583,18 +525,16 @@ function tryParseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
 
         const portIndex = 18 + optLength + 1;
         if (VLBuffer.byteLength < portIndex + 2) return null;
-        const portBuffer = VLBuffer.slice(portIndex, portIndex + 2);
-        new DataView(portBuffer).getUint16(0);
 
-        let addressIndex = portIndex + 2;
+        const addressIndex = portIndex + 2;
         if (VLBuffer.byteLength < addressIndex + 1) return null;
         const addressType = new Uint8Array(VLBuffer.slice(addressIndex, addressIndex + 1))[0];
         if (addressType < 1 || addressType > 3) return null;
-
-        return { hasError: false };
     } catch {
         return null;
     }
+
+    return parseVlHeader(VLBuffer, userID);
 }
 
 function stringify(arr: Uint8Array, offset = 0) {
@@ -626,7 +566,7 @@ function stringify(arr: Uint8Array, offset = 0) {
     ).toLowerCase();
 }
 
-async function parseTrHeader(chunk: ArrayBuffer, password: string) {
+async function parseTrHeader(chunk: ArrayBuffer, password: string, precomputedHash?: string) {
     if (chunk.byteLength < 56) {
         return { hasError: true, message: "invalid trojan data - too short" };
     }
@@ -636,7 +576,8 @@ async function parseTrHeader(chunk: ArrayBuffer, password: string) {
         return { hasError: true, message: "invalid trojan header format (missing CR LF)" };
     }
 
-    const passwordHash = await hashPassword(password);
+    // 探测路径（tryParseTrHeader）已经把哈希算过一次，这里复用，不再重复计算纯 JS SHA-224
+    const passwordHash = precomputedHash ?? await hashPassword(password);
     const receivedPassword = new TextDecoder().decode(bytes.subarray(0, 56));
     if (receivedPassword !== passwordHash) {
         return { hasError: true, message: "invalid trojan password" };
@@ -704,11 +645,16 @@ async function parseTrHeader(chunk: ArrayBuffer, password: string) {
     };
 }
 
-async function tryParseTrHeader(chunk: ArrayBuffer, password: string) {
+/**
+ * Trojan 首包探测：判据与原先**逐字一致**（长度 / CRLF / 口令 SHA-224 比对 / 数据下限 / CMD / ATYP 范围）。
+ * 口令哈希与改动前一样在 try 之外计算（异常照旧冒泡），判据成立后把它交给 parseTrHeader 复用 ——
+ * 原来 parseTrHeader 会**再算一遍** 56 字节的纯 JS SHA-224，这条路径上等于白算。
+ */
+async function tryParseTrHeader(chunk: ArrayBuffer, password: string): Promise<Awaited<ReturnType<typeof parseTrHeader>> | null> {
     if (chunk.byteLength < 56) return null;
 
     const passwordHash = await hashPassword(password);
-    
+
     try {
         const bytes = new Uint8Array(chunk);
         if (bytes[56] !== 0x0d || bytes[57] !== 0x0a) return null;
@@ -726,11 +672,11 @@ async function tryParseTrHeader(chunk: ArrayBuffer, password: string) {
 
         const addrType = view.getUint8(1);
         if (addrType < 1 || addrType > 4) return null;
-
-        return { hasError: false };
     } catch {
         return null;
     }
+
+    return await parseTrHeader(chunk, password, passwordHash);
 }
 
 // Pure JS SHA-224 (SHA-256 core + SHA-224 IVs, output truncated to first 7 state words).
@@ -922,10 +868,8 @@ function setDNSCache(dnsPayload: Uint8Array) {
     const cacheInfo = parseDNSQueryInfo(dnsPayload);
     if (cacheInfo && dnsPayload.length >= 2) {
         const key = `${cacheInfo.domain}|${cacheInfo.qtype}|${cacheInfo.qclass}`;
-        if (globalDNSCache.size >= DNS_CACHE_MAX) {
-            const firstKey = globalDNSCache.keys().next().value;
-            if (firstKey) globalDNSCache.delete(firstKey);
-        }
+        // 插入前腾位置（传 MAX-1），插入后不超过 DNS_CACHE_MAX
+        evictOldest(globalDNSCache, DNS_CACHE_MAX - 1);
         const ttl = parseDNSResponseTTL(dnsPayload);
         const expiresAt = Date.now() + Math.min(86400, Math.max(60, ttl)) * 1000;
         globalDNSCache.set(key, { response: dnsPayload, expiresAt });
@@ -951,6 +895,77 @@ function getDNSCache(dnsQueryPacket: Uint8Array): Uint8Array | null {
         globalDNSCache.delete(key);
     }
     return null;
+}
+
+/**
+ * DNS-over-TCP 响应泵（VLESS / Trojan 共用）：按 2 字节大端长度前缀拆包 → 交 onMessage 构造响应帧 →
+ * 写全局 DNS 缓存 → 裁剪残余缓冲。协议差异（帧格式、是否首次带 VL 头）全部由 onMessage 承担。
+ *
+ * 逐字对齐原两份实现的细节，别顺手简化：
+ *  - 溢出（> 64KB）时打日志并退出循环，残余缓冲不清理（连接即将被关）；
+ *  - 拆包只处理完整的长度前缀帧，半包留在 dnsBuffer 里等下一块；
+ *  - onMessage 在写缓存**之前**调用 —— 帧发送顺序与缓存写入顺序维持原样；
+ *  - reader 由调用方取得并传入（两侧获取时机不同，保持在原处）；
+ *  - 全程 fire-and-forget（调用方不 await），异常只记日志，finally 里 releaseLock。
+ */
+async function pumpTcpDnsMessages(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    label: 'VLESS' | 'Trojan',
+    log: Function,
+    onMessage: (dnsPayload: Uint8Array) => void
+): Promise<void> {
+    let dnsBuffer = new Uint8Array(0);
+    const DNS_MAX_BUF = 65536;
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const chunk = value as Uint8Array;
+            if (dnsBuffer.length + chunk.length > DNS_MAX_BUF) {
+                log(`${label} DNS buffer overflow`);
+                break;
+            }
+
+            // Reassemble
+            const newBuffer = new Uint8Array(dnsBuffer.length + chunk.length);
+            newBuffer.set(dnsBuffer);
+            newBuffer.set(chunk, dnsBuffer.length);
+            dnsBuffer = newBuffer;
+
+            // Parse TCP DNS messages (2-byte length prefix)
+            let offset = 0;
+            while (offset + 2 <= dnsBuffer.length) {
+                const dnsLength = (dnsBuffer[offset] << 8) | dnsBuffer[offset + 1];
+                const dnsStart = offset + 2;
+                const dnsEnd = dnsStart + dnsLength;
+
+                if (dnsEnd > dnsBuffer.length) break; // incomplete message
+
+                const dnsPayload = dnsBuffer.slice(dnsStart, dnsEnd);
+
+                onMessage(dnsPayload);
+
+                // Save to global DNS cache
+                setDNSCache(dnsPayload);
+
+                offset = dnsEnd;
+            }
+
+            // Keep remaining buffer
+            if (offset < dnsBuffer.length) {
+                dnsBuffer = dnsBuffer.slice(offset);
+            } else {
+                dnsBuffer = new Uint8Array(0);
+            }
+        }
+    } catch (e) {
+        log(`${label} DNS response error: ` + e);
+    } finally {
+        // F-11：teardown 由外部 close 驱动，此时 reader 已无未决读；仍包 try/catch 以防重复释放
+        try { reader.releaseLock(); } catch { /* already released */ }
+    }
 }
 
 async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Array<ArrayBuffer> | null, log: Function, protocol: 'vless' | 'trojan', fetcher?: any, trAddrHeader?: Uint8Array) {
@@ -980,84 +995,33 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
         });
         
         // Response handling with caching
-        let dnsBuffer = new Uint8Array(0);
-        const DNS_MAX_BUF = 65536;
         const responseReader = socket.readable.getReader();
-        
-        const handleVLESSDNSResponse = async () => {
-            try {
-                while (true) {
-                    const { done, value } = await responseReader.read();
-                    if (done) break;
 
-                    const chunk = value as Uint8Array;
-                    if (dnsBuffer.length + chunk.length > DNS_MAX_BUF) {
-                        log('VLESS DNS buffer overflow');
-                        break;
-                    }
-
-                    // Reassemble
-                    const newBuffer = new Uint8Array(dnsBuffer.length + chunk.length);
-                    newBuffer.set(dnsBuffer);
-                    newBuffer.set(chunk, dnsBuffer.length);
-                    dnsBuffer = newBuffer;
-
-                    // Parse TCP DNS messages (2-byte length prefix)
-                    let offset = 0;
-                    while (offset + 2 <= dnsBuffer.length) {
-                        const dnsLength = (dnsBuffer[offset] << 8) | dnsBuffer[offset + 1];
-                        const dnsStart = offset + 2;
-                        const dnsEnd = dnsStart + dnsLength;
-
-                        if (dnsEnd > dnsBuffer.length) break; // incomplete message
-
-                        const dnsPayload = dnsBuffer.slice(dnsStart, dnsEnd);
-
-                        // Build VLESS UDP frame: VLResponseHeader (first only) + [2B length BE] + raw DNS payload
-                        const lenHi = (dnsPayload.length >> 8) & 0xff;
-                        const lenLo = dnsPayload.length & 0xff;
-                        if (isVLHeaderSent) {
-                            const frame = new Uint8Array(2 + dnsPayload.length);
-                            frame[0] = lenHi;
-                            frame[1] = lenLo;
-                            frame.set(dnsPayload, 2);
-                            if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                                webSocket.send(frame.buffer);
-                            }
-                        } else {
-                            // First response includes VL header
-                            const frame = new Uint8Array(VLResponseHeader!.length + 2 + dnsPayload.length);
-                            frame.set(VLResponseHeader!, 0);
-                            frame[VLResponseHeader!.length] = lenHi;
-                            frame[VLResponseHeader!.length + 1] = lenLo;
-                            frame.set(dnsPayload, VLResponseHeader!.length + 2);
-                            if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                                webSocket.send(frame.buffer);
-                            }
-                            isVLHeaderSent = true;
-                        }
-
-                        // Save to global DNS cache
-                        setDNSCache(dnsPayload);
-
-                        offset = dnsEnd;
-                    }
-
-                    // Keep remaining buffer
-                    if (offset < dnsBuffer.length) {
-                        dnsBuffer = dnsBuffer.slice(offset);
-                    } else {
-                        dnsBuffer = new Uint8Array(0);
-                    }
+        pumpTcpDnsMessages(responseReader, 'VLESS', log, (dnsPayload) => {
+            // Build VLESS UDP frame: VLResponseHeader (first only) + [2B length BE] + raw DNS payload
+            const lenHi = (dnsPayload.length >> 8) & 0xff;
+            const lenLo = dnsPayload.length & 0xff;
+            if (isVLHeaderSent) {
+                const frame = new Uint8Array(2 + dnsPayload.length);
+                frame[0] = lenHi;
+                frame[1] = lenLo;
+                frame.set(dnsPayload, 2);
+                if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                    webSocket.send(frame.buffer);
                 }
-            } catch (e) {
-                log("VLESS DNS response error: " + e);
-            } finally {
-                // F-11：teardown 由外部 close 驱动，此时 reader 已无未决读；仍包 try/catch 以防重复释放
-                try { responseReader.releaseLock(); } catch { /* already released */ }
+            } else {
+                // First response includes VL header
+                const frame = new Uint8Array(VLResponseHeader!.length + 2 + dnsPayload.length);
+                frame.set(VLResponseHeader!, 0);
+                frame[VLResponseHeader!.length] = lenHi;
+                frame[VLResponseHeader!.length + 1] = lenLo;
+                frame.set(dnsPayload, VLResponseHeader!.length + 2);
+                if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                    webSocket.send(frame.buffer);
+                }
+                isVLHeaderSent = true;
             }
-        };
-        handleVLESSDNSResponse();
+        });
 
         return {
             async write(chunk: ArrayBuffer) {
@@ -1099,76 +1063,27 @@ async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Ar
         };
     } else {
         // Trojan UDP DNS: Parse Trojan UDP packets, forward to 8.8.4.4:53 via TCP, reconstruct responses
-        let dnsBuffer = new Uint8Array(0);
-        const DNS_MAX_BUF = 65536;
         let currentRequestHeader: Uint8Array | null = null; // Stores addrType + addr + port from request
 
-        async function handleTrojanUDPResponse(socket: Socket) {
-            const reader = socket.readable.getReader();
-            try {
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-
-                    const chunk = value as Uint8Array;
-                    if (dnsBuffer.length + chunk.length > DNS_MAX_BUF) {
-                        log('Trojan DNS buffer overflow');
-                        break;
-                    }
-
-                    // Reassemble
-                    const newBuffer = new Uint8Array(dnsBuffer.length + chunk.length);
-                    newBuffer.set(dnsBuffer);
-                    newBuffer.set(chunk, dnsBuffer.length);
-                    dnsBuffer = newBuffer;
-
-                    // Parse TCP DNS messages (2-byte length prefix)
-                    let offset = 0;
-                    while (offset + 2 <= dnsBuffer.length) {
-                        const dnsLength = (dnsBuffer[offset] << 8) | dnsBuffer[offset + 1];
-                        const dnsStart = offset + 2;
-                        const dnsEnd = dnsStart + dnsLength;
-
-                        if (dnsEnd > dnsBuffer.length) break; // incomplete message
-
-                        const dnsPayload = dnsBuffer.slice(dnsStart, dnsEnd);
-
-                        // Build Trojan UDP response frame:
-                        // [addrType + addr + port] + [2B length BE] + [0x0d, 0x0a] + [payload]
-                        if (currentRequestHeader) {
-                            const frame = new Uint8Array(
-                                currentRequestHeader.length + 4 + dnsPayload.length
-                            );
-                            frame.set(currentRequestHeader, 0);
-                            frame[currentRequestHeader.length] = (dnsPayload.length >> 8) & 0xff;
-                            frame[currentRequestHeader.length + 1] = dnsPayload.length & 0xff;
-                            frame[currentRequestHeader.length + 2] = 0x0d;
-                            frame[currentRequestHeader.length + 3] = 0x0a;
-                            frame.set(dnsPayload, currentRequestHeader.length + 4);
-                            if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                                webSocket.send(frame.buffer);
-                            }
-                        }
-
-                        // Save to global DNS cache
-                        setDNSCache(dnsPayload);
-
-                        offset = dnsEnd;
-                    }
-
-                    // Keep remaining buffer
-                    if (offset < dnsBuffer.length) {
-                        dnsBuffer = dnsBuffer.slice(offset);
-                    } else {
-                        dnsBuffer = new Uint8Array(0);
+        function handleTrojanUDPResponse(socket: Socket) {
+            pumpTcpDnsMessages(socket.readable.getReader(), 'Trojan', log, (dnsPayload) => {
+                // Build Trojan UDP response frame:
+                // [addrType + addr + port] + [2B length BE] + [0x0d, 0x0a] + [payload]
+                if (currentRequestHeader) {
+                    const frame = new Uint8Array(
+                        currentRequestHeader.length + 4 + dnsPayload.length
+                    );
+                    frame.set(currentRequestHeader, 0);
+                    frame[currentRequestHeader.length] = (dnsPayload.length >> 8) & 0xff;
+                    frame[currentRequestHeader.length + 1] = dnsPayload.length & 0xff;
+                    frame[currentRequestHeader.length + 2] = 0x0d;
+                    frame[currentRequestHeader.length + 3] = 0x0a;
+                    frame.set(dnsPayload, currentRequestHeader.length + 4);
+                    if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                        webSocket.send(frame.buffer);
                     }
                 }
-            } catch (e) {
-                log("Trojan DNS response error: " + e);
-            } finally {
-                // F-11：teardown 由外部 close 驱动，此时 reader 已无未决读；仍包 try/catch 以防重复释放
-                try { reader.releaseLock(); } catch { /* already released */ }
-            }
+            });
         }
 
         // Connect to DNS server via TCP

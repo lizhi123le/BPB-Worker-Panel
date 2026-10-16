@@ -1,6 +1,6 @@
 import { isPermanentBlacklisted, recordViolationAndMaybeBan } from "./blacklist";
 import { isPathInDictionary, checkRateLimit, checkRateLimitShared, recordRateLimit, writeRateLimitKV } from "./ratelimit";
-import { camouflageProxy, cf1101Page } from "./camouflage";
+import { camouflageProxy, cf1101RateLimitedResponse } from "./camouflage";
 
 /**
  * 非内置路径守卫 — 对齐 cfnew 的安全三件套：
@@ -34,13 +34,7 @@ export async function guardWebsocketBlacklist(request: Request, env: any): Promi
 
     console.warn(`[永久黑名单] WS 升级 IP ${ip} 命中永久黑名单，直接拦截`);
     const reqURL = new URL(request.url);
-    return new Response(await cf1101Page(reqURL.host, ip), {
-        status: 429,
-        headers: {
-            'Content-Type': 'text/html; charset=UTF-8',
-            'Retry-After': '3600'
-        }
-    });
+    return await cf1101RateLimitedResponse(reqURL.host, ip);
 }
 
 /**
@@ -73,13 +67,7 @@ export async function guardNonBuiltinPath(
     // 1. 永久黑名单
     if (ip && kv && await isPermanentBlacklisted(ip, kv)) {
         console.warn(`[永久黑名单] IP ${ip} 命中永久黑名单，直接拦截`);
-        return new Response(await cf1101Page(reqURL.host, ip), {
-            status: 429,
-            headers: {
-                'Content-Type': 'text/html; charset=UTF-8',
-                'Retry-After': '3600'
-            }
-        });
+        return await cf1101RateLimitedResponse(reqURL.host, ip);
     }
 
     // 2. 路径字典校验 + 限流（字典路径视为合法公开路径，不限流不计数；
@@ -91,13 +79,7 @@ export async function guardNonBuiltinPath(
             console.warn(`[速率限制] IP ${ip} 超过非管理员路径请求限制`);
             if (kv) await writeRateLimitKV(kv, ip, ctx);
             if (ip && kv) ctx.waitUntil(recordViolationAndMaybeBan(ip, kv, ctx));
-            return new Response(await cf1101Page(reqURL.host, ip), {
-                status: 429,
-                headers: {
-                    'Content-Type': 'text/html; charset=UTF-8',
-                    'Retry-After': '3600'
-                }
-            });
+            return await cf1101RateLimitedResponse(reqURL.host, ip);
         }
         recordRateLimit(ip);
     }

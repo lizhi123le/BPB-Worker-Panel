@@ -1,4 +1,4 @@
-import { withTimeout } from "@common";
+import { evictOldest, withTimeout } from "@common";
 
 /**
  * 非内置路径速率限制 — 对齐 cfnew：
@@ -175,12 +175,9 @@ export function recordRateLimit(ip: string): void {
     const windowStart = now - RATE_LIMIT_WINDOW_MS;
     let record = rateLimitPool.get(ip);
     if (!record) {
-        // F-07：条目上限保护，超出按插入顺序淘汰最旧条目，长生命周期 isolate 下内存有界
-        while (rateLimitPool.size >= RATE_LIMIT_MAX_TRACKED_IPS) {
-            const oldest = rateLimitPool.keys().next();
-            if (oldest.done) break;
-            rateLimitPool.delete(oldest.value);
-        }
+        // F-07：条目上限保护，超出按插入顺序淘汰最旧条目，长生命周期 isolate 下内存有界。
+        // 插入前腾位置（传 MAX-1），插入后不超过 RATE_LIMIT_MAX_TRACKED_IPS。
+        evictOldest(rateLimitPool, RATE_LIMIT_MAX_TRACKED_IPS - 1);
         record = { timestamps: [] };
         rateLimitPool.set(ip, record);
     }

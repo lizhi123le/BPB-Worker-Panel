@@ -194,7 +194,6 @@ declare global {
         timestamp: number;
         version: string;
     } | undefined;
-    var workerRegion: string;
     var dict: {
         readonly _VL_: string;
         readonly _VL_CAP_: string;

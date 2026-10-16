@@ -229,7 +229,6 @@ export function buildChainOutbound(usedEds?: Set<number>): ChainOutbound | undef
     const {
         dict: { _SS_, _VL_, _TR_, _VM_ },
         settings: {
-            outProxy,
             outProxyParams: {
                 protocol, server, port, user,
                 pass, password, method, uuid,

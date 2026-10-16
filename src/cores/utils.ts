@@ -1,4 +1,4 @@
-import { safeErrorMessage } from "@common";
+import { evictOldest, safeErrorMessage } from "@common";
 import { PUBLIC_PATH_POOL } from "../common/ratelimit";
 
 // ── H6：跨部署硬编码常量的 env 覆盖入口 ──
@@ -97,7 +97,6 @@ export interface CleanProxyEntry {
     username?: string;
     password?: string;
     name?: string;       // 条目 #备注
-    raw: string;         // 原始条目
 }
 
 const CLEAN_PROXY_DEFAULT_PORTS: Record<string, number> = {
@@ -158,8 +157,7 @@ export function parseCleanProxy(entry: string): CleanProxyEntry | null {
         port,
         username: username || undefined,
         password: password || undefined,
-        name: entryName(raw),
-        raw
+        name: entryName(raw)
     };
 }
 
@@ -516,27 +514,43 @@ export async function resolveDNS(domain: string, onlyIPv4 = false): Promise<DnsR
     }
 }
 
-/** Query Cloudflare + Google in parallel, return result data[] from first with results (对齐 edgetunnel 9958-9976) */
-async function dualSourceResolve(cfBase: string, googleBase: string, typeName: string, recordType: number): Promise<string[]> {
-    const results = await Promise.allSettled([
-        fetchDNSRecords(`${cfBase}&type=${typeName}`, recordType),
-        fetchDNSRecords(`${googleBase}&type=${typeName}`, recordType),
-    ]);
+/**
+ * 并发双源查询，取第一个「成功且非空」的结果；两个源都失败或都为空则返回 []。
+ * 语义要点（改动前两份实现逐字相同，合并后仍是同一套）：用 allSettled 等**两个源都结束**，
+ * 而不是 Promise.any 提前返回 —— 慢源只在真的没有更快结果时才被等待。
+ */
+async function firstNonEmptyResult<T>(promises: Promise<T[]>[]): Promise<T[]> {
+    const results = await Promise.allSettled(promises);
     const first = results.find(r => r.status === 'fulfilled' && r.value.length > 0);
     return first?.status === 'fulfilled' ? first.value : [];
 }
 
+/**
+ * 单源 JSON DoH 取数（RFC 8484 的 /resolve 风格：accept: application/dns-json）。
+ * 失败**一律抛错**：吞错还是上抛由调用方决定（resolveDNS 路径上抛、代理池路径吞成 []）。
+ */
+async function dohJsonQuery(url: string): Promise<any[]> {
+    const response = await fetch(url, {
+        headers: { accept: 'application/dns-json' },
+        signal: AbortSignal.timeout(10_000),
+    });
+    const data: any = await response.json();
+    return data.Answer || [];
+}
+
+/** Query Cloudflare + Google in parallel, return result data[] from first with results (对齐 edgetunnel 9958-9976) */
+async function dualSourceResolve(cfBase: string, googleBase: string, typeName: string, recordType: number): Promise<string[]> {
+    return await firstNonEmptyResult([
+        fetchDNSRecords(`${cfBase}&type=${typeName}`, recordType),
+        fetchDNSRecords(`${googleBase}&type=${typeName}`, recordType),
+    ]);
+}
+
 export async function fetchDNSRecords(url: string, recordType: number): Promise<string[]> {
     try {
-        const response = await fetch(url, {
-            headers: { accept: 'application/dns-json' },
-            signal: AbortSignal.timeout(10_000),
-        });
-        const data: any = await response.json();
+        const answer = await dohJsonQuery(url);
 
-        if (!data.Answer) return [];
-
-        return data.Answer
+        return answer
             .filter((record: any) => record.type === recordType)
             .map((record: any) => record.data);
 
@@ -620,14 +634,6 @@ export async function getConfigItems(isFragment: boolean): Promise<ConfigItem[]>
     if (!isFragment) entryAddresses(customCdnAddrs).forEach(pushAddress);
 
     return items;
-}
-
-/** 兼容旧调用：只要序列里的普通地址 */
-export async function getConfigAddresses(isFragment: boolean): Promise<string[]> {
-    const items = await getConfigItems(isFragment);
-    return items
-        .filter((item): item is { kind: 'address'; value: string } => item.kind === 'address')
-        .map(item => item.value);
 }
 
 const remarkCounter: Record<string, number> = {};
@@ -1257,15 +1263,10 @@ export async function filterReachableEntries(
 
 // ── DoH query with dual-source + cache (for proxy pool resolution, 对齐 edgetunnel 9958-9993) ──
 
-/** Low-level DoH query returning raw answer records (no cache). */
+/** Low-level DoH query returning raw answer records (no cache). 吞错返回 []（与 resolveDNS 路径的上抛语义不同，刻意保留） */
 async function dohQueryRaw(domain: string, type: string, dohUrl = CF_DOH): Promise<any[]> {
     try {
-        const response = await fetch(`${dohUrl}?name=${encodeURIComponent(domain)}&type=${type}`, {
-            headers: { accept: 'application/dns-json' },
-            signal: AbortSignal.timeout(10_000),
-        });
-        const data: any = await response.json();
-        return data.Answer || [];
+        return await dohJsonQuery(`${dohUrl}?name=${encodeURIComponent(domain)}&type=${type}`);
     } catch {
         return [];
     }
@@ -1273,12 +1274,10 @@ async function dohQueryRaw(domain: string, type: string, dohUrl = CF_DOH): Promi
 
 /** Dual-source DoH query: parallel Cloudflare + Google, return raw records from first with results. */
 async function dohQueryDual(domain: string, type: string): Promise<any[]> {
-    const results = await Promise.allSettled([
+    return await firstNonEmptyResult([
         dohQueryRaw(domain, type, CF_DOH),
         dohQueryRaw(domain, type, GOOGLE_DOH),
     ]);
-    const first = results.find(r => r.status === 'fulfilled' && r.value.length > 0);
-    return first?.status === 'fulfilled' ? first.value : [];
 }
 
 // DoH result cache for proxy pool resolution
@@ -1306,9 +1305,7 @@ async function dohQueryCached(domain: string, type: string): Promise<any[]> {
         for (const [key, value] of _dohResultCache) {
             if (now - value.time >= DOH_CACHE_TTL) _dohResultCache.delete(key);
         }
-        while (_dohResultCache.size > DOH_CACHE_MAX) {
-            _dohResultCache.delete(_dohResultCache.keys().next().value!);
-        }
+        evictOldest(_dohResultCache, DOH_CACHE_MAX);
     }
 
     return records;
@@ -1429,9 +1426,7 @@ export async function resolveProxyIPPool(
     const result = shuffled.slice(0, 8);
     // C-04：写入带时间戳的键化缓存；超限时按插入顺序（LRU）淘汰最旧一条
     _proxyPoolCache.set(cacheKey, { result, time: Date.now() });
-    if (_proxyPoolCache.size > PROXY_POOL_CACHE_MAX) {
-        _proxyPoolCache.delete(_proxyPoolCache.keys().next().value!);
-    }
+    evictOldest(_proxyPoolCache, PROXY_POOL_CACHE_MAX);
     return result;
 }
 
@@ -1629,7 +1624,7 @@ export async function resolveTargetDNS(domain: string): Promise<DnsResult> {
         empty: result.ipv4.length === 0 && result.ipv6.length === 0,
     });
     if (_targetDnsCache.size > TARGET_DNS_CACHE_MAX) {
-        _targetDnsCache.delete(_targetDnsCache.keys().next().value!);
+        evictOldest(_targetDnsCache, TARGET_DNS_CACHE_MAX);
     }
     return result;
 }

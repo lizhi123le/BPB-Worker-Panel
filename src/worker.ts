@@ -14,7 +14,7 @@ import {
 } from '@handlers';
 import { guardNonBuiltinPath, guardWebsocketBlacklist } from './common/firstCheck';
 import { isPathInDictionary } from './common/ratelimit';
-import { camouflageProxy, cf1101Page } from './common/camouflage';
+import { camouflageProxy, cf1101RateLimitedResponse } from './common/camouflage';
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
@@ -53,13 +53,7 @@ export default {
 					|| isPathInDictionary(wsSegments);
 				if (!wsPathAllowed) {
 					console.warn(`[路径字典] WS 升级路径 ${wsPathName} 不在公共路径字典内，按伪造探测拦截`);
-					return new Response(await cf1101Page(wsUrl.host, request.headers.get('CF-Connecting-IP') || ''), {
-						status: 429,
-						headers: {
-							'Content-Type': 'text/html; charset=UTF-8',
-							'Retry-After': '3600'
-						}
-					});
+					return await cf1101RateLimitedResponse(wsUrl.host, request.headers.get('CF-Connecting-IP') || '');
 				}
 
 				// C-13：与 HTTP 路径共用同一套必填凭据校验（此前 WS 完全跳过，缺凭据时静默鉴权失败）

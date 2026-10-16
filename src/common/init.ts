@@ -1,6 +1,6 @@
 import { getDataset } from "@kv";
-import { isValidUUID } from "@common";
-import { applyAddressEnvOverrides, resolveUrlEntries } from "@utils";
+import { isKvBound, isValidUUID } from "@common";
+import { applyAddressEnvOverrides } from "@utils";
 // 出厂默认值移至零依赖的 ./defaults，使 @kv 也能以它作校验基准而不产生循环依赖。
 // 这里保留同名再导出，既有的 `import { DEFAULT_SETTINGS } from "@init"`（如 @handlers）继续可用。
 import { DEFAULT_SETTINGS } from "./defaults";
@@ -36,7 +36,6 @@ export async function setSettings(request: Request, env: Env) {
     }
 
     // 对齐 cfnew v3.0：wk 为空时走官方直连（CF），不再记录 Worker 所在地
-    globalThis.workerRegion = 'CF';
 }
 
 /**
@@ -53,6 +52,13 @@ function safeDecodePath(raw: string): string | null {
 }
 
 /**
+ * KV 校验的豁免路径：登录页首访「设置管理员口令」流程要在没绑 KV 的情况下也能打开，
+ * 并把「还没绑 KV」用可读 JSON（POST /login/set-password）说清楚，而不是先被拦成通用错误页。
+ * 只豁免 KV 这一条 —— UUID / TR_PASS 是部署必填凭据，仍然照旧强制。
+ */
+const KV_CHECK_EXEMPT_PATHS = ['/login', '/login/set-password'];
+
+/**
  * 必填凭据校验（C-13）：UUID / TR_PASS 齐备、UUID 合法、KV 已绑定。HTTP（initHttp）与 WS 升级分支共用。
  *
  * 此前只有 HTTP 路径调用这段校验，WS 分支完全跳过：缺凭据时 WS 表现为「101 后静默鉴权失败」，
@@ -62,13 +68,14 @@ function safeDecodePath(raw: string): string | null {
  */
 export function assertRequiredCredentials(env: any, normalizedPath: string): void {
     const { _VL_CAP_, _TR_CAP_ } = globalThis.dict;
-    const { UUID, TR_PASS, kv } = env;
+    const { UUID, TR_PASS } = env;
 
     if (['/secrets', '/favicon.ico'].includes(normalizedPath)) return;
 
     if (!UUID || !TR_PASS) throw new Error(`Please set ${_VL_CAP_} UUID and ${_TR_CAP_} password first. Visit /secrets to generate them.`, { cause: "missing-credentials" });
     if (!isValidUUID(UUID)) throw new Error(`Invalid UUID: ${UUID}`, { cause: "init" });
-    if (typeof kv !== 'object') throw new Error(`KV Dataset is not properly set! Please refer to the tutorials.`, { cause: "kv-not-set" });
+    if (KV_CHECK_EXEMPT_PATHS.includes(normalizedPath)) return;
+    if (!isKvBound(env)) throw new Error(`KV Dataset is not properly set! Please refer to the tutorials.`, { cause: "kv-not-set" });
 }
 
 export function init(request: Request, env: Env) {

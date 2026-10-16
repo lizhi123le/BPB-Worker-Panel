@@ -16,7 +16,7 @@ import type {
     Fallback,
     RuleProvider,
 } from '#types/clash';
-import type { RoutingRule, RuleSet, Selector as SbSelector, URLTest as SbUrlTest, Outbound } from '#types/sing-box';
+import type { RoutingRule, RuleSet, Selector as SbSelector, URLTest as SbUrlTest } from '#types/sing-box';
 import { fetchWithTimeout } from '@common';
 
 /**

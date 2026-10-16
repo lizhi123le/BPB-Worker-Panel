@@ -1,5 +1,5 @@
 import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes } from '@utils';
-import { safeErrorMessage, randomUserAgent } from '@common';
+import { evictOldest, safeErrorMessage, randomUserAgent } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
 // 核心修复：原写法 `export const connectSocket = getConnect()` 在模块加载期立即执行，
@@ -58,11 +58,7 @@ function blacklistRecord(key: string) {
     // F-10 容量兜底：超上限时先清扫过期条目，仍超上限则按 Map 插入序淘汰最旧键
     if (ipBlacklist.size > IP_BLACKLIST_MAX_ENTRIES) {
         blacklistSweep();
-        while (ipBlacklist.size > IP_BLACKLIST_MAX_ENTRIES) {
-            const oldestKey = ipBlacklist.keys().next().value;
-            if (oldestKey === undefined) break;
-            ipBlacklist.delete(oldestKey);
-        }
+        evictOldest(ipBlacklist, IP_BLACKLIST_MAX_ENTRIES);
     }
 }
 function blacklistClear(key: string) { ipBlacklist.delete(key); }
@@ -212,13 +208,9 @@ async function connectWithRaceDial(
             }
         }
 
-        // 本批次全部失败，记录黑名单并关闭已建立的连接（如果有）
-        for (const result of results) {
-            if (result.status === 'fulfilled' && result.value && result.value.socket) {
-                blacklistRecord(`${result.value.ip}:${result.value.port}`);
-                try { result.value.socket.close(); } catch {}
-            }
-        }
+        // 走到这里说明本批没有一个候选写成功：每个 fulfilled 的候选都已在上面那个 write 失败的 catch 分支里
+        // 记过黑名单并关过 socket。原先这里再来一遍"本批次全部失败"循环，会把同一键的失败数**再加一次**
+        // （IP_BLACKLIST_MAX_FAIL=3 时两批就拉黑），属重复记账，已删除 —— 封禁节奏回到阈值本身。
     }
 
     // 所有批次都失败，抛出错误让上层处理兜底
@@ -367,13 +359,27 @@ async function connectWithDirectRaceDial(
 const getRandomValue = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
 const parseIPs = (value: string) => value ? value.split(',').map(val => val.trim()).filter(Boolean) : undefined;
 
-/** 连接并写入初始数据的工具函数，供模块内各连接策略使用 */
-async function connectAndWrite(address: string, port: number, rawClientData: ArrayBuffer | undefined, fetcher?: any): Promise<Socket> {
+/**
+ * 拨号 + 写首包的共用实现：模块级调用方与 handleWebsocket 内的 connectAndWriteLocal 共用这一份。
+ * hooks 的回调时机是语义的一部分，不能挪：
+ *  - onSocket：connectSocket 之后、`await opened` **之前**。本地版靠它把 socket 登记进 remoteSocket.value，
+ *    必须早于等待 —— 否则超时/失败时 teardown 关不到这条半开连接（F-09 同一约束）。
+ *  - onOpened：连接建立之后、取 writer **之前**。本地版在这里打「connected to」日志，保持既有日志顺序。
+ */
+async function dialAndWrite(
+    address: string,
+    port: number,
+    rawClientData: ArrayBuffer | undefined,
+    fetcher?: any,
+    hooks?: { onSocket?: (socket: Socket) => void; onOpened?: () => void }
+): Promise<Socket> {
     // if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(address)) address = `${atob('d3d3Lg==')}${address}${atob('LnNzbGlwLmlv')}`;
     const tcpSocket = connectSocket({
         hostname: address,
         port: port,
     }, fetcher);
+
+    hooks?.onSocket?.(tcpSocket);
 
     // 连接超时保护：防止连到不通的 IP 时卡死
     await Promise.race([
@@ -382,6 +388,8 @@ async function connectAndWrite(address: string, port: number, rawClientData: Arr
             setTimeout(() => reject(new Error(`连接超时 (${address}:${port})`)), DIRECT_DIAL_TIMEOUT)
         )
     ]);
+
+    hooks?.onOpened?.();
 
     // log(`connected to ${address}:${port}`);
     const writer = tcpSocket.writable.getWriter();
@@ -436,7 +444,7 @@ async function connectWithPrefixFallback(
         const hasV6Record = isV6Literal ? true : (await resolveTargetDNS(targetAddress)).ipv6.length > 0;
         if (hasV6Record) {
             log(`no IPv4 record for ${targetAddress}; dialing target directly (NAT64 mapping not applicable)`);
-            const directSocket = await connectAndWrite(targetAddress, targetPort, rawClientData, fetcher);
+            const directSocket = await dialAndWrite(targetAddress, targetPort, rawClientData, fetcher);
             return { socket: directSocket, usedIp: targetAddress };
         }
         throw new Error('Unable to find IPv4 in DNS records for prefix fallback');
@@ -454,7 +462,7 @@ async function connectWithPrefixFallback(
     
     log(`trying NAT64 prefix IP ${nat64IP}:${targetPort}`);
     
-    const tcpSocket = await connectAndWrite(nat64IP, targetPort, rawClientData, fetcher);
+    const tcpSocket = await dialAndWrite(nat64IP, targetPort, rawClientData, fetcher);
     
     return { socket: tcpSocket, usedIp: nat64IP };
 }
@@ -833,28 +841,11 @@ export async function handleTCPOutBound(
     const triedHops = new Set<'upstream' | 'pool' | 'official'>();
 
     async function connectAndWriteLocal(address: string, port: number, fetcher?: any): Promise<Socket> {
-        // if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(address)) address = `${atob('d3d3Lg==')}${address}${atob('LnNzbGlwLmlv')}`;
-        const tcpSocket = connectSocket({
-            hostname: address,
-            port: port,
-        }, fetcher);
-
-        remoteSocket.value = tcpSocket;
-
-        // 连接超时保护：防止连到不通的 IP 时卡死
-        await Promise.race([
-            tcpSocket.opened,
-            new Promise<void>((_, reject) =>
-                setTimeout(() => reject(new Error(`连接超时 (${address}:${port})`)), DIRECT_DIAL_TIMEOUT)
-            )
-        ]);
-
-        log(`connected to ${address}:${port}`);
-        const writer = tcpSocket.writable.getWriter();
-        // F-19：与 socks5Connect 一致，写入前判空，避免 write(undefined) 抛 TypeError
-        if (rawClientData && rawClientData.byteLength) await writer.write(rawClientData);
-        writer.releaseLock();
-        return tcpSocket;
+        return await dialAndWrite(address, port, rawClientData, fetcher, {
+            // 登记时机不能挪到 await 之后：超时/失败时 teardown 要靠它关掉这条半开连接
+            onSocket: (socket) => { remoteSocket.value = socket; },
+            onOpened: () => log(`connected to ${address}:${port}`),
+        });
     }
 
     let retryInFlight = false;

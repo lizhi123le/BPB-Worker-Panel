@@ -124,6 +124,15 @@ h2 {
     width: 100%;
 }
 
+/* 登录表单与首访「设置管理员口令」表单互斥显示：两张表单谁出来，完全由服务端写在 <body> 上的
+   data-auth-mode（setup = 尚无管理员口令 / login = 已有）决定。
+   为什么不用 hidden 属性 + JS 切换：脚本在 </body> 前才执行，setup 模式下会先闪一下登录表单。
+   为什么必须用 id 选择器：UA 样式表的 [hidden]{display:none} 会被上面 .login-form 的 display:flex 覆盖。 */
+body[data-auth-mode="setup"] #loginForm,
+body[data-auth-mode="login"] #setupForm {
+    display: none;
+}
+
 .form-control {
     display: flex;
     gap: 12px;
@@ -184,6 +193,11 @@ input[type="text"]:focus {
     margin-bottom: 10px;
 }
 
+/* 口令强度说明：是提示不是报错，不能用 .hint 的红色（与 panel 弹窗同一套文案） */
+.hint.hint-info {
+    color: var(--color-text-secondary);
+}
+
 .button {
     display: flex;
     align-items: center;
@@ -241,15 +255,4 @@ button:active {
     .container {
         width: 30%;
     }
-}
-
-.header {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.panel-version {
-    align-self: flex-start;
-    font-size: large;
 }

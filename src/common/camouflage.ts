@@ -1,4 +1,5 @@
 import {
+    evictOldest,
     fetchWithTimeout,
     withTimeout,
     hstsHeaders,
@@ -143,6 +144,21 @@ export async function cf1101Page(host: string, accessIP: string): Promise<string
   </script> 
 </body>
 </html>`;
+}
+
+/**
+ * 黑名单 / 限流拦截的统一出口：1101 伪装页 + 429 + Retry-After。
+ * firstCheck.ts 的三处拦截与 worker.ts 的 WS 路径字典拦截共用（此前是四份逐字重复的 Response 构造）。
+ * 每次调用都新建 headers 对象，调用方之间不共享可变状态。
+ */
+export async function cf1101RateLimitedResponse(host: string, accessIP: string): Promise<Response> {
+    return new Response(await cf1101Page(host, accessIP), {
+        status: 429,
+        headers: {
+            'Content-Type': 'text/html; charset=UTF-8',
+            'Retry-After': '3600'
+        }
+    });
 }
 
 /**
@@ -306,10 +322,8 @@ async function tryServeImage(maskURL: URL): Promise<Response | null> {
         if (contentLength > 0 && contentLength < 2 * 1024 * 1024) {
             const bytes = await withTimeout(resp.arrayBuffer(), 5000, '图片代理响应体读取');
             if (bytes.byteLength < 2 * 1024 * 1024) {
-                if (maskImageCache.size >= MASK_IMAGE_CACHE_MAX) {
-                    const oldest = maskImageCache.keys().next().value;
-                    if (oldest) maskImageCache.delete(oldest);
-                }
+                // 插入前腾位置（传 MAX-1），插入后不超过 MASK_IMAGE_CACHE_MAX
+                evictOldest(maskImageCache, MASK_IMAGE_CACHE_MAX - 1);
                 maskImageCache.set(url, { body: bytes, status: resp.status, contentType, time: Date.now() });
                 return wrapImageResponse(bytes, resp.status, contentType, maskURL.hostname);
             }
@@ -403,8 +417,10 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
         const contentType = resp.headers.get('content-type') || '';
         const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
 
-        // 文本且 <2MB：缓冲 + 重写上游 host + 缓存
-        if (/text|javascript|json|xml/.test(contentType) && (contentLength === 0 || contentLength < TEXT_REWRITE_MAX)) {
+        // 文本且 <2MB：缓冲 + 重写上游 host + 缓存。
+        // 判据与 filterResponseHeaders（缓存策略）共用同一个常量：原先这里内联了一份**少了 /i** 的副本，
+        // 大写 content-type（如 `Text/HTML`）会走"不重写"的另一条分支，与缓存策略的判定自相矛盾。
+        if (REWRITTEN_CONTENT_TYPE_RE.test(contentType) && (contentLength === 0 || contentLength < TEXT_REWRITE_MAX)) {
             const clone = resp.clone();
             try {
                 const text = await withTimeout(clone.text(), 5000, '伪装页读取');
@@ -442,7 +458,8 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
                     { method: 'GET', headers: fallbackHeaders, cf: {} },
                     FETCH_TIMEOUT
                 );
-                if (fallbackResp.ok || fallbackResp.status < 500) {
+                // Response.ok 就是 2xx，已被 status < 500 包含，这里只判后者
+                if (fallbackResp.status < 500) {
                     return new Response(fallbackResp.body, {
                         status: fallbackResp.status,
                         statusText: fallbackResp.statusText,

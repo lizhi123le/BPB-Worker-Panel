@@ -17,7 +17,7 @@
     __STYLE__
 </head>
 
-<body class="has-fallback">
+<body class="has-fallback" data-auth-mode="__AUTH_MODE__">
     <iframe id="fallback-bg" src="/img?t=1" title="fallback background" aria-hidden="true"></iframe>
     <div class="container">
         <h1>
@@ -25,13 +25,13 @@
             <img class="icon" src="/favicon.ico" alt="BPB Logo"> BPB Panel
         </h1>
         <div class="form-container">
-            <h2>User Login</h2>
+            <h2 id="formTitle">User Login</h2>
             <form id="loginForm" class="login-form">
                 <div class="form-control">
                     <label for="password">Password</label>
                     <div class="password-wrapper">
                         <input type="password" id="password" name="password" required>
-                        <span id="togglePassword" class="material-symbols-rounded toggle-password">
+                        <span class="material-symbols-rounded toggle-password">
                             visibility_off
                         </span>
                     </div>
@@ -39,6 +39,37 @@
                 <div id="passwordError" class="hint"></div>
                 <button type="submit" class="button">
                     Login
+                    <span class="material-symbols-rounded">
+                        login
+                    </span>
+                </button>
+            </form>
+            <!-- 首访（KV 尚无管理员口令）：服务端把 __AUTH_MODE__ 换成 setup，CSS 据此显示这张表单 -->
+            <form id="setupForm" class="login-form">
+                <div class="form-control">
+                    <label for="newPassword">New password</label>
+                    <div class="password-wrapper">
+                        <input type="password" id="newPassword" name="newPassword" autocomplete="new-password" required>
+                        <span class="material-symbols-rounded toggle-password">
+                            visibility_off
+                        </span>
+                    </div>
+                </div>
+                <div class="form-control">
+                    <label for="confirmPassword">Confirm password</label>
+                    <div class="password-wrapper">
+                        <input type="password" id="confirmPassword" name="confirmPassword" autocomplete="new-password" required>
+                        <span class="material-symbols-rounded toggle-password">
+                            visibility_off
+                        </span>
+                    </div>
+                </div>
+                <div class="hint hint-info">
+                    Password must contain at least one capital letter, one number, and be at least 8 characters long.
+                </div>
+                <div id="setupError" class="hint"></div>
+                <button type="submit" class="button">
+                    Set password
                     <span class="material-symbols-rounded">
                         login
                     </span>
