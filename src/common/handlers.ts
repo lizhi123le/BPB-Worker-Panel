@@ -632,15 +632,24 @@ async function getWarpConfigs(request: Request, env: Env): Promise<Response> {
     }
 }
 
+/** 地理信息查询接口（ip-api.com /batch）单次请求上限；同时也是 /proxy-ip 表格的展示条数上限 */
+const GEO_BATCH_LIMIT = 100;
+
 async function getProxyIPsInfo(): Promise<Response> {
-    // A + AAAA 都要查：纯 v6 的中继此前在这张表里永远是空的（原来只查 A）
+    // A + AAAA 都查：纯 v6 的中继此前在这张表里永远是空的（原来只查 A）
     const { ipv4, ipv6 } = await resolveDNS(globalThis.dict._public_proxy_ip_);
-    // 双栈时 v4 / v6 **各自只取一半**（避免表格条数翻倍），且用 ceil 保证单条记录的那一类不会被抹成 0；
-    // 只有一类有记录时（纯 v4 / 纯 v6 中继）全列 —— 纯 v4 的展示与改动前逐字一致。
-    const dualStack = ipv4.length > 0 && ipv6.length > 0;
-    const listed = dualStack
-        ? [...ipv4.slice(0, Math.ceil(ipv4.length / 2)), ...ipv6.slice(0, Math.ceil(ipv6.length / 2))]
-        : [...ipv4, ...ipv6];
+    // 表格目标条数 = GEO_BATCH_LIMIT：
+    //   · 两类合计 ≤ 上限 → 全部显示；
+    //   · 超过上限 → 按 1:1 各加入一半，某一类不够就从**还有剩余**的那一类补齐到上限。
+    // 这样两类都有时尽量各占一半，只有一类（纯 v4 / 纯 v6 中继）时也能把表填满 ——
+    // 顺带保证送进 geoLookupBatch 的条数 ≤ 单次请求上限，永远只发一个批次。
+    const half = GEO_BATCH_LIMIT / 2;
+    const take4 = Math.min(ipv4.length, half);
+    const take6 = Math.min(ipv6.length, half);
+    const missing = GEO_BATCH_LIMIT - take4 - take6;
+    const extra4 = Math.min(ipv4.length - take4, missing);
+    const extra6 = Math.min(ipv6.length - take6, missing - extra4);
+    const listed = [...ipv4.slice(0, take4 + extra4), ...ipv6.slice(0, take6 + extra6)];
     const geoLocInfo = await geoLookupBatch(listed);
     return respond(true, HttpStatus.OK, undefined, geoLocInfo);
 }
@@ -800,7 +809,7 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
 }
 
 async function geoLookupBatch(ipList: string[]): Promise<GeoResult[]> {
-    const batches = chunkArray(ipList, 100);
+    const batches = chunkArray(ipList, GEO_BATCH_LIMIT);
     const results: GeoResult[] = [];
 
     for (const batch of batches) {
