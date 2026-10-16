@@ -12,6 +12,7 @@
     "test:cipher": "node tools/cipher.test.mjs",
     "test:login": "node tools/login-firstrun.test.mjs",
     "test:ws": "node tools/ws-firstpacket.test.mjs",
+    "test:proxyip": "node tools/proxy-ip-limit.test.mjs",
     "test:pool": "node tools/proxy-pool-draw.test.mjs",
     "obfuscate": "node scripts/obfuscate.mjs",
     "verify": "node scripts/verify.mjs",

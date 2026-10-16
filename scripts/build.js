@@ -306,6 +306,7 @@ async function obfuscateWithGates() {
     // reference 行为闸门组：全部只读混淆前产物，钉的是源码行为本身。
     //   · WS 首包判定        —— VLESS/Trojan 识别与非法首包收口
     //   · 首访设置口令       —— /login 首访设口令、登录、改密吊销旧会话
+    //   · /proxy-ip 取数规则 —— A+AAAA 双栈、合计 ≤100 全列、超出按 1:1 且不足从多的那类补齐
     //   · 反代池抽取与退避   —— 全量入池（含 A+AAAA，不砍 IPv6）/ 洗牌抽 8 / 探测不通按指数退避隐退 /
     //                           到期回池 / 50 条大池不截断 / @REGION 地区池互不串味（约 40s，其中 31s
     //                           是等 30s 退避到期以验证「回池」）
@@ -315,6 +316,7 @@ async function obfuscateWithGates() {
     const referenceGates = [
         { script: 'tools/ws-firstpacket.test.mjs', label: 'WS 首包判定（VLESS/Trojan 识别与非法首包收口）' },
         { script: 'tools/login-firstrun.test.mjs', label: '首访设置口令 / 登录 / 改密吊销旧会话' },
+        { script: 'tools/proxy-ip-limit.test.mjs', label: '/proxy-ip 取数规则（A+AAAA 双栈 / 上限 100 / 超出 1:1 / 不足从多的那类补齐）' },
         { script: 'tools/proxy-pool-draw.test.mjs', label: '反代池：全量入池（含 A+AAAA，不砍 IPv6）/ 洗牌抽 8 / 退避隐退与回池 / 地区隔离（约 40s）' }
     ].filter(({ script }) => (script.endsWith('proxy-pool-draw.test.mjs') ? poolGate : toolsGate));
 
