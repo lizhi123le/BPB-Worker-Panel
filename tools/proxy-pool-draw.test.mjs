@@ -7,7 +7,7 @@
  * 为什么需要它：这套逻辑全在 WS 内部（resolveProxyIPPool + connectWithRaceDial），smoke 用例
  * 连不了真 TCP，所以这里用「早期数据」把合法 VLESS 首包喂进 write()，并用
  *   globalThis.connect  → 可编程的 TCP 桩（按 IP 决定 connect 立即失败还是 3ms 成功）
- *   globalThis.fetch    → DoH 桩（按查询域名返回对应的 A 记录集合；AAAA 为空）
+ *   globalThis.fetch    → DoH 桩（按查询域名 + 查询类型返回对应的 A / AAAA 记录集合）
  * 把真实连接路径跑起来；env.PROXY_IP（或 KV proxyIPs）+ `?qj=only`（仅走代理）让首跳必然是反代池竞速。
  *
  * 覆盖：
@@ -20,6 +20,8 @@
  *      （曾经按 32 条截断，被砍掉的 18 条连 2 秒探测机会都没有）
  *   6. 地区隔离：面板按 `@地区` 锚定的条目，wk=KR/SG 时各自只解析并抽取本地区的池，
  *      不混入其它地区的 IP
+ *   7. 不砍 IPv6：解析 A + AAAA 时，AAAA 以 `[v6]` 入池并**同等参与**抽取与探测
+ *      （回归钉：防止以后有人把 v6 候选过滤掉，或用 `split(':')` 之类把 v6 键解析坏）
  *
  * 前提：先构建过（`NODE_ENV=mangle node scripts/build.js`），本测试加载
  * .build/worker.reference.js（混淆前产物，行为等价且可读）。
@@ -35,6 +37,7 @@ const PROXY_DOMAIN = 'pool.example.net';
 const BIG_DOMAIN = 'big-pool.example.net';
 const KR_DOMAIN = 'kr-pool.example.net';
 const SG_DOMAIN = 'sg-pool.example.net';
+const V6_DOMAIN = 'v6-pool.example.net';
 const TARGET = 'ipv4.icanhazip.com';
 
 // 14 条候选：前 6 条「不通」（connect 立即失败），后 8 条「通」（3ms 建连）
@@ -46,6 +49,9 @@ const BIG_POOL = Array.from({ length: 50 }, (_, i) => `10.30.0.${i + 1}`);
 // 两个不同地区的池（真实地区池互不重叠），用于验证 @地区 锚定的池隔离
 const KR_POOL = Array.from({ length: 12 }, (_, i) => `10.40.0.${i + 1}`);
 const SG_POOL = Array.from({ length: 12 }, (_, i) => `10.50.0.${i + 1}`);
+// 双栈池：同一域名同时发布 A 与 AAAA，用来钉「AAAA 以 [v6] 入池并同等参与抽取/探测」
+const V6_A = ['10.60.0.1', '10.60.0.2', '10.60.0.3'];
+const V6_AAAA = ['2001:db8::1', '2001:db8::2', '2001:db8::3'];
 const BLACKLIST_BASE_TTL_MS = 30 * 1000; // IP_BLACKLIST_TTL：等过它才能验证「回池」
 const CONN_WAIT_MS = 300;                // 每次连接后等它的探测/拨号跑完
 
@@ -117,10 +123,14 @@ globalThis.WebSocketPair = class {
     }
 };
 
-/** 本次连接内所有 TCP 建连尝试（探测 + 竞速拨号都会打到这里） */
+/** 本次连接内所有 TCP 建连尝试（探测 + 竞速拨号都会打到这里）。
+ *  分两份记：拼好的 `host:port` 字符串只用于日志，**裸 hostname** 才是断言用的集合 ——
+ *  IPv6 地址本身含冒号，用 `split(':')[0]` 解析会把 `2001:db8::1` 截成 `2001`，v6 断言必然假绿。 */
 let dialedThisConnection = [];
+let dialedHostsThisConnection = [];
 globalThis.connect = ({ hostname, port }) => {
     dialedThisConnection.push(`${hostname}:${port}`);
+    dialedHostsThisConnection.push(hostname);
     let resolveOpened;
     let rejectOpened;
     const opened = new Promise((res, rej) => { resolveOpened = res; rejectOpened = rej; });
@@ -137,23 +147,29 @@ globalThis.connect = ({ hostname, port }) => {
     return socket;
 };
 
-/** DoH 桩当前返回的 A 记录集合（阶段 C 换成 50 条的大池以验证不截断） */
+/** DoH 桩当前对「未知域名」返回的 A 记录集合（阶段 C 换成 50 条的大池以验证不截断） */
 let dohIps = POOL;
-/** 按查询域名返回对应的 A 记录集合：不同地区域名 = 各自独立的池 */
+/** 按查询域名返回该域名发布的记录集合：`{ a, aaaa }`。
+ *  不同地区域名 = 各自独立的池；v6-pool 同时发布 A 与 AAAA（双栈）。 */
 function dohRecordsFor(name) {
     const n = name.toLowerCase();
-    if (n.includes('kr-pool')) return KR_POOL;
-    if (n.includes('sg-pool')) return SG_POOL;
-    return dohIps;
+    if (n.includes('kr-pool')) return { a: KR_POOL, aaaa: [] };
+    if (n.includes('sg-pool')) return { a: SG_POOL, aaaa: [] };
+    if (n.includes('v6-pool')) return { a: V6_A, aaaa: V6_AAAA };
+    return { a: dohIps, aaaa: [] };
 }
 globalThis.fetch = async (url) => {
     const u = String(url);
     const isDoh = u.includes('cloudflare-dns.com') || u.includes('dns.google');
     if (isDoh) {
         const name = decodeURIComponent(/[?&]name=([^&]+)/.exec(u)?.[1] ?? '');
-        const type = /[?&]type=(A|AAAA)/.exec(u)?.[1] ?? 'A';
-        const ips = type === 'AAAA' ? [] : dohRecordsFor(name);
-        const answer = ips.map((ip) => ({ name, type: 1, TTL: 300, data: ip }));
+        // 注意交替顺序：写成 (A|AAAA) 时 `type=AAAA` 会先匹配到 A，AAAA 查询就被当成 A 查询返回，
+        // v6 候选永远进不了池（阶段 E 的回归钉就是这么把这个桩的 bug 抓出来的）。
+        const type = /[?&]type=(AAAA|A)/.exec(u)?.[1] ?? 'A';
+        const records = dohRecordsFor(name);
+        const isAaaa = type === 'AAAA';
+        const answer = (isAaaa ? records.aaaa : records.a)
+            .map((data) => ({ name, type: isAaaa ? 28 : 1, TTL: 300, data }));
         return new RealResponse(JSON.stringify({ Status: 0, Answer: answer }), {
             headers: { 'content-type': 'application/dns-json' }
         });
@@ -185,6 +201,7 @@ const PACKET = vlessDomainPacket(TARGET);
 /** 发一次 WS 升级（仅走代理模式），等首包处理跑完，返回本次观测 */
 async function runConnection(query = '?qj=only') {
     dialedThisConnection = [];
+    dialedHostsThisConnection = [];
     logs.length = 0;
     const earlyData = Buffer.from(PACKET).toString('base64url');
     const request = new Request(`${ORIGIN}/${query}`, {
@@ -196,7 +213,8 @@ async function runConnection(query = '?qj=only') {
     });
     const response = await handler.fetch(request, env, ctx);
     await new Promise((r) => setTimeout(r, CONN_WAIT_MS));
-    const probed = new Set(dialedThisConnection.map((k) => k.split(':')[0]));
+    // 断言集合用裸 hostname：IPv6 地址自带冒号，不能再按 ':' 切分
+    const probed = new Set(dialedHostsThisConnection);
     const drawLog = logs.find((l) => /got \d+ IPs for proxy .* drawing \d+/.test(l)) || '';
     const m = /got (\d+) IPs for proxy .* drawing (\d+) \((\d+) in backoff\)/.exec(drawLog);
     return {
@@ -304,6 +322,33 @@ check('大池仍只抽 8 条参与 2 秒探测',
 check('大池抽出的候选都来自该池',
     big.probed.size > 0 && [...big.probed].every((ip) => BIG_POOL.includes(ip)),
     `probed=${[...big.probed].join(',')}`);
+
+// ── 阶段 E：不砍 IPv6（A + AAAA 都要入池、都要参与抽取与探测）
+//    回归钉：曾经有人把 AAAA 丢掉（直连池只取 ipv4），或把 v6 键用 split(':') 解析坏 —— 这里全钉住。
+out(`— 阶段 E：${V6_DOMAIN} 同时发布 ${V6_A.length} 条 A + ${V6_AAAA.length} 条 AAAA，两类都要在池里并被抽到 —`);
+env.PROXY_IP = V6_DOMAIN;
+const v6runs = [];
+for (let i = 0; i < 3; i++) v6runs.push(await runConnection());
+const v6First = v6runs[0];
+const v6Probed = new Set(v6runs.flatMap((r) => [...r.probed]));
+const v6ProbedV6 = [...v6Probed].filter((h) => h.includes(':'));
+const v6ProbedV4 = [...v6Probed].filter((h) => !h.includes(':'));
+
+check(`双栈池全量入池（A ${V6_A.length} + AAAA ${V6_AAAA.length} = ${V6_A.length + V6_AAAA.length} 条）`,
+    v6First.poolSize === V6_A.length + V6_AAAA.length,
+    `poolSize=${v6First.poolSize} log=${v6First.drawLog}`);
+check('AAAA 候选确实进入抽取/探测（3 条 v6 都被拨到过）',
+    V6_AAAA.every((ip) => v6Probed.has(ip)),
+    `v6probed=${v6ProbedV6.sort().join(',')} 期望=${V6_AAAA.join(',')}`);
+check('A 候选同样被抽到（v6 不是靠挤掉 v4 才进池的）',
+    V6_A.every((ip) => v6Probed.has(ip)),
+    `v4probed=${v6ProbedV4.sort().join(',')}`);
+check('抽取键未被 v6 的冒号解析坏（抽到的 host 都是完整地址，无 2001 之类的截断）',
+    v6ProbedV6.every((h) => /^[0-9a-fA-F:]+$/.test(h) && h.split(':').length >= 3),
+    `v6probed=${v6ProbedV6.sort().join(',')}`);
+check('v6 候选能正常完成探测并参与竞速（本次竞速有胜者）',
+    v6runs.every((r) => r.status === 101 && [...r.probed].some((h) => h.includes(':'))),
+    v6runs.map((r) => `status=${r.status} probed=${[...r.probed].join('|')}`).join(' ;; '));
 
 // ── 阶段 D：地区隔离（面板按 @地区 锚定的两条域名 + wk 指定地区）
 //    KV 里放两个带 @地区标签的条目；wk=KR 时必须只解析/抽取 KR 域名解析出的池，绝不混入 SG；
