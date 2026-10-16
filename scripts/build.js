@@ -292,22 +292,31 @@ async function buildWorker() {
 }
 
 /**
- * 混淆 + 三层闸门 + 重试。
+ * 混淆 + 闸门组 + 重试。
  *
  * 每次尝试都用一条**全新的随机 ChaCha20 密钥**，所以重试出来的产物互不相同；
- * 静态闸门（verify）、行为闸门（smoke）与反代池行为闸门（tools/proxy-pool-draw.test.mjs）
- * 都过了才接受这一份 —— 前两层随重试重跑，第三层只依赖 .build/worker.reference.js
- * （与本次密钥无关），因此只在"其他闸门都过了"的这一份上跑一次。
+ * 静态闸门（verify）与行为闸门（smoke）随重试重跑。
+ * reference 行为闸门组（tools/ 下三个测试）只读 .build/worker.reference.js，与本次密钥和
+ * 混淆强度无关，所以只在「静态+行为闸门都过了」的这一份产物上跑一次，失败直接终止。
  * 闸门跑在独立进程里（stdio inherit），这样单个闸门崩溃不会污染构建进程。
  */
 async function obfuscateWithGates() {
     const attempts = Math.max(1, Number(process.env.HARDEN_ATTEMPTS || 3));
     const smokeEvery = process.env.SMOKE_EVERY !== '0';
-    // 反代池行为闸门：验证「DNS 解析出的候选全量入池 → 抽取时按临时黑名单过滤 → 洗牌抽 8 条
-    // → 2 秒 TCP 探测 → 分批竞速拨号」，以及探测不通的候选按指数退避暂时隐退、到期回池、
-    // 地区（@REGION 锚定）之间池不串味。它读的是混淆前的 reference，所以与密钥/混淆强度无关：
-    // 失败直接终止构建（换密钥不会让代码逻辑变对，重试没有意义），POOL_GATE=0 可临时跳过。
-    const poolGate = process.env.POOL_GATE !== '0';
+    // reference 行为闸门组：全部只读混淆前产物，钉的是源码行为本身。
+    //   · WS 首包判定        —— VLESS/Trojan 识别与非法首包收口
+    //   · 首访设置口令       —— /login 首访设口令、登录、改密吊销旧会话
+    //   · 反代池抽取与退避   —— 全量入池 / 洗牌抽 8 / 探测不通按指数退避隐退 / 到期回池 /
+    //                           50 条大池不截断 / @REGION 地区池互不串味（约 40s，其中 31s
+    //                           是等 30s 退避到期以验证「回池」）
+    // TOOLS_GATE=0 跳过整组；POOL_GATE=0 只跳过最慢的反代池那项。
+    const toolsGate = process.env.TOOLS_GATE !== '0';
+    const poolGate = toolsGate && process.env.POOL_GATE !== '0';
+    const referenceGates = [
+        { script: 'tools/ws-firstpacket.test.mjs', label: 'WS 首包判定（VLESS/Trojan 识别与非法首包收口）' },
+        { script: 'tools/login-firstrun.test.mjs', label: '首访设置口令 / 登录 / 改密吊销旧会话' },
+        { script: 'tools/proxy-pool-draw.test.mjs', label: '反代池：全量入池 / 洗牌抽 8 / 退避隐退与回池 / 地区隔离（约 40s）' }
+    ].filter(({ script }) => (script.endsWith('proxy-pool-draw.test.mjs') ? poolGate : toolsGate));
 
     const run = (script, args = []) => {
         const result = spawnSync(process.execPath, [join(__dirname, '..', script), ...args], {
@@ -337,16 +346,17 @@ async function obfuscateWithGates() {
             console.error(`${failure} smoke 未通过，换一条密钥重试`);
             continue;
         }
-        // 最后一道：反代池行为闸门（约 40s，其中 31s 是等 30s 退避到期以验证「回池」）。
-        // 只依赖 reference，故只在这一份（已过静态+行为闸门）产物上跑一次，不随重试重复。
-        if (poolGate) {
-            console.log(`\n${success} 反代池行为闸门 ${attempt}/${attempts}：tools/proxy-pool-draw.test.mjs`);
-            if (!run('tools/proxy-pool-draw.test.mjs')) {
+        // 最后一组：reference 行为闸门（只依赖混淆前产物，故只在这一份已过静态+行为闸门的
+        // 产物上跑一次，不随重试重复）。任何一项失败都直接终止：换密钥不会让源码行为变对。
+        for (const { script, label } of referenceGates) {
+            console.log(`\n${success} reference 行为闸门 ${attempt}/${attempts}：${script}`);
+            console.log(`      ${label}`);
+            if (!run(script)) {
                 throw new Error(
-                    '反代池行为闸门未通过（tools/proxy-pool-draw.test.mjs）—— 不要部署 dist/worker.js。' +
-                        '它钉的是：解析出的候选全量入池 / 每连接洗牌抽 8 条 / 探测不通按指数退避暂时隐退 / ' +
-                        '退避到期回池参与抽取 / 50 条大池不截断 / @REGION 地区池互不串味。' +
-                        '确认是有意改动可设 POOL_GATE=0 临时跳过本闸门。'
+                    `reference 行为闸门未通过（${script}）—— 不要部署 dist/worker.js。` +
+                        `它钉的是：${label}。` +
+                        '该组闸门只读混淆前的 reference、与本次密钥和混淆强度无关，所以不重试；' +
+                        '确认是有意改动可设 TOOLS_GATE=0 跳过整组，或 POOL_GATE=0 只跳过反代池那项。'
                 );
             }
         }
