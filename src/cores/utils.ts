@@ -1245,14 +1245,18 @@ export async function filterReachableIPs(
     return reachable.length > 0 ? reachable : ips;
 }
 
-/** 对 [host, port] 条目数组做并发探测（每项用自身端口），返回可达条目子集 */
+/** 对 [host, port] 条目数组做并发探测（每项用自身端口），返回可达条目子集。
+ *  onProbe 可选回调：把每条候选的探测结果交给调用方 —— 反代池用它把「探测不通」的候选
+ *  记进临时黑名单（指数退避），避免同一个死候选每连接都白等一次 2 秒探测。 */
 export async function filterReachableEntries(
-    entries: [string, number][]
+    entries: [string, number][],
+    onProbe?: (entry: [string, number], ok: boolean) => void
 ): Promise<[string, number][]> {
     const results = await Promise.all(
         entries.map(async ([ip, port]) => {
             const clean = ip.replace(/^\[|\]$/g, '');
             const ok = await probeIPReachability(clean, port);
+            onProbe?.([ip, port], ok);
             return { entry: [ip, port] as [string, number], ok };
         })
     );
@@ -1334,8 +1338,11 @@ function parseHostPortEntry(entry: string): [string, number] {
  * Resolve proxy IP string into a pool of [host, port] entries.
  * Supports: .william domains (TXT prefix expansion), .tpN domains (port extraction),
  * normal domains (DoH A/AAAA dual-source), and direct IPs.
- * Results are cached per (proxyIP, targetDomain, uuid) with a TTL; pool is sorted
- * + deterministically shuffled + capped at 8.
+ * Results are cached per (proxyIP, targetDomain, uuid) with a TTL; the pool keeps **all**
+ * resolved entries (sorted + deterministically shuffled)，单池不设条数上限 ——
+ * 截断会让被砍掉的候选连 2 秒探测的机会都没有（实测地区池 KR=14、SG/JP/通用=50）。
+ * 抽取 8 条参与「2 秒探测 + 竞速拨号」的职责移到 connectWithRaceDial：那里按临时黑名单
+ * 过滤后随机抽取。
  * Aligns with edgetunnel `解析地址端口` (9895-10016).
  */
 export async function resolveProxyIPPool(
@@ -1423,7 +1430,10 @@ export async function resolveProxyIPPool(
         (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5
     );
 
-    const result = shuffled.slice(0, 8);
+    // 池内保留**全部**解析结果，不做任何条数截断：实测地区池 KR=14 条、SG/JP/通用=50 条，
+    // 截断会让被砍掉的候选连 2 秒探测的机会都没有（那正是本改动要消除的浪费）。
+    // 真正的边界来自 DoH 应答本身（一次 DNS 报文 ≤64KB）与 _proxyPoolCache 的 32 键上限。
+    const result = shuffled;
     // C-04：写入带时间戳的键化缓存；超限时按插入顺序（LRU）淘汰最旧一条
     _proxyPoolCache.set(cacheKey, { result, time: Date.now() });
     evictOldest(_proxyPoolCache, PROXY_POOL_CACHE_MAX);

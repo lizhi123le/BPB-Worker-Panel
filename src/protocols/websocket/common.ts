@@ -19,6 +19,7 @@ const DIRECT_DIAL_TIMEOUT = 5000; // 直连竞速与兜底直连连接超时（�
 const PROXY_DIAL_TIMEOUT = 5000; // 代理竞速连接超时（对齐 cfnew 连接超时值 = 5000）
 const RACE_DIAL_CONCURRENCY = 3; // 并发拨号数量，参考 cfnew
 const RACE_DIAL_MAX_BATCHES = 5; // 最大重试批次
+const RACE_PROBE_COUNT = 8; // 每连接从缓存池抽取参与 2 秒可达性探测的候选数（抽取在探测前、按黑名单过滤后进行）
 
 // IP:port 黑名单：连续失败计数 + 指数退避冷却（对齐 edgetunnel 节点黑名单 250-253）
 const IP_BLACKLIST_TTL = 30 * 1000;          // 基础冷却 30 秒
@@ -63,6 +64,26 @@ function blacklistRecord(key: string) {
 }
 function blacklistClear(key: string) { ipBlacklist.delete(key); }
 
+/** 黑名单键的唯一口径：IPv6 去方括号 + `:port`。
+ *  抽取过滤、拨号前预检、成功清除、失败记账四处必须同键，否则退避形同虚设。 */
+function blacklistKey(host: string, port: number): string {
+    return `${host.replace(/^\[|\]$/g, '')}:${port}`;
+}
+
+/** Fisher-Yates 洗牌后取前 n 条（不改动入参）。
+ *  反代池每连接随机抽取候选，让池里**全部**解析结果都有机会被用到；
+ *  被临时拉黑的候选已在抽取前过滤，退避到期后自然回到抽取集合。 */
+function shuffleTake<T>(items: T[], n: number): T[] {
+    const copy = [...items];
+    for (let i = copy.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = copy[i];
+        copy[i] = copy[j];
+        copy[j] = tmp;
+    }
+    return copy.slice(0, n);
+}
+
 // 代理竞速 IP 级轮询游标：成功候选推进游标（对齐 edgetunnel 缓存反代数组索引 5779/5800）
 let proxyIpPoolCursor = 0;
 
@@ -106,7 +127,8 @@ async function connectWithRaceDial(
 
     // 3. 解析 IP 池（对齐 edgetunnel 解析地址端口 9895-10016）：
     //    逐项分流——IP 字面量直接入池（不 DoH），域名走 DoH 双源解析；
-    //    整体排序 + LCG 确定性洗牌 + 取前 8；带缓存
+    //    整体排序 + LCG 确定性洗牌 + 带缓存的**全量**入池（解析出多少就存多少，不截断）；
+    //    「按黑名单过滤后随机抽 8 条去探测/竞速」在下方第 4/5 步做
     //    每项携带自身端口（显式端口 / .tpN 端口），无端口条目回退 targetPort（保持既有语义）
     log(`resolving proxy pool via DoH...`);
     const pool = await resolveProxyIPPool(poolInput.join(','), targetAddress, '');
@@ -116,11 +138,33 @@ async function connectWithRaceDial(
         throw new Error(`DNS resolution failed for proxy ${proxyAddr}`);
     }
 
-    log(`got ${poolEntries.length} IPs for proxy ${proxyAddr}, probing reachability...`);
+    // 4. 抽取阶段先按临时黑名单过滤：退避中的候选（指数退避 30/60/120s）暂时从缓存池隐退，
+    //    把本连接的槽位让给可用候选；退避到期由 blacklistCheck 自动删除条目、重新参与抽取。
+    const usableEntries = poolEntries.filter(([host, port]) => !blacklistCheck(blacklistKey(host, port)));
+    // 全池都在退避中（例如整池刚集体抖动）：此刻不再相信黑名单，本次照拨 ——
+    // 与 filterReachableEntries「全部不通则回退原始列表」同一取向，连通性优先，避免一次集体误判把池锁死。
+    const blacklistBypass = usableEntries.length === 0;
+    const drawSource = blacklistBypass ? poolEntries : usableEntries;
 
-    // 4. 并发探测前 8 个条目的可达性（每项用自身端口，BPB 独有，兼容保留）
-    const probeEntries = poolEntries.slice(0, 8);
-    const reachableEntries = await filterReachableEntries(probeEntries);
+    // 洗牌抽 8 条参与探测：池内（本次可用的）全部候选都有机会被用到，
+    // 不再由解析期的 slice(0,8) 把其余候选结构性丢弃、锁死 10 分钟。
+    const probeEntries = shuffleTake(drawSource, RACE_PROBE_COUNT);
+
+    log(`got ${poolEntries.length} IPs for proxy ${proxyAddr}, drawing ${probeEntries.length} (${poolEntries.length - drawSource.length} in backoff), probing reachability...`);
+
+    // 5. 并发探测（每项用自身端口）—— 探测不通的记一次失败进临时黑名单，不再每连接为死候选白等 2 秒
+    const probeFailed: [string, number][] = [];
+    const reachableEntries = await filterReachableEntries(probeEntries, (entry, ok) => {
+        if (!ok) probeFailed.push(entry);
+    });
+
+    // 例外：本批抽取的候选**全部**探测不通 —— 这正是「2 秒探测超时、5 秒拨号仍可能连上」的边界情形，
+    // filterReachableEntries 会把它们原样返回继续拨号，所以此时不记退避，免得一次集体抖动就把整池锁进黑名单
+    //（真不通的候选会在拨号超时/写首包失败时按既有逻辑记账）。
+    const allProbeFailed = probeEntries.length > 0 && probeFailed.length === probeEntries.length;
+    if (!blacklistBypass && !allProbeFailed) {
+        for (const [host, port] of probeFailed) blacklistRecord(blacklistKey(host, port));
+    }
 
     log(`reachable proxy IPs: ${reachableEntries.map(([h, p]) => `${h}:${p}`).join(', ')}`);
 
@@ -153,8 +197,10 @@ async function connectWithRaceDial(
         // 并发拨号，取最快成功的（黑名单预检跳过已知不通的 IP:port，对齐 edgetunnel 5782-5786）
         const dialPromises = batchEntries.map(async ([ip, entryPort], j) => {
             const cleanIp = ip.replace(/^\[|\]$/g, '');
-            const key = `${cleanIp}:${entryPort}`;
-            if (blacklistCheck(key)) return { socket: null, ip: cleanIp, port: entryPort, index: batchIndexes[j] };
+            const key = blacklistKey(cleanIp, entryPort);
+            // 抽取阶段已按黑名单过滤过；这里只兜住「抽取 → 拨号」之间被并发连接新拉黑的键。
+            // blacklistBypass（全池退避中）时不跳过，保证最后兜底仍真的会拨号。
+            if (!blacklistBypass && blacklistCheck(key)) return { socket: null, ip: cleanIp, port: entryPort, index: batchIndexes[j] };
             const socket = connectSocket({ hostname: cleanIp, port: entryPort }, fetcher);
             // 等待连接建立
             try {
@@ -197,13 +243,13 @@ async function connectWithRaceDial(
                     }
                 }
                 // 成功：清除黑名单 + 游标推进到成功候选（对齐 edgetunnel 5799-5800）
-                blacklistClear(`${ip}:${entryPort}`);
+                blacklistClear(blacklistKey(ip, entryPort));
                 proxyIpPoolCursor = index;
                 log(`race dial winner: ${ip}:${entryPort} (proxy: ${proxyAddr})`);
                 return { socket, usedIp: ip };
             } catch (writeError) {
                 log(`race dial write failed for ${ip}:${entryPort}: ${safeErrorMessage(writeError)}`);
-                blacklistRecord(`${ip}:${entryPort}`);
+                blacklistRecord(blacklistKey(ip, entryPort));
                 try { socket.close(); } catch {}
             }
         }
@@ -294,7 +340,7 @@ async function connectWithDirectRaceDial(
         for (let j = 0; j < DIRECT_RACE_CONCURRENCY && k + j < pool.length; j++) {
             const realIndex = (startOffset + k + j) % pool.length;
             const ip = pool[realIndex];
-            const key = `${ip}:${targetPort}`;
+            const key = blacklistKey(ip, targetPort);
             if (blacklistCheck(key)) continue; // 黑名单预检，不计 failCount
             batchCandidates.push({ hostname: ip.replace(/^\[|\]$/g, ''), port: targetPort, key, index: realIndex });
         }
