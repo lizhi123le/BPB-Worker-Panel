@@ -633,8 +633,15 @@ async function getWarpConfigs(request: Request, env: Env): Promise<Response> {
 }
 
 async function getProxyIPsInfo(): Promise<Response> {
-    const ips = await resolveDNS(globalThis.dict._public_proxy_ip_, true);
-    const geoLocInfo = await geoLookupBatch(ips.ipv4);
+    // A + AAAA 都要查：纯 v6 的中继此前在这张表里永远是空的（原来只查 A）
+    const { ipv4, ipv6 } = await resolveDNS(globalThis.dict._public_proxy_ip_);
+    // 双栈时 v4 / v6 **各自只取一半**（避免表格条数翻倍），且用 ceil 保证单条记录的那一类不会被抹成 0；
+    // 只有一类有记录时（纯 v4 / 纯 v6 中继）全列 —— 纯 v4 的展示与改动前逐字一致。
+    const dualStack = ipv4.length > 0 && ipv6.length > 0;
+    const listed = dualStack
+        ? [...ipv4.slice(0, Math.ceil(ipv4.length / 2)), ...ipv6.slice(0, Math.ceil(ipv6.length / 2))]
+        : [...ipv4, ...ipv6];
+    const geoLocInfo = await geoLookupBatch(listed);
     return respond(true, HttpStatus.OK, undefined, geoLocInfo);
 }
 
