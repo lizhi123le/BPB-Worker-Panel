@@ -1320,6 +1320,19 @@ async function dohQueryCached(domain: string, type: string): Promise<any[]> {
 // 会拿到为第一个域名洗出的同一份 8 条子集，且首次降级结果被永久冻结。
 const PROXY_POOL_CACHE_TTL = 10 * 60 * 1000; // 10min：与解析依赖的 DoH 结果缓存 DOH_CACHE_TTL 对齐
 const PROXY_POOL_CACHE_MAX = 32;             // 键数量上限，防止长生命周期 isolate 中无界增长
+
+/** 反代池缓存诊断日志：仅当面板「Log Level」设为 debug 时输出（与 unified.ts 的 logDebug 同口径）。
+ *  一次解析只落一行，按 layer 计数即可算命中率：
+ *    L1 hit    —— isolate 内 Map 命中（最热路径，零网络）
+ *    L1 stale  —— 有但超过 10min，丢弃后继续往下
+ *    inflight  —— 同键已有解析在飞，直接复用
+ *    L2 hit    —— Cache API 命中（同一 PoP 其他 isolate 留下的结果）
+ *    L2 miss   —— 二级也没有，准备走 DoH
+ *    L2 skip   —— 纯 IP 池（官方直连池），解析是内存计算，不碰二级缓存
+ *    DoH       —— 真正发了 DNS（ms 是解析耗时） */
+function poolCacheLog(message: string): void {
+    if (globalThis.settings?.logLevel === 'debug') console.log(`[proxy-pool] ${message}`);
+}
 /** 模块级缓存：isolate 生命周期内有效（键 = proxyIP|targetDomain|uuid），命中时校验 TTL，超限时按 LRU 淘汰 */
 const _proxyPoolCache = new Map<string, { result: [string, number][]; time: number }>();
 
@@ -1431,9 +1444,13 @@ export async function resolveProxyIPPool(
         // 命中即刷新 LRU 顺序，保证淘汰的是最久未用的键
         _proxyPoolCache.delete(cacheKey);
         _proxyPoolCache.set(cacheKey, cachedPool);
+        poolCacheLog(`L1 hit target=${targetDomain} age=${Math.round((Date.now() - cachedPool.time) / 1000)}s n=${cachedPool.result.length}`);
         return cachedPool.result;
     }
-    if (cachedPool) _proxyPoolCache.delete(cacheKey);
+    if (cachedPool) {
+        poolCacheLog(`L1 stale target=${targetDomain} age=${Math.round((Date.now() - cachedPool.time) / 1000)}s`);
+        _proxyPoolCache.delete(cacheKey);
+    }
 
     // ── 单飞（in-flight 去重）──
     // 一级缓存要等解析结束才写入，而同一个键在同一秒里可能有多条连接同时到达
@@ -1441,7 +1458,10 @@ export async function resolveProxyIPPool(
     // N 条连接会各自发起一遍 DoH。这里把「进行中的同键解析」共享出去：只有第一条真正解析，
     // 其余直接 await 它的结果；解析结束（成功或失败）立刻移除，绝不把失败固化进单飞表。
     const pending = _proxyPoolInflight.get(cacheKey);
-    if (pending) return await pending;
+    if (pending) {
+        poolCacheLog(`inflight join target=${targetDomain}`);
+        return await pending;
+    }
 
     const task = resolveProxyPoolUncached(cacheKey, proxyIP, targetDomain, uuid);
     _proxyPoolInflight.set(cacheKey, task);
@@ -1470,14 +1490,19 @@ async function resolveProxyPoolUncached(
     if (poolNeedsDns) {
         const sharedPool = await readProxyPoolCacheApi(cacheKey);
         if (sharedPool) {
+            poolCacheLog(`L2 hit target=${targetDomain} age=${Math.round((Date.now() - sharedPool.time) / 1000)}s n=${sharedPool.result.length}`);
             // 用二级条目自己的时间戳回填一级：两层共用一个绝对 TTL，
             // 不会因为「命中后回填」把 10 分钟续成 20 分钟。
             _proxyPoolCache.set(cacheKey, { result: sharedPool.result, time: sharedPool.time });
             evictOldest(_proxyPoolCache, PROXY_POOL_CACHE_MAX);
             return sharedPool.result;
         }
+        poolCacheLog(`L2 miss target=${targetDomain}`);
+    } else {
+        poolCacheLog(`L2 skip target=${targetDomain} (ip-only pool)`);
     }
 
+    const resolveStartedAt = Date.now();
     const proxyIPNormalized = proxyIP.toLowerCase();
     const entries = proxyIPNormalized.split(',').map(s => s.trim()).filter(Boolean);
     const allEntries: [string, number][] = [];
@@ -1554,6 +1579,7 @@ async function resolveProxyPoolUncached(
     const result = shuffled;
     // C-04：写入带时间戳的键化缓存；超限时按插入顺序（LRU）淘汰最旧一条
     const resolvedAt = Date.now();
+    poolCacheLog(`DoH target=${targetDomain} ms=${resolvedAt - resolveStartedAt} n=${result.length}`);
     _proxyPoolCache.set(cacheKey, { result, time: resolvedAt });
     evictOldest(_proxyPoolCache, PROXY_POOL_CACHE_MAX);
     // 二级缓存：同一 PoP 内其它 isolate 直接复用这份结果（写失败只影响命中率，不影响本次返回）

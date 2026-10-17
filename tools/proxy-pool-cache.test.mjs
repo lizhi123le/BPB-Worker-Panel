@@ -17,6 +17,9 @@
  *      不同键各自解析；解析结束后单飞表不残留
  *   5. 降级安全：没有 caches、没有 httpConfig.hostName、cache.match/put 抛错，都只是退化成
  *      一级缓存，不影响本次解析结果（smoke 的 Node 环境就是这种情况）
+ *   6. 调试日志：Log Level=debug 时每次解析只落一行 `[proxy-pool] L1 hit|L1 stale|inflight|
+ *      L2 hit|L2 miss|L2 skip|DoH`（按 layer 计数即可算命中率），且不打印反代池条目；
+ *      非 debug 级别一行都不输出
  *
  * 前提：`npm install`（需要 esbuild、html-minifier 之外的依赖不变）。不依赖 dist/ 与 .build/。
  */
@@ -247,6 +250,48 @@ async function main() {
     await m('sf.example.net:443', 'a.example.com', '');
     check('解析结束后不再重复解析', () => assert.strictEqual(fetchCount, beforeAfter));
     dohDelay = 0;
+
+    // 16) 调试日志分层：logLevel=debug 时一次解析只落一行，按 layer 计数即可算命中率
+    globalThis.caches = { default: new FakeCache() };
+    const debugLines = [];
+    const realConsoleLog = console.log;
+    globalThis.settings = { logLevel: 'debug' };
+    console.log = (...args) => { debugLines.push(args.join(' ')); };
+    try {
+        const n = await newIsolate();
+        // 首次：L2 miss → DoH；同 isolate 第二次：L1 hit
+        await n('log.example.net:443', 'loglayer.example.com', '');
+        await n('log.example.net:443', 'loglayer.example.com', '');
+    } finally {
+        console.log = realConsoleLog;
+    }
+    check('debug 日志分层：L2 miss / DoH / L1 hit 各一条', () => {
+        const lines = debugLines.filter((l) => l.includes('[proxy-pool]'));
+        const need = ['L2 miss', 'DoH', 'L1 hit'];
+        for (const key of need) {
+            assert.ok(lines.some((l) => l.includes(key)), `缺 ${key}，实际：${lines.join(' | ')}`);
+        }
+    });
+    check('debug 日志不泄露反代池条目（只记目标与条数）', () => {
+        // 反代池条目是 log.example.net 这类域名，日志里只应出现目标域名与 n=
+        const lines = debugLines.filter((l) => l.includes('[proxy-pool]'));
+        assert.ok(lines.every((l) => !l.includes('log.example.net')), lines.join(' | '));
+    });
+
+    // 17) 非 debug 级别不输出：默认日志里不能凭空多出噪声
+    const quietLines = [];
+    globalThis.settings = { logLevel: 'info' };
+    console.log = (...args) => { quietLines.push(args.join(' ')); };
+    try {
+        const q = await newIsolate();
+        await q('quiet.example.net:443', 'quiet.example.com', '');
+    } finally {
+        console.log = realConsoleLog;
+        globalThis.settings = undefined;
+    }
+    check('非 debug 级别不输出 [proxy-pool] 日志', () => {
+        assert.ok(!quietLines.some((l) => l.includes('[proxy-pool]')), quietLines.join(' | '));
+    });
 
     globalThis.fetch = realFetch;
 
