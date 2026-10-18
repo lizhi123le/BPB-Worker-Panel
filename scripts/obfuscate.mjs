@@ -38,6 +38,16 @@
  *   HARDEN_RENAME_VARIABLES / HARDEN_RENAME_GLOBALS / HARDEN_MOVED_DECLARATIONS /
  *   HARDEN_OBJECT_EXTRACTION / HARDEN_AST_SCRAMBLER  = true（逐个可关，用于定位问题）
  *   HARDEN_ATTEMPTS=3        单个产物最多重试几次（由 scripts/build.js 驱动）
+ *   HARDEN_MASK_PROPERTIES=true   混淆前把含敏感词的**属性键/方法键**改写成计算属性
+ *                                 （`a.proxyGroups` -> `a["proxyGroups"]`），否则这些名字
+ *                                 是标识符节点，stringConcealing 根本碰不到 —— 见
+ *                                 scripts/harden-source.mjs。
+ *   HARDEN_MASK_TEMPLATES=true    混淆前把静态片段含敏感词的**模板字面量**改写成拼接，
+ *                                 让日志/请求头片段也能被密文化（模板的 quasis 不是字符串字面量）。
+ *   HARDEN_MASK_BUILTIN_PROXY=true 把未绑定的内置全局 `Proxy` 改写成
+ *                                 `globalThis[String.fromCharCode(...)]`。纯指纹修饰：
+ *                                 Proxy 是引擎内置名，不含本项目特征，但不改写就没法让
+ *                                 `\bproxy\b` 闸门通过。
  *
  * 标识符陷阱（本仓库实测，务必保留 build.js 里的 `mangle: false`）
  *   js-confuser 2.0 的 renameVariables 会按**名字**解析作用域绑定。如果交给它的代码里本来就有
@@ -76,6 +86,7 @@ import {
   randomHelperName,
 } from '../tools/cipher.mjs';
 import { formatSizeSpec, loadParams } from './build-params.mjs';
+import { hardenSource } from './harden-source.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const BUILD_PARAMS = loadParams(process.argv.slice(2));
@@ -134,6 +145,10 @@ const CONFIG = {
   astScrambler: bool(process.env.HARDEN_AST_SCRAMBLER, true),
   renameVariables: bool(process.env.HARDEN_RENAME_VARIABLES, true),
   renameGlobals: bool(process.env.HARDEN_RENAME_GLOBALS, true),
+  // 混淆前的敏感标记遮蔽（见 scripts/harden-source.mjs 的详细说明）。
+  maskPropertyNames: bool(process.env.HARDEN_MASK_PROPERTIES, true),
+  maskTemplates: bool(process.env.HARDEN_MASK_TEMPLATES, true),
+  maskBuiltinProxy: bool(process.env.HARDEN_MASK_BUILTIN_PROXY, true),
   // 产物保持单行：js-confuser 的 compact 输出本身是一行，追加的解码器源码默认是多行，
   // 这里把解码器也压成一行（--one-line=false / HARDEN_ONE_LINE=0 可保留可读格式）。
   oneLine: BUILD_PARAMS.params.oneLine,
@@ -193,7 +208,7 @@ function readSensitiveWords() {
     return readFileSync(join(ROOT, 'sensitive_words_auto.txt'), 'utf-8')
       .split('\n')
       .map((w) => w.trim().toLowerCase())
-      .filter(Boolean);
+      .filter((w) => w && !w.startsWith('#'));
   } catch {
     return ['bpb', 'vless', 'trojan'];
   }
@@ -231,9 +246,26 @@ const runtimeSuffixInline = compactRuntime(runtimeSuffix);
 
 const sourceCode = readFileSync(INPUT_PATH, 'utf8');
 
+// 混淆前的敏感标记遮蔽（属性键 / 模板静态片段 / 内置 Proxy 名）。
+// 必须在 js-confuser 之前：这一步把"标识符形态的敏感标记"变成"字符串字面量形态"，
+// 之后 stringConcealing 才能把它们一起密文化。见 scripts/harden-source.mjs。
+const { code: hardenedCode, stats: maskStats } = hardenSource(sourceCode, {
+  words: sensitiveWords,
+  maskPropertyNames: CONFIG.maskPropertyNames,
+  maskTemplates: CONFIG.maskTemplates,
+  maskBuiltinProxy: CONFIG.maskBuiltinProxy,
+});
+if (maskStats.edits > 0) {
+  console.log(
+    `  敏感标记遮蔽：属性键 ${maskStats.propertyKeys}（简写 ${maskStats.shorthandKeys}）、` +
+      `模板 ${maskStats.templates}、内置 Proxy ${maskStats.builtinProxy}，` +
+      `${sourceCode.length} -> ${hardenedCode.length} 字节`
+  );
+}
+
 // 只有 integrity 的反制函数必须存在于 AST 中（Lock 插件按名字查找它）。
 // 它的错误消息字符串和其他字符串一样会被隐藏 —— 现在解码器不再依赖载荷数组，这是安全的。
-let prepared = sourceCode;
+let prepared = hardenedCode;
 if (CONFIG.integrity || CONFIG.antiDebug || CONFIG.selfDefending) {
   prepared = `${COUNTERMEASURE_SOURCE}\n${prepared}`;
 }
@@ -509,6 +541,7 @@ writeFileSync(
       helperName,
       keyStreamName,
       config: effective,
+      sourceMask: maskStats,
       sensitiveWords: CONFIG.concealAllStrings ? undefined : sensitiveWords,
       sourceBytes: sourceCode.length,
       outputBytes: output.length,
