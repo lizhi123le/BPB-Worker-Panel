@@ -1,0 +1,8 @@
+{
+  "_note": "体积/单行参数的引用文件。复制为 harden.config.json 后生效；CLI > 环境变量 > 本文件 > 默认值。",
+  "_format": "targetBytes/targetZipBytes 支持 320000、320k、1m、75%（百分比相对首次混淆产物）；0 = 关闭该限制",
+  "targetBytes": "512k",
+  "targetZipBytes": "236k",
+  "maxRuns": 20,
+  "oneLine": true
+}

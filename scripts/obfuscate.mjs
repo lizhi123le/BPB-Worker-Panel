@@ -4,7 +4,9 @@
  * 读取构建产物（默认 dist/worker.reference.js，即 esbuild + terser 之后、未混淆的同一份文件），
  * 用 js-confuser 加一层"每次构建一条随机 ChaCha20 密钥"的字符串密文，然后写回 dist/worker.js。
  *
- * 运行：node scripts/obfuscate.mjs [输入] [输出]
+ * 运行：node scripts/obfuscate.mjs [输入] [输出] [--target-zip=320k] [--target-bytes=70%]
+ *       参数优先级 CLI > 环境变量 > harden.config.json；大小支持 320000/320k/1m/75%。
+ *       默认体积目标：--target-bytes=512k --target-zip=236k（显式设 0 可关闭）。
  *
  * 与参考实现（MOD-Worker-Panel/obfuscate.mjs）的关系：
  *  - 密文换成真 ChaCha20（RFC 8439）+ 每条字符串独立 8 字节 nonce，密钥每次构建随机，
@@ -20,7 +22,11 @@
  *   HARDEN_MAX_STRING=0      超过该长度的字符串不隐藏（0 = 不限制）。
  *                            本仓库内置了 gzip+base64 页面大块（最大 26KB），需要限制时可调小。
  *   HARDEN_MIN_STRING=0      短于该长度的不隐藏。谓词同时作用于属性名，调大能明显压缩载荷表，
- *                            代价是 `obj.get` 这类短属性名留在明处。
+ *                            代价是 `obj.get` 这类短属性名留在明处。敏感词始终强制隐藏。
+ *   HARDEN_ONE_LINE=true     产物保持单行（追加的解码器源码也压成一行）
+ *   HARDEN_TARGET_BYTES=0    产物原始字节预算；>0 时启用参数搜索（0 = 不限制，单次混淆）
+ *   HARDEN_TARGET_ZIP_BYTES=0 dist/worker.zip 压缩字节预算（DEFLATE，与 build.js 相同算法）
+ *   HARDEN_SIZE_MAX_RUNS=12  体积搜索最多跑几次混淆（每次约 3.5s）
  *   HARDEN_OPAQUE=0.1        不透明谓词概率
  *   HARDEN_CFF=0             控制流平坦化 —— 必须保持 0，它会生成 `with`，
  *                            在 ES 模块（严格模式）里是语法错误（js-confuser 的已知缺陷）
@@ -69,10 +75,15 @@ import {
   makeCodec,
   randomHelperName,
 } from '../tools/cipher.mjs';
+import { formatSizeSpec, loadParams } from './build-params.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const INPUT_PATH = resolve(ROOT, process.argv[2] || '.build/worker.reference.js');
-const OUTPUT_PATH = resolve(ROOT, process.argv[3] || 'dist/worker.js');
+const BUILD_PARAMS = loadParams(process.argv.slice(2));
+const INPUT_PATH = resolve(
+  ROOT,
+  BUILD_PARAMS.positional[0] || '.build/worker.reference.js'
+);
+const OUTPUT_PATH = resolve(ROOT, BUILD_PARAMS.positional[1] || 'dist/worker.js');
 const REPORT_PATH = join(ROOT, '.build/last-build.json');
 
 // ---------------------------------------------------------------- 配置读取
@@ -97,11 +108,11 @@ function bool(value, fallback) {
 
 const CONFIG = {
   concealAllStrings: bool(process.env.HARDEN_STRINGS, true),
-  maxConcealedLength: int(process.env.HARDEN_MAX_STRING, 0),
+  maxConcealedLength: BUILD_PARAMS.params.maxString,
   // 太短的字符串不隐藏。这个谓词同时作用于字符串字面量与**属性名**，所以调大它可以显著
   // 压缩"载荷表"（属性名数量远多于字面量：本仓库 3,983 条字面量 → 13,507 条载荷），
-  // 代价是 `obj.get` 这类短属性名会留在明处。
-  minConcealedLength: int(process.env.HARDEN_MIN_STRING, 0),
+  // 代价是 `obj.get` 这类短属性名会留在明处。敏感词始终强制隐藏。
+  minConcealedLength: BUILD_PARAMS.params.minString,
   opaquePredicates: num(process.env.HARDEN_OPAQUE, 0.1),
   // 控制流平坦化会生成 `with`，在严格模式 / 任何 ES 模块里都是语法错误，必须为 0。
   controlFlowFlattening: num(process.env.HARDEN_CFF, 0),
@@ -123,6 +134,9 @@ const CONFIG = {
   astScrambler: bool(process.env.HARDEN_AST_SCRAMBLER, true),
   renameVariables: bool(process.env.HARDEN_RENAME_VARIABLES, true),
   renameGlobals: bool(process.env.HARDEN_RENAME_GLOBALS, true),
+  // 产物保持单行：js-confuser 的 compact 输出本身是一行，追加的解码器源码默认是多行，
+  // 这里把解码器也压成一行（--one-line=false / HARDEN_ONE_LINE=0 可保留可读格式）。
+  oneLine: BUILD_PARAMS.params.oneLine,
 };
 
 if (CONFIG.controlFlowFlattening > 0 && process.env.HARDEN_ALLOW_CFF !== 'true') {
@@ -131,6 +145,37 @@ if (CONFIG.controlFlowFlattening > 0 && process.env.HARDEN_ALLOW_CFF !== 'true')
       '在 ES 模块 / 严格模式下是语法错误。请设 HARDEN_CFF=0；' +
       '确实知道自己在做什么时用 HARDEN_ALLOW_CFF=true 放行，或改用 HARDEN_OPAQUE / HARDEN_INTEGRITY。'
   );
+}
+
+// ------------------------------------------------------------------ 体积预算
+// 参数优先级：CLI > 环境变量 > harden.config.json > 默认值（见 scripts/build-params.mjs）。
+//   --target-bytes=620000 / 620k / 70%   worker.js 原始字节预算（70% = 首次混淆产物的 70%）
+//   --target-zip=320k / 320000 / 75%     worker.zip 预算（同 build.js 的 DEFLATE）
+//   --max-runs=12                        搜索最多跑几次混淆
+// 不设目标时行为与之前完全一致（单次混淆）。
+const SIZE_RAW_SPEC = BUILD_PARAMS.params.targetBytes;
+const SIZE_ZIP_SPEC = BUILD_PARAMS.params.targetZipBytes;
+const SIZE_MAX_RUNS = BUILD_PARAMS.params.maxRuns;
+const SIZE_SEARCH = Boolean(SIZE_RAW_SPEC || SIZE_ZIP_SPEC);
+
+// 绝对目标先确定；百分比目标在量到「首次混淆产物」后解析（相对同口径大小）。
+let SIZE_TARGET_RAW = SIZE_RAW_SPEC && SIZE_RAW_SPEC.kind === 'bytes' ? SIZE_RAW_SPEC.value : 0;
+let SIZE_TARGET_ZIP = SIZE_ZIP_SPEC && SIZE_ZIP_SPEC.kind === 'bytes' ? SIZE_ZIP_SPEC.value : 0;
+const SIZE_PERCENT_RAW = SIZE_RAW_SPEC && SIZE_RAW_SPEC.kind === 'percent' ? SIZE_RAW_SPEC.value : null;
+const SIZE_PERCENT_ZIP = SIZE_ZIP_SPEC && SIZE_ZIP_SPEC.kind === 'percent' ? SIZE_ZIP_SPEC.value : null;
+let sizeTargetsResolved = SIZE_PERCENT_RAW === null && SIZE_PERCENT_ZIP === null;
+
+function resolvePercentTargets(firstMetrics) {
+  if (SIZE_PERCENT_RAW !== null) {
+    SIZE_TARGET_RAW = Math.max(1, Math.floor((firstMetrics.rawBytes * SIZE_PERCENT_RAW) / 100));
+  }
+  if (SIZE_PERCENT_ZIP !== null) {
+    if (firstMetrics.zipBytes === null) {
+      throw new Error('百分比 zip 目标需要测量 zip 大小（内部错误：zipBytes 为空）');
+    }
+    SIZE_TARGET_ZIP = Math.max(1, Math.floor((firstMetrics.zipBytes * SIZE_PERCENT_ZIP) / 100));
+  }
+  sizeTargetsResolved = true;
 }
 
 // ---------------------------------------------------------------------- 辅助
@@ -171,6 +216,19 @@ const helperName = randomHelperName();
 const keyStreamName = randomHelperName();
 const runtimeSuffix = buildDecoderSource(key, { ks: keyStreamName, dec: helperName });
 
+/**
+ * 解码器源码压成单行。它没有 `//` 行注释，字符串字面量只有空串/方法名，
+ * 因此把换行换成空格、合并缩进是安全的；verify/smoke 会兜底。
+ */
+function compactRuntime(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '') // 保险：去掉块注释
+    .replace(/\r?\n/g, ' ')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+const runtimeSuffixInline = compactRuntime(runtimeSuffix);
+
 const sourceCode = readFileSync(INPUT_PATH, 'utf8');
 
 // 只有 integrity 的反制函数必须存在于 AST 中（Lock 插件按名字查找它）。
@@ -180,20 +238,28 @@ if (CONFIG.integrity || CONFIG.antiDebug || CONFIG.selfDefending) {
   prepared = `${COUNTERMEASURE_SOURCE}\n${prepared}`;
 }
 
-/** 被隐藏的字符串会调用这个极薄的包装，包装再调用追加的运行时。 */
-function shouldConceal(str) {
-  if (CONFIG.maxConcealedLength > 0 && str.length > CONFIG.maxConcealedLength) return false;
-  if (str.length < CONFIG.minConcealedLength) return false;
-  if (CONFIG.concealAllStrings) return true;
+/** 敏感词永远隐藏（不受 min/max 长度影响），保证 verify 的禁止词闸门。 */
+function isSensitiveString(str) {
   const lower = str.toLowerCase();
   return sensitiveWords.some((word) => lower.includes(word));
 }
 
-const options = {
+/** 按体积预算参数生成 stringConcealing 谓词。 */
+function makeConcealPredicate(cfg) {
+  return (str) => {
+    if (isSensitiveString(str)) return true;
+    if (cfg.maxConcealedLength > 0 && str.length > cfg.maxConcealedLength) return false;
+    if (str.length < cfg.minConcealedLength) return false;
+    return CONFIG.concealAllStrings;
+  };
+}
+
+function buildOptions(cfg) {
+  return {
   target: 'browser',
 
   // 字符串密文必需
-  stringConcealing: shouldConceal,
+  stringConcealing: makeConcealPredicate(cfg),
   customStringEncodings: [
     {
       code: `function {fnName}(str) { return ${helperName}(str); }`,
@@ -229,7 +295,7 @@ const options = {
   rgf: false,
 
   // 加固（概率，见文件头 HARDENING）
-  opaquePredicates: CONFIG.opaquePredicates,
+  opaquePredicates: cfg.opaquePredicates,
   controlFlowFlattening: CONFIG.controlFlowFlattening,
 
   lock: {
@@ -243,14 +309,193 @@ const options = {
     selfDefending: CONFIG.selfDefending,
     tamperProtection: false, // 需要非严格模式；本产物是 ES 模块
   },
+  };
+}
+
+// ------------------------------------------------------------ 体积预算搜索
+// 主导旋钮是 minConcealedLength（数字面量/属性名数量约 13.5k），其次 maxConcealedLength
+// （可把 26KB 的页面 gzip blob 留在明文）；opaque/ast 等对体积影响很小，这里不动它们。
+async function zipSize(code) {
+  const { default: JSZip } = await import('jszip');
+  const zip = new JSZip();
+  zip.file('_worker.js', code);
+  const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  return buffer.length;
+}
+
+const baseCfg = {
+  minConcealedLength: CONFIG.minConcealedLength,
+  maxConcealedLength: CONFIG.maxConcealedLength,
+  opaquePredicates: CONFIG.opaquePredicates,
 };
 
-const startedAt = Date.now();
-const result = await JsConfuser.obfuscate(prepared, options);
-const elapsedMs = Date.now() - startedAt;
+const attempts = [];
+const candidateCache = new Map();
+let runs = 0;
 
-// 追加密文运行时。它**故意不参与混淆**：它绝不能依赖它所解码的那个载荷数组。
-const output = result.code + '\n' + runtimeSuffix + '\n';
+async function runCandidate(cfg) {
+  const cacheKey = `${cfg.minConcealedLength}:${cfg.maxConcealedLength}`;
+  if (candidateCache.has(cacheKey)) return candidateCache.get(cacheKey);
+  const startedAt = Date.now();
+  const result = await JsConfuser.obfuscate(prepared, buildOptions(cfg));
+  // 追加密文运行时。它**故意不参与混淆**：它绝不能依赖它所解码的那个载荷数组。
+  if (CONFIG.oneLine && result.code.includes('\n')) {
+    throw new Error('js-confuser 的 compact 输出不是单行 —— 请设 HARDEN_MINIFY=false 并检查 compact 选项');
+  }
+  const code = CONFIG.oneLine
+    ? `${result.code};${runtimeSuffixInline}\n`
+    : `${result.code}\n${runtimeSuffix}\n`;
+  const metrics = {
+    minConcealedLength: cfg.minConcealedLength,
+    maxConcealedLength: cfg.maxConcealedLength,
+    opaquePredicates: cfg.opaquePredicates,
+    rawBytes: code.length,
+    zipBytes:
+      SIZE_TARGET_ZIP > 0 || SIZE_PERCENT_ZIP !== null ? await zipSize(code) : null,
+    ms: Date.now() - startedAt,
+  };
+  runs += 1;
+  attempts.push(metrics);
+  console.log(
+    `  体积候选 #${runs}: min=${cfg.minConcealedLength} max=${cfg.maxConcealedLength}` +
+      ` -> ${metrics.rawBytes} B${metrics.zipBytes !== null ? ` / zip ${metrics.zipBytes} B` : ''}` +
+      `${fits(metrics) ? ' ✅' : ''}`
+  );
+  const candidate = { code, cfg, metrics };
+  candidateCache.set(cacheKey, candidate);
+  return candidate;
+}
+
+function fits(metrics) {
+  if (!sizeTargetsResolved) return false;
+  if (SIZE_TARGET_RAW > 0 && metrics.rawBytes > SIZE_TARGET_RAW) return false;
+  if (SIZE_TARGET_ZIP > 0 && metrics.zipBytes !== null && metrics.zipBytes > SIZE_TARGET_ZIP) {
+    return false;
+  }
+  return true;
+}
+
+async function tryCandidate(cfg) {
+  if (runs >= SIZE_MAX_RUNS && !candidateCache.has(`${cfg.minConcealedLength}:${cfg.maxConcealedLength}`)) {
+    const last = attempts[attempts.length - 1];
+    throw new Error(
+      `体积预算搜索已达上限 ${SIZE_MAX_RUNS} 次（HARDEN_SIZE_MAX_RUNS）；最后一次 ${last.rawBytes} B` +
+        `${last.zipBytes !== null ? ` / zip ${last.zipBytes} B` : ''}，仍未达到目标。` +
+        '放宽目标，或用 HARDEN_MIN_STRING / HARDEN_MAX_STRING 手动取舍，或增大 HARDEN_SIZE_MAX_RUNS。'
+    );
+  }
+  return runCandidate(cfg);
+}
+
+let chosen;
+if (!SIZE_SEARCH) {
+  chosen = await runCandidate(baseCfg);
+} else {
+  const targetLabel = [
+    SIZE_RAW_SPEC ? `worker.js<=${formatSizeSpec(SIZE_RAW_SPEC)}` : '',
+    SIZE_ZIP_SPEC ? `worker.zip<=${formatSizeSpec(SIZE_ZIP_SPEC)}` : '',
+  ]
+    .filter(Boolean)
+    .join('，');
+  console.log(`体积预算：${targetLabel}（最多 ${SIZE_MAX_RUNS} 次混淆）`);
+
+  const first = await tryCandidate(baseCfg);
+  resolvePercentTargets(first.metrics);
+  if (SIZE_PERCENT_RAW !== null || SIZE_PERCENT_ZIP !== null) {
+    console.log(
+      `  百分比目标解析（以首次产物为基准）：` +
+        [
+          SIZE_TARGET_RAW > 0 ? `worker.js<=${SIZE_TARGET_RAW}B` : '',
+          SIZE_TARGET_ZIP > 0 ? `worker.zip<=${SIZE_TARGET_ZIP}B` : '',
+        ]
+          .filter(Boolean)
+          .join('，')
+    );
+  }
+  if (fits(first.metrics)) {
+    chosen = first;
+  } else {
+    // 先按 min 翻倍找到达标点，再二分找「刚好达标」的最小 min（尽量保留混淆）。
+    // 搜索下界不低过用户显式设置的 HARDEN_MIN_STRING。
+    const minFloor = Math.max(1, baseCfg.minConcealedLength);
+    let hi = null;
+    let hiResult = null;
+    for (const min of [4, 8, 16, 32, 64, 96, 128].filter((value) => value > baseCfg.minConcealedLength)) {
+      const candidate = await tryCandidate({ ...baseCfg, minConcealedLength: min });
+      if (fits(candidate.metrics)) {
+        hi = min;
+        hiResult = candidate;
+        break;
+      }
+    }
+
+    if (hi !== null) {
+      chosen = hiResult;
+      let lo = minFloor;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        const candidate = await tryCandidate({ ...baseCfg, minConcealedLength: mid });
+        if (fits(candidate.metrics)) {
+          hi = mid;
+          chosen = candidate;
+        } else {
+          lo = mid + 1;
+        }
+      }
+    } else {
+      // 短字符串全隐藏仍超标 → 再把大字符串（页面 gzip blob）排除
+      const maxCandidates = baseCfg.maxConcealedLength > 0
+        ? [baseCfg.maxConcealedLength]
+        : [65536, 32768, 16384, 8192, 4096, 2048];
+      for (const max of maxCandidates) {
+        const highMin = Math.max(64, baseCfg.minConcealedLength);
+        const candidate = await tryCandidate({
+          ...baseCfg,
+          minConcealedLength: highMin,
+          maxConcealedLength: max,
+        });
+        if (!fits(candidate.metrics)) continue;
+        chosen = candidate;
+        // 同一 max 下再二分找更小的 min，尽量多隐藏一些字符串
+        let lo = minFloor;
+        let hiMin = highMin;
+        while (lo < hiMin) {
+          const mid = (lo + hiMin) >> 1;
+          const refined = await tryCandidate({
+            ...baseCfg,
+            minConcealedLength: mid,
+            maxConcealedLength: max,
+          });
+          if (fits(refined.metrics)) {
+            hiMin = mid;
+            chosen = refined;
+          } else {
+            lo = mid + 1;
+          }
+        }
+        break;
+      }
+      if (!chosen) {
+        const last = attempts[attempts.length - 1];
+        throw new Error(
+          `体积预算无法满足（${targetLabel}）；最后一次 ${last.rawBytes} B` +
+            `${last.zipBytes !== null ? ` / zip ${last.zipBytes} B` : ''}。` +
+            '可放宽目标，或用 HARDEN_MIN_STRING / HARDEN_MAX_STRING 手动取舍，' +
+            '或增大 HARDEN_SIZE_MAX_RUNS。'
+        );
+      }
+    }
+  }
+}
+
+const effective = {
+  ...CONFIG,
+  minConcealedLength: chosen.cfg.minConcealedLength,
+  maxConcealedLength: chosen.cfg.maxConcealedLength,
+  opaquePredicates: chosen.cfg.opaquePredicates,
+};
+const output = chosen.code;
+const elapsedMs = attempts.length ? attempts.reduce((sum, item) => sum + item.ms, 0) : 0;
 writeFileSync(OUTPUT_PATH, output);
 
 mkdirSync(dirname(REPORT_PATH), { recursive: true });
@@ -263,11 +508,29 @@ writeFileSync(
       nonceBytesPerString: 8,
       helperName,
       keyStreamName,
-      config: CONFIG,
+      config: effective,
       sensitiveWords: CONFIG.concealAllStrings ? undefined : sensitiveWords,
       sourceBytes: sourceCode.length,
       outputBytes: output.length,
+      zipBytes: chosen.metrics.zipBytes,
       obfuscateMs: elapsedMs,
+      sizeSearch: SIZE_SEARCH
+        ? {
+            configFile: BUILD_PARAMS.params.configPath,
+            targets: {
+              raw: formatSizeSpec(SIZE_RAW_SPEC) || undefined,
+              zip: formatSizeSpec(SIZE_ZIP_SPEC) || undefined,
+              resolvedRawBytes: SIZE_TARGET_RAW || undefined,
+              resolvedZipBytes: SIZE_TARGET_ZIP || undefined,
+            },
+            runs,
+            selected: {
+              minConcealedLength: chosen.cfg.minConcealedLength,
+              maxConcealedLength: chosen.cfg.maxConcealedLength,
+            },
+            attempts,
+          }
+        : undefined,
       input: INPUT_PATH,
       output: OUTPUT_PATH,
       generatedAt: new Date().toISOString(),
@@ -278,7 +541,10 @@ writeFileSync(
 );
 
 console.log(
-  `js-confuser + ChaCha20 完成：${sourceCode.length} -> ${output.length} 字节，${elapsedMs} ms` +
-    `（字符串=${CONFIG.concealAllStrings ? (CONFIG.maxConcealedLength ? `全部<=${CONFIG.maxConcealedLength}` : '全部') : '仅敏感词'}` +
-    `, opaque=${CONFIG.opaquePredicates}, cff=${CONFIG.controlFlowFlattening}, integrity=${CONFIG.integrity}）`
+  `js-confuser + ChaCha20 完成：${sourceCode.length} -> ${output.length} 字节` +
+    `${chosen.metrics.zipBytes !== null ? `（zip ${chosen.metrics.zipBytes}）` : ''}，` +
+    `${elapsedMs} ms，混淆 ${runs} 次，${CONFIG.oneLine ? '单行' : '多行解码器'}` +
+    `（字符串=${CONFIG.concealAllStrings ? (effective.maxConcealedLength ? `全部<=${effective.maxConcealedLength}` : '全部') : '仅敏感词'}` +
+    `, min=${effective.minConcealedLength}, max=${effective.maxConcealedLength}` +
+    `, opaque=${effective.opaquePredicates}, cff=${CONFIG.controlFlowFlattening}, integrity=${CONFIG.integrity}）`
 );

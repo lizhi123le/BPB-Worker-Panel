@@ -5,6 +5,11 @@ import { spawnSync } from 'node:child_process';
 import pkg from '../package.json' with { type: 'json' };
 import { gzipSync } from 'zlib';
 import { ensureDeps } from './ensure-deps.mjs';
+import { formatSizeSpec, loadParams } from './build-params.mjs';
+
+// 构建参数：CLI > 环境变量 > harden.config.json > 默认值（见 scripts/build-params.mjs）。
+// 例：node scripts/build.js --target-zip=320k --target-bytes=70%
+const BUILD_PARAMS = loadParams(process.argv.slice(2));
 
 // 构建期依赖先自检/自补，再动态 import。
 // 静态 import 会在"包根本没装"时于模块链接阶段就抛 ERR_MODULE_NOT_FOUND，那时这段自检
@@ -280,14 +285,48 @@ async function buildWorker() {
     }
 
     const worker = readFileSync(WORKER_PATH, 'utf8');
+    if (BUILD_PARAMS.params.oneLine && worker.trimEnd().includes('\n')) {
+        throw new Error(
+            `产物不是单行（内部换行数 ${worker.trimEnd().split('\n').length - 1}）。` +
+                '混淆器 compact 输出应为一行，追加的解码器由 scripts/obfuscate.mjs 压成单行；' +
+                '请检查 build-params / --one-line 设置。'
+        );
+    }
     const zip = new JSZip();
     zip.file('_worker.js', worker);
     // 必须 await：之前是 fire-and-forget，进程有可能先退出，zip 永远写不出来。
     const nodebuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
     writeFileSync(ZIP_PATH, nodebuffer);
 
+    // 体积预算兜底：obfuscate.mjs 已按参数搜索；这里只对绝对字节目标再确认一次，
+    // 百分比目标依赖「首次产物」基准，由 obfuscate 内部保证。
+    const rawTarget =
+        BUILD_PARAMS.params.targetBytes && BUILD_PARAMS.params.targetBytes.kind === 'bytes'
+            ? BUILD_PARAMS.params.targetBytes.value
+            : 0;
+    const zipTarget =
+        BUILD_PARAMS.params.targetZipBytes && BUILD_PARAMS.params.targetZipBytes.kind === 'bytes'
+            ? BUILD_PARAMS.params.targetZipBytes.value
+            : 0;
+    if (rawTarget && worker.length > rawTarget) {
+        throw new Error(`dist/worker.js ${worker.length} B 超过 --target-bytes=${rawTarget}`);
+    }
+    if (zipTarget && nodebuffer.length > zipTarget) {
+        throw new Error(`dist/worker.zip ${nodebuffer.length} B 超过 --target-zip=${zipTarget}`);
+    }
+
     console.log(
-        `${success} Done! worker.js ${worker.length} bytes, worker.zip ${nodebuffer.length} bytes`
+        `${success} Done! worker.js ${worker.length} bytes, worker.zip ${nodebuffer.length} bytes` +
+            `${
+                BUILD_PARAMS.params.targetBytes
+                    ? `（目标 raw ≤${formatSizeSpec(BUILD_PARAMS.params.targetBytes)}）`
+                    : ''
+            }` +
+            `${
+                BUILD_PARAMS.params.targetZipBytes
+                    ? `（目标 zip ≤${formatSizeSpec(BUILD_PARAMS.params.targetZipBytes)}）`
+                    : ''
+            }`
     );
 }
 
@@ -333,6 +372,25 @@ async function obfuscateWithGates() {
         return result.status === 0;
     };
 
+    // 把体积/单行参数原样传给 obfuscate 子进程（百分比目标也保留，由子进程解析）。
+    const forwardArgs = [];
+    const params = BUILD_PARAMS.params;
+    if (params.targetBytes) forwardArgs.push(`--target-bytes=${formatSizeSpec(params.targetBytes)}`);
+    if (params.targetZipBytes) forwardArgs.push(`--target-zip=${formatSizeSpec(params.targetZipBytes)}`);
+    forwardArgs.push(
+        `--max-runs=${params.maxRuns}`,
+        `--one-line=${params.oneLine}`,
+        `--min-string=${params.minString}`,
+        `--max-string=${params.maxString}`
+    );
+    if (BUILD_PARAMS.flags.has('config')) forwardArgs.push(`--config=${params.configPath}`);
+    console.log(
+        `${success} 体积参数：raw=${formatSizeSpec(params.targetBytes) || '不限制'}，` +
+            `zip=${formatSizeSpec(params.targetZipBytes) || '不限制'}，` +
+            `maxRuns=${params.maxRuns}，oneLine=${params.oneLine}` +
+            `${BUILD_PARAMS.flags.has('config') ? `，config=${params.configPath}` : ''}`
+    );
+
     // 先验证密码本身（ChaCha20 已知答案向量 + 编解码往返），再花时间跑整包混淆。
     if (!run('tools/cipher.test.mjs')) {
         throw new Error('ChaCha20 密文自检未通过 —— 先修 tools/cipher.mjs，不要继续构建');
@@ -340,7 +398,7 @@ async function obfuscateWithGates() {
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
         console.log(`\n${success} 混淆尝试 ${attempt}/${attempts}`);
-        if (!run('scripts/obfuscate.mjs', ['.build/worker.reference.js', 'dist/worker.js'])) {
+        if (!run('scripts/obfuscate.mjs', ['.build/worker.reference.js', 'dist/worker.js', ...forwardArgs])) {
             console.error(`${failure} obfuscate 失败，重试`);
             continue;
         }

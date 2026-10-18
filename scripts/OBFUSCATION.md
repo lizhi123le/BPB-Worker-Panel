@@ -64,13 +64,13 @@ npm run smoke:bench   # 行为闸门 + 冷启动/热请求耗时对照
 
 | | 旧流水线（javascript-obfuscator） | 新流水线（js-confuser + ChaCha20） |
 | --- | --- | --- |
-| `worker.js` | 1,235,257 B | 791,613 B（−36%） |
-| `worker.zip` | 186,572 B | 430,394 B（+130%） |
-| 字符串 | **可 10 行脚本还原**（见下） | 约 13,500 条 ChaCha20 密文 |
+| `worker.js` | 1,235,257 B | 521,442 B（默认体积目标；不设目标时约 792 KB） |
+| `worker.zip` | 186,572 B | 239,782 B（默认体积目标；不设目标时约 431 KB） |
+| 字符串 | **可 10 行脚本还原**（见下） | 默认约 2,433 条密文（min=12）；不设目标时约 13,500 条 |
 | 冷启动（GET /login） | — | 约 1 ms，与参考同量级（多次采样 0.8–1.3 ms） |
 | 热请求（GET /login） | — | 0.53 ms（参考 0.72 ms，300 次均值；两者差在采样噪声内） |
 
-zip 变大是正常的：密文不可压缩，而旧产物里的字符串基本是明文、可压。两者都远低于 Workers 的体积上限。
+不设体积目标时 zip 会变大：密文不可压缩，而旧产物里的字符串基本是明文、可压。默认体积目标（512k/236k）会把 zip 压到 236 KiB 以内，代价是长度 <12 的短字符串留在明文；两者都低于 Workers 的体积上限。
 
 ### 旧流水线为什么不算混淆
 
@@ -91,7 +91,11 @@ zlib.gunzipSync(Buffer.from(joined, 'base64'))   // -> 完整 error / panel 页�
 | --- | --- | --- |
 | `HARDEN_STRINGS` | `true` | `false` → 只藏 `sensitive_words_auto.txt` 命中的字符串 |
 | `HARDEN_MAX_STRING` | `0` | 超过该长度不藏（本仓库最大字面量 26KB，是 gzip+base64 页面块） |
-| `HARDEN_MIN_STRING` | `0` | 短于该长度不藏。谓词对属性名同样生效，调大能明显压缩载荷表 |
+| `HARDEN_MIN_STRING` | `0` | 短于该长度不藏。谓词对属性名同样生效，调大能明显压缩载荷表；敏感词始终强制隐藏 |
+| `HARDEN_ONE_LINE` | `true` | 产物单行：js-confuser 主体本就单行，追加的解码器源码也压成一行 |
+| `HARDEN_TARGET_BYTES` | `512k` | `dist/worker.js` 原始字节预算；默认构建即启用，`0` 关闭 |
+| `HARDEN_TARGET_ZIP_BYTES` | `236k` | `dist/worker.zip`（DEFLATE，与 build.js 同算法）字节预算；`0` 关闭 |
+| `HARDEN_SIZE_MAX_RUNS` | `20` | 体积搜索最多跑几次混淆（每次约 3.5s） |
 | `HARDEN_OPAQUE` | `0.1` | 不透明谓词概率 |
 | `HARDEN_CFF` | `0` | **必须为 0**：控制流平坦化会生成 `with`，ES 模块里是语法错误 |
 | `HARDEN_INTEGRITY` | `false` | js-confuser 2.0 的 Lock 会随机生成自遮蔽包装器（`verify` 会拒），且 `tamperProtection` 需要非严格模式 |
@@ -101,6 +105,58 @@ zlib.gunzipSync(Buffer.from(joined, 'base64'))   // -> 完整 error / panel 页�
 | `HARDEN_RENAME_*` / `HARDEN_MOVED_DECLARATIONS` / `HARDEN_OBJECT_EXTRACTION` / `HARDEN_AST_SCRAMBLER` | `true` | 逐个可关，用于定位问题 |
 | `HARDEN_ATTEMPTS` | `3` | 闸门失败后换密钥重试的次数 |
 | `SMOKE_EVERY` | `1` | 设 `0` → 只跑静态闸门，不跑行为闸门（调参时用） |
+
+## 5.1 体积预算与单行格式
+
+默认单行：js-confuser 的 compact 输出本来就是一行，追加的解码器源码也压成一行；
+`build.js` 在写 zip 前会拒绝含内部换行的产物。`--one-line=false`（或 `HARDEN_ONE_LINE=0`）可关闭。
+
+**默认体积目标：`--target-bytes=512k`、`--target-zip=236k`**（未传任何目标时生效）。
+这意味着默认构建就会跑体积搜索，约 20–40 秒；想关闭某个目标就显式设 0：
+`--target-bytes=0` 或 `--target-zip=0`。
+
+体积目标是**可引用的参数**，三个来源，优先级从高到低：
+
+1. **CLI**：`--target-zip=320k`、`--target-bytes=620000`、`--max-runs=10`、`--one-line=false`
+2. **环境变量**：`HARDEN_TARGET_ZIP_BYTES`、`HARDEN_TARGET_BYTES`、`HARDEN_SIZE_MAX_RUNS`、`HARDEN_ONE_LINE`
+3. **配置文件**：仓库根目录 `harden.config.json`（模板见 `harden.config.example.json`），也可 `--config=path`
+
+大小写法：`320000`、`320k`（1024 进制）、`1m`、`75%`。百分比以**首次混淆产物**为基准
+（zip 目标相对 zip，raw 目标相对 raw），例如 `--target-zip=75%` 表示压到当前 zip 的 75%。
+
+```bash
+# 只重跑混淆：目标 zip 320 KiB
+node scripts/obfuscate.mjs .build/worker.reference.js dist/worker.js --target-zip=320k
+
+# 完整构建：压到当前 zip 的 75%
+node scripts/build.js --target-zip=75%
+
+# 或者写进 harden.config.json（CLI/环境变量仍可覆盖）
+{ "targetBytes": "512k", "targetZipBytes": "236k", "maxRuns": 20, "oneLine": true }
+```
+
+搜索策略：
+
+1. 先按当前配置跑一次；
+2. 超标则把 `minConcealedLength` 从 4 开始翻倍，找到达标点后二分找「刚好达标」的最小 min；
+3. 仍超标则依次尝试 `maxConcealedLength` 65536 → 2048（把 26KB 页面 blob 留在明文），
+   并在选中的 max 下用二分继续找更小的 min，尽量多隐藏一些字符串；
+4. 超过 `maxRuns` 或仍不达标就失败，并报告最后一次大小与可调项。
+
+敏感词永远隐藏（不受 min/max 影响），所以 verify 的禁止词闸门不会被预算模式绕过。
+实测（reference 502,017 B）：
+
+| 目标 | 选中参数 | `worker.js` | `worker.zip` | 混淆次数 |
+| --- | --- | --- | --- | --- |
+| 不设（旧行为） | min=0 | 约 792 KB | 约 431 KB | 1 |
+| **默认 512k/236k** | min=12，max=0 | 521,442 B | 239,782 B | 7 |
+| `--target-zip=320k` | min=8 | 609,315 B | 308,261 B | 5 |
+| `--target-zip=75%` | min=8 | 607,910 B | 307,383 B | 5 |
+| `harden.config.json` 里 zip=330k | min=7 | 636,400 B | 329,038 B | 5 |
+
+预算模式下 `verify` 与 `smoke` 均通过（27 条请求逐字节一致）。默认目标较激进（min≈12），
+长度 <12 的字符串/属性名留在明文，`verify` 可能出现 1–2 个「观察词可见」的 WARN（硬性禁止词仍全部隐藏）；
+要藏得更全就放宽目标，或接受更多搜索次数。
 
 ## 6. 坑：terser 的短名复用会让 js-confuser 改名错位
 

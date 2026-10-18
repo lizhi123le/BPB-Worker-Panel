@@ -1,6 +1,8 @@
 *
 !.gitignore
 !package.json
+!harden.config.json
+!harden.config.example.json
 !tsconfig.json
 !src/
 !src/**
