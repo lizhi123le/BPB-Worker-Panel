@@ -6,6 +6,7 @@
 # js-confuser 的 stringConcealing 管不到它们，因此不要把它们放进硬性词表。
 
 speedtest.net
+proxy
 dns-query
 proxy-ip
 workers.dev

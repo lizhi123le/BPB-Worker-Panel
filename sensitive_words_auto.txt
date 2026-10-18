@@ -7,6 +7,9 @@
 # 大小写不敏感，按子串 / 词边界匹配。每行一个，空行与 # 开头行忽略。
 
 bpb
+roxy
+dns-query
+proxy-ip
 bpb-worker-panel
 bia-pain-bache
 yousef.isegaro
