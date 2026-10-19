@@ -84,7 +84,7 @@ export async function getClNormalConfig(): Promise<Response> {
     // 同一 isolate 内每生成一次配置就累积一个重复端口（[443] → [1080,443] → [1080,1080,443]），
     // 并可能被后续 PUT 持久化。故只在局部副本上操作，绝不写回 globalThis.settings。
     const ports = [...(cachedPorts || [])];
-    // 已占用路径池词集合：每个 ws 出站各抽一个互不相同的伪装路径
+    // 已占用路径池词集合（仅「节点随机路径」开启时生效）：每个 ws 出站各抽一个互不相同的伪装路径
     const usedPaths = new Set<string>();
     // 已占用 early-data 阈值集合：每个 ws 出站各抽一个互不相同的 ed（无放回，两两不同）
     const usedEds = new Set<number>();

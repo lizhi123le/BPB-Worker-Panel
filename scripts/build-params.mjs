@@ -8,9 +8,9 @@
  *   75%                    相对「首次混淆产物」的百分比（zip 目标相对 zip，raw 相对 raw）
  *
  * 配置文件默认是仓库根目录 harden.config.json（可选），也可以 --config=path 指定。
- * 未显式指定时默认构建即启用体积控制：raw ≤ 512 KiB、zip ≤ 236 KiB（设 0 可关闭）。
+ * 未显式指定时默认构建即启用体积控制：raw ≤ 520 KiB、zip ≤ 236 KiB（设 0 可关闭）。
  * 例：
- *   { "targetBytes": "512k", "targetZipBytes": "236k", "maxRuns": 20, "oneLine": true }
+ *   { "targetBytes": "520k", "targetZipBytes": "236k", "maxRuns": 20, "oneLine": true }
  */
 
 import fs from 'node:fs';
@@ -123,8 +123,8 @@ export function loadParams(argv = process.argv.slice(2), env = process.env) {
   const zipTargetValue = pick('target-zip', 'HARDEN_TARGET_ZIP_BYTES', 'targetZipBytes');
   const params = {
     configPath,
-    // 默认构建即控制体积：raw ≤ 439 KiB，zip ≤ 180 KiB；显式设为 0 可关闭。
-    targetBytes: parseSizeSpec(rawTargetValue === undefined ? '512k' : rawTargetValue, 'targetBytes'),
+    // 默认构建即控制体积：raw ≤ 520 KiB，zip ≤ 236 KiB；显式设为 0 可关闭。
+    targetBytes: parseSizeSpec(rawTargetValue === undefined ? '520k' : rawTargetValue, 'targetBytes'),
     targetZipBytes: parseSizeSpec(zipTargetValue === undefined ? '236k' : zipTargetValue, 'targetZipBytes'),
     maxRuns: Math.max(
       1,

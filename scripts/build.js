@@ -357,6 +357,7 @@ async function obfuscateWithGates() {
     const toolsGates = [
         { script: 'tools/panel-layout.test.mjs', label: '面板 Subscriptions 布局：表格/行铺满容器、操作按钮列钉在右边缘（CSS 契约）' },
         { script: 'tools/ws-firstpacket.test.mjs', label: 'WS 首包判定（VLESS/Trojan 识别与非法首包收口）' },
+        { script: 'tools/random-path.test.mjs', label: '节点随机路径开关（开启=1-3 段随机路径 / 关闭=固定根路径 / ed 无放回不变）' },
         { script: 'tools/login-firstrun.test.mjs', label: '首访设置口令 / 登录 / 改密吊销旧会话' },
         { script: 'tools/proxy-ip-limit.test.mjs', label: '/proxy-ip 取数规则（A+AAAA 双栈 / 上限 100 / 超出 1:1 / 不足从多的那类补齐）' },
         { script: 'tools/proxy-pool-cache.test.mjs', label: '反代池缓存：isolate 内 Map / Cache API 跨 isolate 复用 / 同键并发单飞 / 降级安全 / debug 分层日志' },

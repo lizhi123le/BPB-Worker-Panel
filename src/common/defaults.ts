@@ -51,6 +51,7 @@ export const DEFAULT_SETTINGS: Settings = {
     ports: [443],
     fingerprint: "chrome",
     alpn: "",
+    randomPath: true,
     enableTFO: false,
     fragmentMode: "custom",
     fragmentLengthMin: 100,

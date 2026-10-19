@@ -870,7 +870,7 @@ export async function getURLConfigs() {
     // 随每次订阅请求累积（[443] → [1080,443] → [1080,1080,443]）并被后续 PUT 持久化。
     const ports = [...(globalThis.settings.ports || [])];
 
-    // 已占用路径池词集合：本次请求内 VLESS / Trojan 各抽一个互不相同的伪装路径
+    // 已占用路径池词集合（仅「节点随机路径」开启时生效）：本次请求内 VLESS / Trojan 各抽一个互不相同的伪装路径
     const usedPaths = new Set<string>();
     // 已占用 early-data 阈值池：同一份订阅内各节点 ed 两两不同（无放回抽取），作用域与 usedPaths 一致（一次请求一个集合）
     const usedEds = new Set<number>();

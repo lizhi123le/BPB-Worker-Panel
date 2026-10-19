@@ -124,6 +124,9 @@ declare global {
         ports: number[];
         fingerprint: Fingerprint;
         alpn: string;
+        // 节点随机路径（面板 Random Path）：true = 每个节点随机抽 1-3 段伪装路径；
+        // false = 所有节点共用固定根路径 `/`（旧订阅的 `/?ed=…` 形态）
+        randomPath: boolean;
         enableTFO: boolean;
         fragmentMode: "custom" | "low" | "medium" | "high";
         fragmentLengthMin: number;

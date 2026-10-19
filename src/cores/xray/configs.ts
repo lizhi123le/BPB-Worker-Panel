@@ -273,7 +273,7 @@ async function addWorkerlessConfigs(configs: Config[]) {
 export async function getXrCustomConfigs(isFragment: boolean): Promise<Response> {
     resetRemarkCounter();
     const { outProxy, ports, upstreamParams: { upstreamServer, upstreamPort } } = globalThis.settings;
-    // 已占用路径池词集合：每个 ws 出站各抽一个互不相同的伪装路径
+    // 已占用路径池词集合（仅「节点随机路径」开启时生效）：每个 ws 出站各抽一个互不相同的伪装路径
     const usedPaths = new Set<string>();
     // 已占用 early-data 阈值集合：与 usedPaths 同粒度、同批次共享，保证任意两个节点的 ed 两两不同
     const usedEds = new Set<number>();

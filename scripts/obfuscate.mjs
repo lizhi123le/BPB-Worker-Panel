@@ -6,7 +6,7 @@
  *
  * 运行：node scripts/obfuscate.mjs [输入] [输出] [--target-zip=320k] [--target-bytes=70%]
  *       参数优先级 CLI > 环境变量 > harden.config.json；大小支持 320000/320k/1m/75%。
- *       默认体积目标：--target-bytes=512k --target-zip=236k（显式设 0 可关闭）。
+ *       默认体积目标：--target-bytes=520k --target-zip=236k（显式设 0 可关闭）。
  *
  * 与参考实现（MOD-Worker-Panel/obfuscate.mjs）的关系：
  *  - 密文换成真 ChaCha20（RFC 8439）+ 每条字符串独立 8 字节 nonce，密钥每次构建随机，

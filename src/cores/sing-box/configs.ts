@@ -96,7 +96,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
     const items = await getConfigItems(isFragment);
     const entryPortMap = buildEntryPortMap();
     const totalPorts = ports.filter(port => !isFragment || isHttps(port));
-    // 已占用路径池词集合：每个 ws 出站各抽一个互不相同的伪装路径
+    // 已占用路径池词集合（仅「节点随机路径」开启时生效）：每个 ws 出站各抽一个互不相同的伪装路径
     const usedPaths = new Set<string>();
     // 已占用 early-data 阈值池：作用域与 usedPaths 一致（一次请求一个集合），
     // 同一份订阅内任意两个节点的 ed 两两不同（无放回抽取）

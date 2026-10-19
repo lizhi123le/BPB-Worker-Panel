@@ -708,8 +708,15 @@ const WS_PATH_MAX_REDRAW = 5;
  *             重抽次数用尽则返回最后一次结果，绝不抛错、绝不返回 undefined。
  *             注意语义为「整条路径」而非「单词」——段级重复是允许且期望的，
  *             `/api/video` 与 `/api/blog` 可同时存在。不传则为放回抽取。
+ *
+ * 面板「节点随机路径」（settings.randomPath）关闭时直接返回根路径 `/`，不参与 `used`：
+ * 此时所有节点共用同一条路径是有意为之（旧订阅的 `/?ed=…` 形态），刷新订阅路径不再变化。
  */
 export function generateWsPath(used?: Set<string>): string {
+    // 面板「节点随机路径」关闭：所有节点共用根路径 `/`（旧订阅的 `/?ed=…` 形态）。
+    // worker 的 WS 升级守卫本就放行空段路径（`wsSegments.length === 0`），无需额外特例。
+    if (globalThis.settings?.randomPath === false) return '/';
+
     if (PUBLIC_PATH_POOL.length === 0) return "/";
 
     const len = PUBLIC_PATH_POOL.length;

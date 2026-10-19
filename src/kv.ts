@@ -62,6 +62,12 @@ export async function getDataset(
             (proxySettings as any).echServerName = val ? [val] : [];
         }
 
+        // 向后兼容：旧 KV 里没有「节点随机路径」开关（面板后续新增）时按出厂默认补齐。
+        // 只在内存里补，不写 KV —— 用户下次保存设置时才落库；否则面板下拉会取到 undefined 而显示空白。
+        if (proxySettings && typeof (proxySettings as any).randomPath !== 'boolean') {
+            (proxySettings as any).randomPath = DEFAULT_SETTINGS.randomPath;
+        }
+
         if (!warpAccounts) {
             // 无账号或形状不合法：交回 fetchWarpAccounts（其内部已有「上游失败 → 内置默认账号」的回退）
             warpAccounts = await fetchWarpAccounts(env);
@@ -228,6 +234,7 @@ export async function updateDataset(request: Request, env: Env): Promise<Setting
             ["ports"],
             ["fingerprint"],
             ["alpn"],
+            ["randomPath"],
             ["enableTFO"],
             ["fragmentMode"],
             ["fragmentLengthMin"],
