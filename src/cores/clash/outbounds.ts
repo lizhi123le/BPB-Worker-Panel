@@ -1,4 +1,4 @@
-import { isHttps, buildEntryPortMap, parseHostPort, pickEarlyData, pickRandomEch, selectSniHost, isBareIPv4, isBareIPv6, type CleanProxyEntry } from '@utils';
+import { isTlsPort, parseHostPort, pickEarlyData, pickRandomEch, selectSniHost, isBareIPv4, isBareIPv6, type CleanProxyEntry } from '@utils';
 import {
     BaseOutbound,
     HttpOutbound,
@@ -69,15 +69,14 @@ export function buildWebsocketOutbound(
             enableIPv6, 
             enableECH, 
             echServerName, 
-            hostSniList, 
-            upstreamParams: { upstreamServer } 
+            hostSniList
         }
     } = globalThis;
 
     // 与 handlers.ts 的 URI 侧判定对齐：任一地址的显式端口表里出现过该端口也视为 TLS，
     // 否则同一节点会出现 URI 写 security=tls、JSON 无 tls 字段的自相矛盾组合。
-    // entryPortMap 只依赖 globalThis.settings，按调用求值为请求内局部量（无模块级可变状态）。
-    const isTLS = isHttps(port) || address === upstreamServer || Object.values(buildEntryPortMap()).some(ports => ports.includes(port));
+    // 判据（含 entryPortMap 的按调用求值）统一由 @utils 的 isTlsPort 维护。
+    const isTLS = isTlsPort(port, address);
     if (protocol === _TR_ && !isTLS) return null;
     const { host, sni, allowInsecure } = selectSniHost(address, pickRandomEch(hostSniList));
     // G13-C10：ECH 启用而 `echServerName` 为空时的名称回退，与 handlers.ts#buildConfig（URI 侧）

@@ -1,4 +1,4 @@
-import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes } from '@utils';
+import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes, isBareIPv4 } from '@utils';
 import { evictOldest, safeErrorMessage, randomUserAgent } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
@@ -263,9 +263,11 @@ async function connectWithRaceDial(
     throw new Error(`All race dial attempts failed for proxy ${proxyAddr}`);
 }
 
-/** 判断地址是否为 IP 字面量（IPv4 或含冒号的 IPv6），而非域名（对齐 cfnew 是IP地址） */
+/** 判断地址是否为 IP 字面量（IPv4 或含冒号的 IPv6），而非域名（对齐 cfnew 是IP地址）。
+ *  IPv4 判定复用 @utils 的 isBareIPv4（与订阅侧同一份正则，避免两处口径漂移）；
+ *  IPv6 沿用「含冒号且非 CIDR」的宽松判据 —— 这里只用于决定是否跳过 DoH，不需要地址合法性。 */
 const isIPLiteral = (address: string): boolean =>
-    /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(address)
+    isBareIPv4(address)
     || (address.includes(':') && !address.includes('/'));
 
 // 直连 IP 池轮询偏移（模块级，避免总是从第一个 IP 开始，对齐 cfnew IP池轮询索引）

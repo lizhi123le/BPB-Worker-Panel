@@ -75,6 +75,36 @@ export function respond(
     return new Response(JSON.stringify(responseBody), { status, headers });
 }
 
+/**
+ * 订阅配置接口的统一响应：格式化 JSON + 明确不缓存。
+ * Clash / sing-box / Xray 三端此前各写一份完全相同的 Response 字面量（共 6 处），
+ * 头部语义只在此处维护。
+ */
+export function configJsonResponse(data: unknown, status: HttpStatus = HttpStatus.OK): Response {
+    return new Response(JSON.stringify(data, null, 4), {
+        status,
+        headers: {
+            'Content-Type': 'text/plain;charset=utf-8',
+            'Cache-Control': 'no-store',
+            'CDN-Cache-Control': 'no-store'
+        }
+    });
+}
+
+/**
+ * HTML 页面响应的统一封装（面板 / 登录 / 密钥 / 代理 IP / 错误页共用）：
+ * text/html + 安全响应头，避免每处重复展开同一份 headers。
+ */
+export function htmlResponse(
+    body: string | ReadableStream<Uint8Array>,
+    status: HttpStatus = HttpStatus.OK
+): Response {
+    return new Response(body as BodyInit, {
+        status,
+        headers: { 'Content-Type': 'text/html; charset=utf-8', ...securityHeaders((globalThis as any)?.env) }
+    });
+}
+
 export function safeErrorMessage(error: any): string {
     return error instanceof Error ? error.message : String(error);
 }

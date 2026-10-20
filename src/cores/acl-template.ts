@@ -18,6 +18,7 @@ import type {
 } from '#types/clash';
 import type { RoutingRule, RuleSet, Selector as SbSelector, URLTest as SbUrlTest } from '#types/sing-box';
 import { fetchWithTimeout } from '@common';
+import { DEFAULT_ACL_TEMPLATE_URL } from '../common/defaults';
 
 /**
  * ACL4SSR 分组配置模板引擎（对齐 cfnew `明文源吗` 实现）。
@@ -266,6 +267,26 @@ export async function fetchAclTemplate(configUrl: string): Promise<ParsedTemplat
         console.warn('[ACL Config] Fetch ini template error:', e?.message || e);
         return null;
     }
+}
+
+/**
+ * ACL 模板加载 + 内置地址兜底（Clash / sing-box 两端共用）：
+ * 已配置地址取不到有效内容（404 / 被墙 / 格式不符）时，退回内置远程模板再试一次；
+ * 两次都取不到才保持内置分组。两端以前各写一份完全相同的回退流程，这里合并为唯一实现。
+ * `build` 由各端传入（buildAclClash / buildAclSingbox），`isEmpty` 用各端结果结构判断「无效内容」。
+ */
+export async function loadAclTemplateWithFallback<T>(
+    configUrl: string,
+    proxyTags: string[],
+    build: (url: string, proxyTags: string[]) => Promise<T | null>,
+    isEmpty: (acl: T) => boolean
+): Promise<T | null> {
+    let acl = await build(configUrl, proxyTags);
+    if ((!acl || isEmpty(acl)) && configUrl !== DEFAULT_ACL_TEMPLATE_URL) {
+        console.warn('[ACL Config] 模板地址无有效内容，改用内置模板:', configUrl);
+        acl = await build(DEFAULT_ACL_TEMPLATE_URL, proxyTags);
+    }
+    return acl;
 }
 
 /** 检测字符串是否为正则模式（而非字面代理/组名）。 */

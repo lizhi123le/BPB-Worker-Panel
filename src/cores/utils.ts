@@ -192,6 +192,26 @@ export function cleanProxyRemark(proxy: CleanProxyEntry): string {
     return proxy.name || `${proxy.server}:${proxy.port}`;
 }
 
+/**
+ * 把代理条目追加为独立可选节点：构建出站、登记节点名、登记选择器成员。
+ * Clash / sing-box 的普通与 Warp 订阅各有一份逐字相同的循环，合并到这里；
+ * 构建器由各端传入（两端出站结构不同）。
+ */
+export function appendCleanProxyNodes<T>(
+    proxies: CleanProxyEntry[],
+    outbounds: T[],
+    proxyTags: string[],
+    selectorTags: string[],
+    build: (proxy: CleanProxyEntry, tag: string) => T
+): void {
+    for (const proxy of proxies) {
+        const tag = cleanProxyRemark(proxy);
+        outbounds.push(build(proxy, tag));
+        proxyTags.push(tag);
+        selectorTags.push(tag);
+    }
+}
+
 /** Map entries to clean address array（代理条目不是地址，直接跳过） */
 export function entryAddresses(entries: string[]): string[] {
     return entries.map(entry => parseCleanProxy(entry) ? '' : entryAddress(entry)).filter(Boolean);
@@ -213,6 +233,16 @@ export function buildEntryPortMap(): Record<string, number[]> {
         }
     }
     return map;
+}
+
+/** 地址对应的端口列表：该地址有显式端口时用它，否则回退到全局端口列表。
+ *  订阅生成的三端（Clash / sing-box / Xray）与 Raw 链接共用这一条取值规则。 */
+export function portsForHost(
+    entryPortMap: Record<string, number[]>,
+    host: string,
+    fallbackPorts: number[]
+): number[] {
+    return entryPortMap[host]?.length ? entryPortMap[host] : fallbackPorts;
 }
 
 /** Find custom name for an address across multiple entry lists, with optional port matching */
@@ -580,6 +610,18 @@ function envSpeedtestAddress(): string | undefined {
 export type ConfigItem =
     | { kind: 'address'; value: string }
     | { kind: 'proxy'; value: CleanProxyEntry };
+
+/**
+ * 把上游代理条目并入节点序列（订阅生成入口共用）：
+ * 端口插到端口列表最前，地址插到节点序列最前，保证上游节点优先输出。
+ * `skip` 供分片订阅使用（分片只含 TLS 节点，不并入明文上游条目）。
+ */
+export function prependUpstreamItem(items: ConfigItem[], ports: number[], skip = false): void {
+    const { upstreamParams: { upstreamServer, upstreamPort } } = globalThis.settings;
+    if (skip || !upstreamServer || !upstreamPort) return;
+    ports.unshift(upstreamPort);
+    items.unshift({ kind: 'address', value: upstreamServer });
+}
 
 /**
  * 订阅节点的**有序**序列：先域名 / 测速域名 / DNS 解析出的 IP，再按 cleanIPs 的**输入顺序**
@@ -959,6 +1001,42 @@ export function parseHostPort(input: string, brackets?: boolean): { host: string
 export function isHttps(port: number): boolean {
     const { defaultHttpsPorts } = globalThis.httpConfig;
     return defaultHttpsPorts.includes(port);
+}
+
+/**
+ * 订阅节点端口是否按 TLS 处理（URI 侧与 Clash/sing-box/Xray 三端 JSON 出站共用同一判据）。
+ * 任一地址的显式端口表里出现过该端口也视为 TLS，否则同一节点会出现
+ * URI 写 security=tls、JSON 写 none 的自相矛盾组合。
+ * entryPortMap 只依赖 globalThis.settings，默认按调用求值（请求内局部量，无模块级状态）；
+ * 已持有同一映射的调用方可直接传入，避免重复构建。
+ */
+export function isTlsPort(
+    port: number,
+    address: string,
+    entryPortMap: Record<string, number[]> = buildEntryPortMap()
+): boolean {
+    const { upstreamParams: { upstreamServer } } = globalThis.settings;
+    return isHttps(port) || address === upstreamServer || Object.values(entryPortMap).some(ports => ports.includes(port));
+}
+
+/**
+ * 制裁域名的 DoH 端点派生（Clash / sing-box / Xray 三端同一口径）：
+ * 输入已带 https:// → 直接作为完整 DoH 端点，无明文兜底；
+ * 否则拼 `https://<输入>/dns-query`，原输入地址保留作明文兜底。
+ * 裸 IPv6 必须加方括号，否则拼出的 URL 不是合法地址（三端都会启动/加载失败）。
+ */
+export function antiSanctionDohTarget(antiSanctionDNS: string): {
+    dohUrl: string;
+    plainFallback?: string;
+} {
+    const isDohUrl = /^https:\/\//i.test(antiSanctionDNS);
+    const host = isIPv6(antiSanctionDNS) && !antiSanctionDNS.startsWith('[')
+        ? `[${antiSanctionDNS}]`
+        : antiSanctionDNS;
+    return {
+        dohUrl: isDohUrl ? antiSanctionDNS : `https://${host}/dns-query`,
+        plainFallback: isDohUrl ? undefined : antiSanctionDNS
+    };
 }
 
 const isBypass = (type: string) => type === "direct";

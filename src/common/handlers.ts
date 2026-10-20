@@ -1,4 +1,4 @@
-import { Authenticate, clearSessionCookieHeader, generateJWTToken, initializePassword, resetPassword } from "@auth";
+import { Authenticate, clearSessionCookieHeader, generateJWTToken, initializePassword, requireSession, resetPassword } from "@auth";
 import { getDataset, updateDataset, InvalidSettingsError } from "@kv";
 import { setKvCache } from "../kv-cache";
 import { DEFAULT_SETTINGS, setSettings } from "@init";
@@ -7,8 +7,8 @@ import { getSbCustomConfig, getSbWarpConfig } from "@sing-box/configs";
 import { getXrCustomConfigs, getXrWarpConfigs } from "@xray/configs";
 import { fetchWarpAccounts } from "@warp";
 import { UnifiedWSHandler, getXPaddingIdentifier } from "@unified";
-import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, HttpStatus, isKvBound, respond, safeErrorMessage, securityHeaders } from "@common";
-import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, DEFAULT_PROXY_IPS, generateRemark, generateWsPath, getConfigItems, isHttps, OFFICIAL_DIRECT_IPS, parseHostPort, parseProxyIPWithRegion, pickEarlyData, pickRandomEch, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
+import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, htmlResponse, HttpStatus, isKvBound, respond, safeErrorMessage } from "@common";
+import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, DEFAULT_PROXY_IPS, generateRemark, generateWsPath, getConfigItems, isTlsPort, OFFICIAL_DIRECT_IPS, parseHostPort, parseProxyIPWithRegion, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
 /**
@@ -257,20 +257,15 @@ export async function renderError(error: any): Promise<Response> {
     // 函数式替换：避免 String.replace 把消息里的 $&/$'/$` 当插值序列解释
     const errorPage = html.replace('__ERROR_MESSAGE__', () => message + action);
 
-    return new Response(errorPage, {
-        // F16：此前一律返回 200，掩盖故障并让监控/缓存/重试语义全错。
-        // 本仓库能走到这个兜底的异常只有两类：部署配置错误（缺 env / KV 未绑定 / UUID 非法）与上游连接失败，
-        // 都不属于客户端可修复的 4xx，硬造 404/401 只会撒谎，故统一 500。
-        status: HttpStatus.INTERNAL_SERVER_ERROR,
-        headers: { 'Content-Type': 'text/html; charset=utf-8', ...securityHeaders((globalThis as any)?.env) }
-    });
+    // F16：此前一律返回 200，掩盖故障并让监控/缓存/重试语义全错。
+    // 本仓库能走到这个兜底的异常只有两类：部署配置错误（缺 env / KV 未绑定 / UUID 非法）与上游连接失败，
+    // 都不属于客户端可修复的 4xx，硬造 404/401 只会撒谎，故统一 500。
+    return htmlResponse(errorPage, HttpStatus.INTERNAL_SERVER_ERROR);
 }
 
 async function renderProxyIPs() {
     const html = await decompressHtml(__PROXY_IP_HTML_CONTENT__, false);
-    return new Response(html, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8', ...securityHeaders((globalThis as any)?.env) }
-    });
+    return htmlResponse(html);
 }
 
 export async function handleLogin(request: Request, env: Env): Promise<Response> {
@@ -389,15 +384,8 @@ export async function handleSubscriptions(request: Request, env: Env): Promise<R
 }
 
 async function updateSettings(request: Request, env: Env): Promise<Response> {
-    if (request.method !== 'PUT') {
-        return respond(false, HttpStatus.METHOD_NOT_ALLOWED, 'Method not allowed.');
-    }
-
-    const auth = await Authenticate(request, env);
-
-    if (!auth) {
-        return respond(false, HttpStatus.UNAUTHORIZED, 'Unauthorized or expired session.');
-    }
+    const denied = await requireSession(request, env, { method: 'PUT' });
+    if (denied) return denied;
 
     try {
         const proxySettings = await updateDataset(request, env);
@@ -413,15 +401,9 @@ async function updateSettings(request: Request, env: Env): Promise<Response> {
 }
 
 async function resetSettings(request: Request, env: Env): Promise<Response> {
-    if (request.method !== 'POST') {
-        return respond(false, HttpStatus.METHOD_NOT_ALLOWED, 'Method not allowed!');
-    }
-
-    const auth = await Authenticate(request, env);
-
-    if (!auth) {
-        return respond(false, HttpStatus.UNAUTHORIZED, 'Unauthorized or expired session.');
-    }
+    // 405 文案沿用该接口的历史字面量（带感叹号），合并守卫后响应体仍逐字不变
+    const denied = await requireSession(request, env, { method: 'POST', methodMessage: 'Method not allowed!' });
+    if (denied) return denied;
 
     try {
         // 重置 = 写回明确的出厂默认，与 isolate 内存状态无关（冷/暖 isolate 结果一致）
@@ -441,9 +423,8 @@ async function resetSettings(request: Request, env: Env): Promise<Response> {
 }
 
 async function getSettings(request: Request, env: Env): Promise<Response> {
-    const auth = await Authenticate(request, env);
-
-    if (!auth) {
+    const denied = await requireSession(request, env);
+    if (denied) {
         // F20：未鉴权一律不下发任何部署状态。这里原先带 isPassSet（未授权访客可据此判定「尚未设口令」
         // 直接衔接抢注），首访引导收敛到 /login 的设置表单后已无消费方，连同那次 KV 读一并删掉。
         // body 用空对象而非 null：调用方会直接读 body 上的字段。
@@ -492,15 +473,8 @@ export async function fallback(request: Request): Promise<Response> {
 }
 
 async function getMyIP(request: Request, env: Env): Promise<Response> {
-    if (request.method !== 'POST') {
-        return respond(false, HttpStatus.METHOD_NOT_ALLOWED, 'Method not allowed.');
-    }
-
-    const auth = await Authenticate(request, env);
-
-    if (!auth) {
-        return respond(false, HttpStatus.UNAUTHORIZED, 'Unauthorized or expired session.');
-    }
+    const denied = await requireSession(request, env, { method: 'POST' });
+    if (denied) return denied;
 
     const ip = await request.text();
 
@@ -515,11 +489,8 @@ async function getMyIP(request: Request, env: Env): Promise<Response> {
 }
 
 async function getRegionInfo(request: Request, env: Env): Promise<Response> {
-    const auth = await Authenticate(request, env);
-
-    if (!auth) {
-        return respond(false, HttpStatus.UNAUTHORIZED, 'Unauthorized or expired session.');
-    }
+    const denied = await requireSession(request, env);
+    if (denied) return denied;
 
     try {
         await setSettings(request, env);
@@ -682,9 +653,7 @@ async function renderPanel(request: Request, env: Env): Promise<Response> {
     }
 
     const html = await decompressHtml(__PANEL_HTML_CONTENT__, false);
-    return new Response(html, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8', ...securityHeaders((globalThis as any)?.env) }
-    });
+    return htmlResponse(html);
 }
 
 async function renderLogin(request: Request, env: Env): Promise<Response> {
@@ -707,31 +676,17 @@ async function renderLogin(request: Request, env: Env): Promise<Response> {
     const html = (await decompressHtml(__LOGIN_HTML_CONTENT__, true) as string)
         .replace('__AUTH_MODE__', isFirstRun ? 'setup' : 'login');
 
-    return new Response(html, {
-        headers: {
-            'Content-Type': 'text/html; charset=utf-8',
-            ...securityHeaders((globalThis as any)?.env)
-        }
-    });
+    return htmlResponse(html);
 }
 
 export async function renderSecrets(): Promise<Response> {
     const html = await decompressHtml(__SECRETS_HTML_CONTENT__, false);
-    return new Response(html, {
-        headers: {
-            'Content-Type': 'text/html; charset=utf-8',
-            ...securityHeaders((globalThis as any)?.env)
-        }
-    });
+    return htmlResponse(html);
 }
 
 async function updateWarpConfigs(request: Request, env: Env): Promise<Response> {
-    if (request.method !== 'POST') return respond(false, HttpStatus.METHOD_NOT_ALLOWED, 'Method not allowed.');
-    const auth = await Authenticate(request, env);
-
-    if (!auth) {
-        return respond(false, HttpStatus.UNAUTHORIZED, 'Unauthorized.');
-    }
+    const denied = await requireSession(request, env, { method: 'POST', unauthorizedMessage: 'Unauthorized.' });
+    if (denied) return denied;
 
     try {
         await fetchWarpAccounts(env);
@@ -876,7 +831,7 @@ export async function getURLConfigs() {
     const usedEds = new Set<number>();
 
     const buildConfig = (protocol: string, addr: string, port: number, host: string, sni: string, remark: string, allowInsecure: boolean) => {
-        const isTLS = isHttps(port) || addr === upstreamServer || Object.values(entryPortMap).some(ports => ports.includes(port));
+        const isTLS = isTlsPort(port, addr, entryPortMap);
         const security = isTLS ? 'tls' : 'none';
         const config = new URL(`${protocol}://config`);
 
@@ -930,10 +885,8 @@ export async function getURLConfigs() {
     let nodeConfs = '', chainProxy = '';
     const items = await getConfigItems(false);
 
-    if (upstreamServer && upstreamPort) {
-        ports.unshift(upstreamPort);
-        items.unshift({ kind: 'address', value: upstreamServer });
-    }
+    // 上游代理条目（若配置）优先并入节点序列；判定与插入顺序由共享助手统一维护
+    prependUpstreamItem(items, ports);
 
     const entryPortMap = buildEntryPortMap();
 
@@ -946,7 +899,7 @@ export async function getURLConfigs() {
         }
 
         const addr = item.value;
-        const addrPorts = entryPortMap[addr]?.length ? entryPortMap[addr] : ports;
+        const addrPorts = portsForHost(entryPortMap, addr, ports);
 
         for (const port of addrPorts) {
             const { host, sni, allowInsecure } = selectSniHost(addr, pickRandomEch(hostSniList));

@@ -3,9 +3,10 @@ import { buildDNS, retargetDnsDetour } from './dns';
 import { buildRoutingRules, buildBaseRoutingRules, buildRuleProviders, buildBlockRules, buildBypassRules } from './routing';
 import { buildChainOutbound, buildCleanProxyOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound, getChainExplicitEarlyData, redrawChainEarlyData } from './outbounds';
 import type { WireguardOutbound, Config, Outbound } from '#types/clash';
-import { buildEntryPortMap, getConfigItems, cleanProxyEntries, cleanProxyRemark, generateRemark, generateWsPath, getProtocols, pickEarlyData, resetRemarkCounter } from '@utils';
+import { buildEntryPortMap, getConfigItems, cleanProxyEntries, generateRemark, generateWsPath, getProtocols, pickEarlyData, resetRemarkCounter, prependUpstreamItem, portsForHost, appendCleanProxyNodes } from '@utils';
+import { configJsonResponse } from '@common';
 import { sniffer, tun } from './inbounds';
-import { buildAclClash, ACL_BUILTIN_GROUP_TAGS } from '../acl-template';
+import { buildAclClash, ACL_BUILTIN_GROUP_TAGS, loadAclTemplateWithFallback } from '../acl-template';
 import { DEFAULT_ACL_TEMPLATE_URL } from '../../common/defaults';
 
 async function buildConfig(
@@ -96,10 +97,8 @@ export async function getClNormalConfig(): Promise<Response> {
     const entryPortMap = buildEntryPortMap();
     const protocols = getProtocols();
 
-    if (upstreamServer && upstreamPort) {
-        ports.unshift(upstreamPort);
-        items.unshift({ kind: 'address', value: upstreamServer });
-    }
+    // 上游代理条目（若配置）优先并入节点序列；判定与插入顺序由共享助手统一维护
+    prependUpstreamItem(items, ports);
 
     const proxyTags: string[] = [];
     const chainTags: string[] = [];
@@ -110,16 +109,13 @@ export async function getClNormalConfig(): Promise<Response> {
     //（只做节点：不设 dialer-proxy、不进链式分支）
     for (const item of items) {
         if (item.kind === 'proxy') {
-            const tag = cleanProxyRemark(item.value);
-            outbounds.push(buildCleanProxyOutbound(item.value, tag));
-            proxyTags.push(tag);
-            selectorTags.push(tag);
+            appendCleanProxyNodes([item.value], outbounds, proxyTags, selectorTags, buildCleanProxyOutbound);
             continue;
         }
 
         const host = item.value;
         for (const protocol of protocols) {
-            const addrPorts = entryPortMap[host]?.length ? entryPortMap[host] : ports;
+            const addrPorts = portsForHost(entryPortMap, host, ports);
 
             for (const port of addrPorts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
@@ -169,11 +165,12 @@ export async function getClNormalConfig(): Promise<Response> {
         try {
             // 已配置的地址取不到有效内容（404 / 被墙 / 格式不符）时，旧行为是**静默跳过** ——
             // 用户只看到「开关已启用却仍是内置分组」。故退回内置地址再试一次；两次都取不到才保持内置分组。
-            let acl = await buildAclClash(aclUrl, proxyTags);
-            if ((!acl || (acl.groups.length === 0 && acl.rules.length === 0)) && aclUrl !== DEFAULT_ACL_TEMPLATE_URL) {
-                console.warn('[ACL Config] 模板地址无有效内容，改用内置模板:', aclUrl);
-                acl = await buildAclClash(DEFAULT_ACL_TEMPLATE_URL, proxyTags);
-            }
+            const acl = await loadAclTemplateWithFallback(
+                aclUrl,
+                proxyTags,
+                buildAclClash,
+                result => result.groups.length === 0 && result.rules.length === 0
+            );
             if (acl && (acl.groups.length > 0 || acl.rules.length > 0)) {
                 // ACL 模板接管：proxy-groups 整体替换为模板组（去掉内置 Selector/最佳延迟）
                 config["proxy-groups"] = acl.groups;
@@ -212,14 +209,7 @@ export async function getClNormalConfig(): Promise<Response> {
         }
     }
 
-    return new Response(JSON.stringify(config, null, 4), {
-        status: 200,
-        headers: {
-            'Content-Type': 'text/plain;charset=utf-8',
-            'Cache-Control': 'no-store',
-            'CDN-Cache-Control': 'no-store'
-        }
-    });
+    return configJsonResponse(config);
 }
 
 export async function getClWarpConfig(request: Request, env: Env, isPro: boolean): Promise<Response> {
@@ -250,12 +240,13 @@ export async function getClWarpConfig(request: Request, env: Env, isPro: boolean
 
     // Clean IPs / Domains 里的代理条目 → 独立可选节点（只做节点：不设 dialer-proxy、不进链式分组）
     const cleanProxyOutbounds: Outbound[] = [];
-    for (const proxy of cleanProxyEntries(globalThis.settings.cleanIPs || [])) {
-        const tag = cleanProxyRemark(proxy);
-        cleanProxyOutbounds.push(buildCleanProxyOutbound(proxy, tag));
-        proxyTags.push(tag);
-        selectorTags.push(tag);
-    }
+    appendCleanProxyNodes(
+        cleanProxyEntries(globalThis.settings.cleanIPs || []),
+        cleanProxyOutbounds,
+        proxyTags,
+        selectorTags,
+        buildCleanProxyOutbound
+    );
 
     const config = await buildConfig(
         [...outbounds, ...cleanProxyOutbounds],
@@ -267,12 +258,5 @@ export async function getClWarpConfig(request: Request, env: Env, isPro: boolean
         isPro
     );
 
-    return new Response(JSON.stringify(config, null, 4), {
-        status: 200,
-        headers: {
-            'Content-Type': 'text/plain;charset=utf-8',
-            'Cache-Control': 'no-store',
-            'CDN-Cache-Control': 'no-store'
-        }
-    });
+    return configJsonResponse(config);
 }

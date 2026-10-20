@@ -1,6 +1,6 @@
 import { getGeoAssets } from './geo-assets';
 import { DNS, DnsHosts, FakeDNS } from '#types/clash';
-import { isDomain, getDomain, accDnsRules, isIPv6 } from '@utils';
+import { isDomain, getDomain, accDnsRules, antiSanctionDohTarget } from '@utils';
 
 /**
  * C3：ACL 模板接管后，内置策略组（✅ Selector / 各类「最佳延迟」）被整体替换为模板分组，
@@ -102,10 +102,8 @@ export async function buildDNS(isChain: boolean, isWarp: boolean, isPro: boolean
         // 裸 IPv6 必须加方括号：`https://2001:db8::1/dns-query#DIRECT` 会被 mihomo 判为
         // `too many colons in address`，**整份配置被拒**（实测 mihomo v1.19.30：裸形态 test failed、
         // 方括号形态 test successful）——与 xray 端同一判据（isIPv6 且未自带方括号）。
-        const antiSanctionDohHost = isIPv6(antiSanctionDNS) && !antiSanctionDNS.startsWith('[')
-            ? `[${antiSanctionDNS}]`
-            : antiSanctionDNS;
-        const dohUrl = /^https:\/\//i.test(antiSanctionDNS) ? antiSanctionDNS : `https://${antiSanctionDohHost}/dns-query`;
+        // 端点派生（含方括号归一）由 @utils 的 antiSanctionDohTarget 统一维护。
+        const { dohUrl } = antiSanctionDohTarget(antiSanctionDNS);
         // 「Doh 优先 + 明文兜底」里的**兜底**在 Clash 侧无处安放，只落地可安全表达的一半，原因：
         //  1) nameserver-policy 是单值映射（clash.d.ts:42 `Record<string, string>`），同一个键塞两个服务器
         //     在 mihomo 里是**并发查询、最快者胜**，不是「先主后备」——明文查询仍会照旧发出，且通常被

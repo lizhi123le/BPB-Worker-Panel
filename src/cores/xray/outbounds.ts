@@ -1,9 +1,8 @@
 import {
     base64ToDecimal,
-    buildEntryPortMap,
     isBareIPv4,
     isBareIPv6,
-    isHttps,
+    isTlsPort,
     toRange,
     selectSniHost,
     pickRandomEch,
@@ -101,8 +100,7 @@ export function buildWebsocketOutbound(
             enableTFO,
             enableECH,
             echServerName,
-            hostSniList,
-            upstreamParams: { upstreamServer }
+            hostSniList
         },
         globalConfig: { userID, TrPass },
         dict: { _VL_ }
@@ -110,9 +108,8 @@ export function buildWebsocketOutbound(
 
     // 与 handlers.ts#buildConfig（URI 侧）的判定逐字一致：显式端口表里出现过该端口即按 TLS 处理，
     // 否则同一节点会出现 URI 写 security=tls、JSON 写 security=none 的自相矛盾配置。
-    // entryPortMap 每个出站构造时局部重算（无模块级状态，语义同 xray/configs.ts 的请求内求值）。
-    const entryPortMap = buildEntryPortMap();
-    const isTLS = isHttps(port) || address === upstreamServer || Object.values(entryPortMap).some(ports => ports.includes(port));
+    // 判据（含 entryPortMap 的按调用求值）统一由 @utils 的 isTlsPort 维护。
+    const isTLS = isTlsPort(port, address);
     const { host, sni, allowInsecure } = selectSniHost(address, pickRandomEch(hostSniList));
     // G13-C10：echServerName 名单为空时回退到该节点的 host，与 handlers.ts#buildConfig（URI 侧）的
     // `pickRandomEch(echServerName) || host` 逐字一致，避免同一节点出现「URI 有 ech、JSON 无 ECH」的分歧。

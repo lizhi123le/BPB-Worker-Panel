@@ -23,8 +23,11 @@ import {
     isHttps,
     getProtocols,
     parseHostPort,
-    resetRemarkCounter
+    resetRemarkCounter,
+    prependUpstreamItem,
+    portsForHost
 } from '@utils';
+import { configJsonResponse } from '@common';
 
 function buildBalancer(tag: string, selector: string, fallbackTag?: string): Balancer {
     return {
@@ -283,10 +286,8 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     const totalPorts = ports.filter(port => !isFragment || isHttps(port));
     const protocols = getProtocols();
 
-    if (upstreamServer && upstreamPort && !isFragment) {
-        totalPorts.unshift(upstreamPort);
-        items.unshift({ kind: 'address', value: upstreamServer });
-    }
+    // 上游代理条目（若配置）优先并入节点序列；分片订阅跳过
+    prependUpstreamItem(items, totalPorts, isFragment);
 
     const configs: Config[] = [];
     const proxies: Outbound[] = [];
@@ -309,7 +310,7 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
 
         const host = item.value;
         for (const protocol of protocols) {
-            const addrPorts = entryPortMap[host]?.length ? entryPortMap[host] : totalPorts;
+            const addrPorts = portsForHost(entryPortMap, host, totalPorts);
 
             for (const port of addrPorts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
@@ -343,14 +344,7 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
         await addWorkerlessConfigs(configs);
     }
 
-    return new Response(JSON.stringify(configs, null, 4), {
-        status: 200,
-        headers: {
-            'Content-Type': 'text/plain;charset=utf-8',
-            'Cache-Control': 'no-store',
-            'CDN-Cache-Control': 'no-store'
-        }
-    });
+    return configJsonResponse(configs);
 }
 
 export async function getXrWarpConfigs(
@@ -448,14 +442,7 @@ export async function getXrWarpConfigs(
 
     configs.push(warpBestPing, wowBestPing);
 
-    return new Response(JSON.stringify(configs, null, 4), {
-        status: 200,
-        headers: {
-            'Content-Type': 'text/plain;charset=utf-8',
-            'Cache-Control': 'no-store',
-            'CDN-Cache-Control': 'no-store'
-        }
-    });
+    return configJsonResponse(configs);
 }
 
 function modifyOutbound(outbound: Outbound, tag: string, usedEds?: Set<number>, dialerProxy?: string): Outbound {

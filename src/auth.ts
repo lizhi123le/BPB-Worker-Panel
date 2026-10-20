@@ -191,18 +191,39 @@ export async function Authenticate(request: Request, env: Env): Promise<boolean>
     }
 }
 
-export async function resetPassword(request: Request, env: Env): Promise<Response> {
-    if (request.method !== 'POST') {
-        return respond(false, HttpStatus.METHOD_NOT_ALLOWED, 'Method not allowed.');
+/**
+ * 管理接口统一会话守卫（auth.ts 与 handlers.ts 共用）：
+ * 先校验 HTTP 方法（可选），再校验会话。返回 Response 表示应直接结束请求；null 表示通过。
+ * 此前每个管理接口都手写一份「405 + 401」判断，漏改一处就会出现鉴权语义分叉。
+ * 两条文案可按调用点覆盖，保证合并后响应体与既有接口逐字一致。
+ */
+export async function requireSession(
+    request: Request,
+    env: Env,
+    options: { method?: string; unauthorizedMessage?: string; methodMessage?: string } = {}
+): Promise<Response | null> {
+    const {
+        method,
+        unauthorizedMessage = 'Unauthorized or expired session.',
+        methodMessage = 'Method not allowed.'
+    } = options;
+
+    if (method && request.method !== method) {
+        return respond(false, HttpStatus.METHOD_NOT_ALLOWED, methodMessage);
     }
 
+    if (!(await Authenticate(request, env))) {
+        return respond(false, HttpStatus.UNAUTHORIZED, unauthorizedMessage);
+    }
+
+    return null;
+}
+
+export async function resetPassword(request: Request, env: Env): Promise<Response> {
     // 只服务「已登录改密」。这里曾经在「KV 尚无 pwd」时免鉴权放行（面板首访弹窗走的就是那条路），
     // 首访入口收敛到 /login/set-password 之后它就是冗余的第二条「未登录抢设口令」路径，故去掉。
-    const auth = await Authenticate(request, env);
-
-    if (!auth) {
-        return respond(false, HttpStatus.UNAUTHORIZED, 'Unauthorized.');
-    }
+    const denied = await requireSession(request, env, { method: 'POST', unauthorizedMessage: 'Unauthorized.' });
+    if (denied) return denied;
 
     const oldPwd = await env.kv.get('pwd');
     const newPwd = await request.text();

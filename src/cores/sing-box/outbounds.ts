@@ -1,6 +1,5 @@
 import {
-    isHttps,
-    buildEntryPortMap,
+    isTlsPort,
     base64ToDecimal,
     parseHostPort,
     selectSniHost,
@@ -86,8 +85,7 @@ export function buildWebsocketOutbound(
             enableTFO, 
             enableECH, 
             echServerName, 
-            hostSniList, 
-            upstreamParams: { upstreamServer } 
+            hostSniList
         }
     } = globalThis;
 
@@ -99,8 +97,8 @@ export function buildWebsocketOutbound(
     const transport = buildTransport("ws", "none", path, host, undefined, earlyData);
     // 与 handlers.ts 的 URI 侧判定对齐：任一地址的显式端口表里出现过该端口也视为 TLS，
     // 否则同一节点会出现 URI 写 security=tls、JSON 写 none 的自相矛盾组合。
-    // entryPortMap 只依赖 globalThis.settings，按调用求值为请求内局部量（无模块级可变状态）。
-    const tls = isHttps(port) || address === upstreamServer || Object.values(buildEntryPortMap()).some(ports => ports.includes(port))
+    // 判据（含 entryPortMap 的按调用求值）统一由 @utils 的 isTlsPort 维护。
+    const tls = isTlsPort(port, address)
         ? buildTLS(
             "tls",
             isFragment,

@@ -1,6 +1,6 @@
 import { getGeoAssets } from './geo-assets';
 import type { DNS, DnsServer, DnsHosts } from '#types/xray';
-import { resolveDNS, isDomain, isIPv6, getDomain, accDnsRules } from '@utils';
+import { resolveDNS, isDomain, getDomain, accDnsRules, antiSanctionDohTarget } from '@utils';
 
 export async function buildDNS(
     outboundAddrs: string[],
@@ -95,13 +95,12 @@ export async function buildDNS(
     // （app/dns/dns.go: sortClients/serialQuery）。finalQuery 只标在链尾（有明文兜底时标明文，否则标
     // DoH 那条）：命中后不再回落到默认 remoteDNS，与改动前单条 finalQuery:true 的语义保持一致。
     if (sanctionDomains.length) {
-        const antiSanctionOnDoH = /^https:\/\//i.test(antiSanctionDNS);
         // 裸 IPv6 必须加方括号，否则 `https://2001:db8::1/dns-query` 不是合法地址，xray 会启动失败。
-        const antiSanctionDohHost = isIPv6(antiSanctionDNS) && !antiSanctionDNS.startsWith('[')
-            ? `[${antiSanctionDNS}]`
-            : antiSanctionDNS;
-        const antiSanctionDohUrl = antiSanctionOnDoH ? antiSanctionDNS : `https://${antiSanctionDohHost}/dns-query`;
-        const antiSanctionPlainFallback = antiSanctionOnDoH ? undefined : antiSanctionDNS;
+        // 端点派生（含方括号归一与明文兜底）由 @utils 的 antiSanctionDohTarget 统一维护。
+        const {
+            dohUrl: antiSanctionDohUrl,
+            plainFallback: antiSanctionPlainFallback
+        } = antiSanctionDohTarget(antiSanctionDNS);
 
         servers.push(buildDnsServer(
             antiSanctionDohUrl,

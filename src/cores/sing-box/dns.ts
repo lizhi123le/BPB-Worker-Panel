@@ -1,6 +1,6 @@
 import { getGeoAssets } from './geo-assets';
 import { DNS, DnsRule, DnsServer } from '#types/sing-box';
-import { accDnsRules, pickRandomEch, resolveDNS, isDomain, isIPv6 } from '@utils';
+import { accDnsRules, pickRandomEch, resolveDNS, isDomain, antiSanctionDohTarget } from '@utils';
 
 /**
  * H7：解析节点自身域名的 hosts 静态 IP 服务器 tag。
@@ -189,12 +189,9 @@ export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> 
         //   输入已带 https:// → dohUrl = 原样（用户显式给了完整 DoH 端点），无明文兜底；
         //   否则              → dohUrl = https://<输入>/dns-query，明文 <输入> 作兜底。
         // 裸 IPv6 必须加方括号，否则 `https://2001:db8::1/dns-query` 不是合法 URL（与 xray 端同一判据）。
-        const antiSanctionDohHost = isIPv6(antiSanctionDNS) && !antiSanctionDNS.startsWith('[')
-            ? `[${antiSanctionDNS}]`
-            : antiSanctionDNS;
-        const isDohUrl = /^https:\/\//i.test(antiSanctionDNS);
-        const doh = parseDohUrl(isDohUrl ? antiSanctionDNS : `https://${antiSanctionDohHost}/dns-query`);
-        const plainFallback = isDohUrl ? undefined : antiSanctionDNS;
+        // 端点派生（含方括号归一与明文兜底）由 @utils 的 antiSanctionDohTarget 统一维护。
+        const { dohUrl, plainFallback } = antiSanctionDohTarget(antiSanctionDNS);
+        const doh = parseDohUrl(dohUrl);
 
         addDnsRule(
             rules,
