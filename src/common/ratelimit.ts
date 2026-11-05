@@ -124,6 +124,19 @@ const BUILTIN_ROUTE_WORDS: ReadonlySet<string> = new Set([
 export const PUBLIC_PATH_POOL: readonly string[] = Array.from(PUBLIC_PATH_DICTIONARY)
     .filter(word => !BUILTIN_ROUTE_WORDS.has(word));
 
+/**
+ * 首段是否为内置路由词。
+ *
+ * XHTTP 入站的路径白名单用它做前置排除：白名单本身按 `isPathInDictionary` 判定，
+ * 而该字典目前并不含这些路由词 —— 但这是**当前数据**的巧合，不是契约。
+ * 字典将来一旦回填 `panel` / `login` 这类词（F-15 禁止它们进伪装池，却没禁止它们进限流白名单），
+ * 仅凭字典判定就会让 `POST /panel/...` 被 XHTTP 接管、面板直接坏掉。
+ * 把「内置路由词不可用于协议路径」写成显式判据，比依赖字典内容更稳。
+ */
+export function isBuiltinRouteWord(word: string): boolean {
+    return BUILTIN_ROUTE_WORDS.has(word.toLowerCase());
+}
+
 const RATE_LIMIT_WINDOW_MS = 3600000; // 1 小时
 const RATE_LIMIT_MAX_REQUESTS = 6;    // 每窗口最多 6 次
 const RATE_LIMIT_KV_PREFIX = 'ratelimit:';

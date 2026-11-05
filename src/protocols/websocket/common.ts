@@ -1400,8 +1400,11 @@ export function registerWsCleanup(webSocket: WebSocket, hook: () => void): void 
  * 排空并执行该连接的全部清理钩子。
  * 先 delete 再执行：close / cancel / error 中先到者执行，后到者成为 no-op —— 每个钩子至多跑一次，
  * 因此内部即便不做幂等也不会重复关闭。
+ *
+ * 导出给 XHTTP 入站：XHTTP 没有真正的 WebSocket，handleUDPOutBound 登记的 DNS socket 清理钩子
+ * 不会由 WS 事件触发，必须由 XHTTP 在流结束时手动排空（复用同一份钩子表，不另建一套）。
  */
-function runWsCleanupHooks(webSocket: WebSocket): void {
+export function runWsCleanupHooks(webSocket: WebSocket): void {
     const hooks = wsCleanupHooks.get(webSocket);
     if (!hooks) return;
     wsCleanupHooks.delete(webSocket);

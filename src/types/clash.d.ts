@@ -1,6 +1,6 @@
 type OptionalIntersection<T, U> = T | (T & U);
 export type DnsHosts = Record<string, string[] | string>;
-export type Network = "tcp" | "http" | "ws" | "httpupgrade" | "grpc";
+export type Network = "tcp" | "http" | "ws" | "httpupgrade" | "grpc" | "xhttp";
 export type Protocol =
     | "http"
     | "socks5"
@@ -86,6 +86,23 @@ export interface GrpcOpts {
     "grpc-service-name"?: string;
 }
 
+/**
+ * mihomo 的 XHTTP 选项块（自 v1.19.22 起支持 network: xhttp）。
+ * 字段是 Xray SplitHTTP 字段的 kebab-case 版本，语义与本项目 raw URI 的 `extra` 一一对应：
+ * x-padding-* 五项必须与 @cores/xhttp 的约定保持同源，否则同一订阅在 mihomo 与 Xray 系客户端上
+ * 会填出不同的填充头名 / 键名。
+ */
+export interface XhttpOpts {
+    "path"?: string;
+    "host"?: string;
+    "mode"?: string;
+    "x-padding-obfs-mode"?: boolean;
+    "x-padding-method"?: string;
+    "x-padding-placement"?: string;
+    "x-padding-header"?: string;
+    "x-padding-key"?: string;
+}
+
 export interface HttpOpts {
     "method": "GET";
     "path": string[];
@@ -131,6 +148,7 @@ export type Transport = {
     "ws-opts"?: WsOpts;
     "http-opts"?: HttpOpts;
     "grpc-opts"?: GrpcOpts;
+    "xhttp-opts"?: XhttpOpts;
 }
 
 export interface HttpOutbound extends BaseOutbound {

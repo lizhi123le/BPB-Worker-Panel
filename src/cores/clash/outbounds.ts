@@ -1,4 +1,8 @@
-import { isTlsPort, parseHostPort, pickEarlyData, pickRandomEch, selectSniHost, isBareIPv4, isBareIPv6, type CleanProxyEntry } from '@utils';
+import { isTlsPort, parseHostPort, pickEarlyData, pickRandomEch, selectSniHost, isBareIPv4, isBareIPv6, getXPaddingIdentifier, type CleanProxyEntry } from '@utils';
+
+// XHTTP 的路径 / 填充约定与 raw URI、Xray JSON 共用同一份实现（单一来源，避免三端漂移）
+import { XHTTP_MODE } from '@cores/xhttp';
+
 import {
     BaseOutbound,
     HttpOutbound,
@@ -10,6 +14,7 @@ import {
     WsOpts,
     GrpcOpts,
     HttpOpts,
+    XhttpOpts,
     VmessOutbound,
     TLS,
     Transport,
@@ -51,33 +56,23 @@ function buildOutbound<T>(
     } as T;
 }
 
-export function buildWebsocketOutbound(
+/**
+ * 地址型节点（WS / XHTTP）共用的 TLS 装配。
+ *
+ * 抽出来是为了让同一 (地址, 端口) 的两种传输永远给出同一套 sni / ECH / alpn / 证书校验判定；
+ * 分叉的后果是同一份订阅里 WS 节点与 XHTTP 节点各按一套规则走，行为无从对照。
+ * 随机抽取顺序（先 hostSniList 再 echServerName）必须保持不变，否则既有节点会漂移。
+ */
+function buildAddressNodeTls(
     protocol: string,
-    remark: string,
     address: string,
-    port: number,
-    path: string,
-    earlyData?: number,
-): VlessOutbound | TrojanOutbound | null {
+    port: number
+): { host: string; tls: Partial<TLS> } {
     const {
-        dict: { _VL_, _TR_ },
-        globalConfig: { userID, TrPass },
-        settings: { 
-            fingerprint, 
-            alpn, 
-            enableTFO, 
-            enableIPv6, 
-            enableECH, 
-            echServerName, 
-            hostSniList
-        }
+        settings: { fingerprint, alpn, enableECH, echServerName, hostSniList }
     } = globalThis;
 
-    // 与 handlers.ts 的 URI 侧判定对齐：任一地址的显式端口表里出现过该端口也视为 TLS，
-    // 否则同一节点会出现 URI 写 security=tls、JSON 无 tls 字段的自相矛盾组合。
-    // 判据（含 entryPortMap 的按调用求值）统一由 @utils 的 isTlsPort 维护。
     const isTLS = isTlsPort(port, address);
-    if (protocol === _TR_ && !isTLS) return null;
     const { host, sni, allowInsecure } = selectSniHost(address, pickRandomEch(hostSniList));
     // G13-C10：ECH 启用而 `echServerName` 为空时的名称回退，与 handlers.ts#buildConfig（URI 侧）
     // `${pickRandomEch(echServerName) || host}` 逐字一致——原先 Clash 侧空名单会把
@@ -89,16 +84,42 @@ export function buildWebsocketOutbound(
     // pickedEch 因此等价于 enableECH；这里仍写成 !pickedEch，以便与 Xray/sing-box 端
     // 「分片分支 ECH 关闭 → 放行 alpn」的修法保持同一语义，也不给 Clash 加无意义的分片门槛。
     const tls = isTLS ? buildTLS(
-        protocol, 
-        "tls", 
-        allowInsecure, 
-        sni, 
-        !!pickedEch, 
-        pickedEch, 
-        pickedEch ? undefined : (alpn || undefined), 
+        protocol,
+        "tls",
+        allowInsecure,
+        sni,
+        !!pickedEch,
+        pickedEch,
+        pickedEch ? undefined : (alpn || undefined),
         fingerprint
     ) : {};
-    
+
+    return { host, tls };
+}
+
+export function buildWebsocketOutbound(
+    protocol: string,
+    remark: string,
+    address: string,
+    port: number,
+    path: string,
+    earlyData?: number,
+): VlessOutbound | TrojanOutbound | null {
+    const {
+        dict: { _VL_, _TR_ },
+        globalConfig: { userID, TrPass },
+        settings: { enableTFO, enableIPv6 }
+    } = globalThis;
+
+    // 与 handlers.ts 的 URI 侧判定对齐：任一地址的显式端口表里出现过该端口也视为 TLS，
+    // 否则同一节点会出现 URI 写 security=tls、JSON 无 tls 字段的自相矛盾组合。
+    // 判据（含 entryPortMap 的按调用求值）统一由 @utils 的 isTlsPort 维护。
+    // Trojan 无 TLS 时不生成节点（明文 Trojan 无意义），且必须在抽 SNI / ECH 之前短路，
+    // 以保持既有节点的随机抽取顺序不变。
+    const isTLS = isTlsPort(port, address);
+    if (protocol === _TR_ && !isTLS) return null;
+    const { host, tls } = buildAddressNodeTls(protocol, address, port);
+
     // early-data 阈值由调用点从无放回池中抽取（见 pickEarlyData）：2048..2560（513 个取值），
     // 同一份订阅内任意两个节点的 ed 两两不同，消除「固定长度」这一常量特征（不做模块级缓存）。
     // 下限不再取更低：ed 是「首包长度阈值」，首包超过它会直接不启用 Early Data（丢 0-RTT）。
@@ -111,6 +132,50 @@ export function buildWebsocketOutbound(
 
     return buildOutbound<TrojanOutbound>(remark, protocol, address, port, enableIPv6, enableTFO, tls, transport, {
         "password": TrPass
+    });
+}
+
+/**
+ * XHTTP（HTTP POST / stream-one）出站，仅供 VLESS。
+ *
+ * 与 buildWebsocketOutbound 的差异：
+ * - 没有 early-data：`ed` 是 WebSocket 协议头的语义，XHTTP 下无意义，故不抽 usedEds；
+ * - transport 用 `network: xhttp` + `xhttp-opts`（mihomo 自 v1.19.22 起支持）：
+ *   更老版本的 mihomo 不认识该 network，会整份配置解析失败 —— 面板无法探测内核版本，
+ *   因此本节点只在用户显式打开 `xhttpConfigs` 时才会出现；
+ * - 填充参数与 raw URI / Xray JSON 同源（@utils#getXPaddingIdentifier + @cores/xhttp），
+ *   三端填出的头名与键名逐字一致。
+ */
+export function buildXhttpOutbound(
+    remark: string,
+    address: string,
+    port: number,
+    path: string
+): VlessOutbound {
+    const {
+        dict: { _VL_ },
+        globalConfig: { userID },
+        settings: { enableTFO, enableIPv6 }
+    } = globalThis;
+
+    const { host, tls } = buildAddressNodeTls(_VL_, address, port);
+    const { header, key } = getXPaddingIdentifier(userID);
+
+    return buildOutbound<VlessOutbound>(remark, _VL_, address, port, enableIPv6, enableTFO, tls, {
+        "network": "xhttp",
+        "xhttp-opts": {
+            "path": path,
+            "host": host,
+            "mode": XHTTP_MODE,
+            "x-padding-obfs-mode": true,
+            "x-padding-method": "tokenish",
+            "x-padding-placement": "queryInHeader",
+            "x-padding-header": header,
+            "x-padding-key": key
+        } satisfies XhttpOpts
+    }, {
+        "uuid": userID,
+        "packet-encoding": ""
     });
 }
 

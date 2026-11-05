@@ -64,12 +64,15 @@ function initiatePanel(proxySettings) {
     const {
         VLConfigs,
         TRConfigs,
+        xhttpConfigs,
         ports,
         xrayUdpNoises
     } = proxySettings;
 
     Object.assign(globalThis, {
-        activeProtocols: VLConfigs + TRConfigs,
+        // XHTTP 也计入「至少选一个」：它本身就是一种可独立使用的 VLESS 传输，
+        // 关掉 VLESS/Trojan 只留 XHTTP 仍是合法订阅（只出 VLESS-XHTTP 节点）。
+        activeProtocols: VLConfigs + TRConfigs + xhttpConfigs,
         activeTlsPorts: ports.filter(port => defaultHttpsPorts.includes(port)),
         xrayNoiseCount: xrayUdpNoises.length,
     });

@@ -812,6 +812,16 @@ export function pickRandomEch(echServerNames: string[]): string | undefined {
     return echServerNames[Math.floor(Math.random() * echServerNames.length)];
 }
 
+/**
+ * xPadding 抗指纹标识：从 UUID 派生隐蔽的头名/键名（对齐 cfnew 获取叉HTTP填充标识）。
+ * 订阅侧（raw URI / xray JSON 的 extra）与服务端（WS 入站、XHTTP 入站）必须用同一份派生规则，
+ * 因此单独收敛到这里（@unified 仍保留同名再导出，避免既有 import 失效）。
+ * 注意：服务端只用它识别/记录语义，**不回写**该头（回写会把 UUID 的 12 个 hex 字符泄露给未认证调用方）。
+ */
+export function getXPaddingIdentifier(uuid: string): { header: string; key: string } {
+    return { header: uuid.slice(1, 7), key: '_' + uuid.slice(25, 31) };
+}
+
 export function base64ToDecimal(base64: string | null | undefined): number[] {
     // 容错：空值/非法 base64 降级为 []（= 无 reserved 字节），绝不抛错。
     // reserved 缺失（上游字段变化 / 旧 KV 数据）时若抛错，会让整个 /sub/warp 订阅 500。

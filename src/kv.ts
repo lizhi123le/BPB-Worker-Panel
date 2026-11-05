@@ -68,6 +68,14 @@ export async function getDataset(
             (proxySettings as any).randomPath = DEFAULT_SETTINGS.randomPath;
         }
 
+        // 向后兼容：旧 KV 里没有「XHTTP 传输」开关（本次新增）时同样按出厂默认（false）补齐。
+        // 不补的后果不是「默认关闭」那么简单：面板 initiatePanel 用 `VL + TR + xhttp` 求和得到
+        // activeProtocols，undefined 会把结果变成 NaN —— 「至少选一个协议」的拦截随即可被绕过
+        // （`NaN === 0` 恒 false）。与 randomPath 一样只在内存里补，不写 KV。
+        if (proxySettings && typeof (proxySettings as any).xhttpConfigs !== 'boolean') {
+            (proxySettings as any).xhttpConfigs = DEFAULT_SETTINGS.xhttpConfigs;
+        }
+
         if (!warpAccounts) {
             // 无账号或形状不合法：交回 fetchWarpAccounts（其内部已有「上游失败 → 内置默认账号」的回退）
             warpAccounts = await fetchWarpAccounts(env);
@@ -231,6 +239,7 @@ export async function updateDataset(request: Request, env: Env): Promise<Setting
             ["bestVLTRInterval"],
             ["VLConfigs"],
             ["TRConfigs"],
+            ["xhttpConfigs"],
             ["ports"],
             ["fingerprint"],
             ["alpn"],

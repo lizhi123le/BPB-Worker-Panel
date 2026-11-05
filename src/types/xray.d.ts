@@ -1,6 +1,6 @@
 export type DnsHosts = Record<string, string[] | string>
 export type DomainStrategy = "UseIP" | "UseIPv4" | "UseIPv4v6";
-export type TransportType = "tcp" | "raw" | "ws" | "httpupgrade" | "grpc";
+export type TransportType = "tcp" | "raw" | "ws" | "httpupgrade" | "grpc" | "xhttp";
 export type Protocol =
     | "http"
     | "socks"
@@ -177,11 +177,25 @@ export interface GrpcSettings {
     serviceName?: string;
 }
 
+/**
+ * XHTTP（HTTP POST / stream-one）传输设置。
+ * 与 WsSettings 不同，这里没有 early-data 概念：ed 只对 ws 传输生效，
+ * 因此字段集合刻意保持最小，避免生成「看起来能用、实际被内核忽略」的参数。
+ */
+export interface XhttpSettings {
+    host?: string;
+    path?: string;
+    mode?: string;
+    // xPadding 等内核扩展参数原样下发，xray 不认识的键会自行忽略
+    extra?: Record<string, unknown>;
+}
+
 export type Transport =
     | RawSettings
     | WsSettings
     | HttpupgradeSettings
-    | GrpcSettings;
+    | GrpcSettings
+    | XhttpSettings;
 
 export interface HappyEyeballs {
     tryDelayMs: number;
@@ -229,6 +243,7 @@ export interface StreamSettings {
     wsSettings?: WsSettings;
     httpupgradeSettings?: HttpupgradeSettings;
     grpcSettings?: GrpcSettings;
+    xhttpSettings?: XhttpSettings;
     sockopt?: Sockopt;
     finalmask?: {
         tcp?: TCPMask[];

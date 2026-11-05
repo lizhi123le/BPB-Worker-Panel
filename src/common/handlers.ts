@@ -6,158 +6,25 @@ import { getClNormalConfig, getClWarpConfig } from "@clash/configs";
 import { getSbCustomConfig, getSbWarpConfig } from "@sing-box/configs";
 import { getXrCustomConfigs, getXrWarpConfigs } from "@xray/configs";
 import { fetchWarpAccounts } from "@warp";
-import { UnifiedWSHandler, getXPaddingIdentifier } from "@unified";
+import { UnifiedWSHandler } from "@unified";
+import { XHTTP_MODE, buildXhttpExtra, buildXhttpNodePath } from "@cores/xhttp";
 import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, htmlResponse, HttpStatus, isKvBound, respond, safeErrorMessage } from "@common";
-import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, DEFAULT_PROXY_IPS, generateRemark, generateWsPath, getConfigItems, isTlsPort, OFFICIAL_DIRECT_IPS, parseHostPort, parseProxyIPWithRegion, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectProxyIPByRegion, selectSniHost } from "@utils";
+import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, generateRemark, generateWsPath, getConfigItems, isTlsPort, parseHostPort, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
+import { prepareWsRuntimeConfig } from "./ws-runtime";
+
 /**
- * 归一化官方直连 IP 条目：裸 IP（无端口）或未带 @CF 标签的条目，
- * 统一补齐 :443 端口，使其与内置池语义（始终拨 443）完全兼容。
- * 保留 @region 标签与 #comment 后缀。
+ * WS 升级入口。
  *
- * C-06/C-07：畸形条目（host 为空、端口越界）改为**返回空串丢弃**（调用方 filter），
- * 不再「修」成 `:443`、也不再让 `1.1.1.1:70000` 原样透传；
- * IPv6 方括号归一提到端口分支之前，带端口的裸 IPv6 同样会补上括号。
+ * 连接级配置（反代池 / 官方直连池 / 地区匹配 / 出站模式）已下沉到 @ws-runtime 的
+ * prepareWsRuntimeConfig —— XHTTP 入站走同一套出站策略，必须共用同一份推导，
+ * 否则两条入站会给出不一致的出口行为（此处只是调用点，语义与搬运前逐字一致）。
  */
-function normalizeOfficialIP(entry: string): string {
-    const hashIdx = entry.indexOf('#');
-    const addressPart = (hashIdx !== -1 ? entry.slice(0, hashIdx) : entry).trim();
-    const comment = hashIdx !== -1 ? entry.slice(hashIdx) : '';
-    if (!addressPart) return '';
-
-    const atIdx = addressPart.lastIndexOf('@');
-    const clean = atIdx !== -1 ? addressPart.slice(0, atIdx).trim() : addressPart;
-    const regionSuffix = atIdx !== -1 ? addressPart.slice(atIdx) : '';
-
-    const { host, port } = parseHostPort(clean, true);
-    if (!host) return ''; // 畸形条目（如裸 `:443`）：host 为空即丢弃
-
-    // IPv6 安全网：任何路径下若 host 含 ':' 但未加方括号，则补上。
-    // parseHostPort(brackets=true) 已给 IPv6 补了括号，故先剥掉已有括号再判定，
-    // 否则 `2606:4700::1111:8443` 这种「原文未加括号」的条目会漏过（旧代码 `if (port) return entry` 正是如此）。
-    const bareHost = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
-    const normalizedHost = bareHost.includes(':') ? `[${bareHost}]` : bareHost;
-
-    // parseHostPort 用 0 表示「无端口」。显式 `:0` 属于端口越界，但 IPv6 末段（如 `2001:db8::0`）不是端口。
-    if (port === 0) {
-        if (!bareHost.includes(':') && /:0$/.test(clean)) return '';
-        return `${normalizedHost}:443${regionSuffix}${comment}`;
-    }
-
-    // C-06：端口必须落在 1–65535，越界（如 `1.1.1.1:70000`）丢弃而不是原样透传
-    if (!Number.isInteger(port) || port < 1 || port > 65535) return '';
-
-    // 原文已是规范形式则逐字返回，不改写用户的空白/大小写
-    return clean === `${normalizedHost}:${port}` ? entry : `${normalizedHost}:${port}${regionSuffix}${comment}`;
-}
-
 export async function handleWebsocket(request: Request, env: Env): Promise<Response> {
     // 对齐 cfnew：路径不包含协议信息，协议由首包内容自动识别
     // 客户端统一连接同一个 WS 端点，服务端根据首包判断 VLESS 或 Trojan
-
-    const reqUrl = new URL(request.url);
-    const queryWk = (reqUrl.searchParams.get('wk') || '').toUpperCase();
-    const queryRm = reqUrl.searchParams.get('rm');
-    const queryQj = (reqUrl.searchParams.get('qj') || '').toLowerCase();
-
-    const {
-        regionMatch: kvRegionMatch,
-        wkRegion: kvWkRegion,
-        proxyIPMode,
-        proxyOnly: kvProxyOnly,
-        proxyDegrade: kvProxyDegrade
-    } = globalThis.settings;
-    const rawProxyIPs = globalThis.settings.proxyIPs || [];
-    const proxyIPs = await resolveUrlEntries(rawProxyIPs, env); // 连接时解析（带 KV 缓存）
-
-    // 1. wkRegion：URL query wk > KV wkRegion > 空（空 = 官方直连 CF，对齐 cfnew v3.0）
-    const effectiveWkRegion = queryWk || kvWkRegion || '';
-
-    // 2. regionMatch：URL query rm(no=关闭) > KV regionMatch > 默认开启
-    const effectiveRegionMatch = queryRm !== null
-        ? queryRm.toLowerCase() !== 'no'
-        : (kvRegionMatch ?? true);
-
-    // 3. proxyMode：URL query qj(only=仅走代理/no=直连目标) > KV proxyOnly/proxyDegrade > 默认两者皆 false
-    const effectiveProxyOnly = queryQj === 'only'
-        ? true
-        : (queryQj === 'no' ? false : (kvProxyOnly ?? false));
-    const effectiveProxyDegrade = queryQj === 'only'
-        ? false
-        : (queryQj === 'no' ? true : (kvProxyDegrade ?? false));
-
-    // 3. proxyIPs：KV proxyIPs > envProxyIPs > DEFAULT_PROXY_IPS（对齐 cfnew 备用地址列表）
-    const envFallbackIPs = globalThis.wsConfig?.envProxyIPs
-        ? [globalThis.wsConfig.envProxyIPs]
-        : [];
-    // 自定义代理 = 面板手动设置的 proxyIPs 非空，或配置了 env PROXY_IP（envFallbackIPs 非空）。
-    // 写入 wsConfig.hasCustomProxyIPs：出站模式用它判断「有没有反代池可走」，
-    // 与上方 effectivePanelIPs 的取值链（proxyIPs > envFallbackIPs > DEFAULT_PROXY_IPS）保持一致。
-    // 注意：内置 DEFAULT_PROXY_IPS 属于公共备用中继，不计入 hasCustomProxyIPs。
-    const hasCustomProxyIPs = proxyIPs.length > 0 || envFallbackIPs.length > 0;
-    const effectivePanelIPs = proxyIPs.length > 0
-        ? proxyIPs
-        : (envFallbackIPs.length > 0 ? envFallbackIPs : DEFAULT_PROXY_IPS);
-    // 用户显式配置的反代池实体（不含内置 DEFAULT_PROXY_IPS，也不含下方 CF 模式替换的官方直连池）。
-    // CF 模式会把 panelIPs 整份换成官方池，而「仅走代理」要与指定地区保持同一套逻辑
-    // （只要配了反代池就能用），因此单列一份供它拨号。
-    const customProxyPool = hasCustomProxyIPs ? effectivePanelIPs : [];
-
-    // 官方直连 IP 池（面板 officialIPs，未配置则内置 10 个）：只归一化这一次，
-    // 「CF 模式下的 panelIPs」与「出站模式的 CF 内置 IP 池兜底层」共用同一份结果，
-    // 避免两处各算一遍导致内容/顺序不一致。
-    const officialIPsRaw = globalThis.settings.officialIPs?.length
-        ? globalThis.settings.officialIPs
-        : OFFICIAL_DIRECT_IPS;
-    // C-06：非法条目在归一化阶段丢弃；自定义池若整池非法则回退内置官方池，
-    // 避免拨号池为空导致后续选 IP / 拨号直接失败（旧行为是把畸形项当合法 IP 用）。
-    const normalizedOfficial = officialIPsRaw.map(normalizeOfficialIP).filter(Boolean);
-    if (normalizedOfficial.length === 0) {
-        console.warn('[officialIPs] 自定义官方直连条目全部非法，回退内置官方直连池');
-    }
-    const officialPool = normalizedOfficial.length > 0
-        ? normalizedOfficial
-        : OFFICIAL_DIRECT_IPS.map(normalizeOfficialIP).filter(Boolean);
-
-    globalThis.wsConfig = {
-        ...globalThis.wsConfig,
-        proxyMode: proxyIPMode,
-        panelIPs: effectivePanelIPs,
-        customProxyPool,
-        officialPool,
-        regionMatch: effectiveRegionMatch,
-        wkRegion: effectiveWkRegion,
-        hasCustomProxyIPs,
-        proxyOnly: effectiveProxyOnly,
-        proxyDegrade: effectiveProxyDegrade
-    };
-
-    // Detect worker region: manual wkRegion > 官方直连（CF，对齐 cfnew v3.0）
-    // wk 为空时不再用 cf.country 自动检测，而是走官方直连（内置 10 个官方 Cloudflare IP）
-    // 自定义 proxyIP（面板手动设置）同样启用自动地区检测：列表带 @ 后缀码时
-    // 按访客地区匹配对应域名（对齐用户需求：自动地区匹配/指定地区按 @ 后缀码匹配）
-    globalThis.wsConfig.workerRegion = effectiveWkRegion || 'CF';
-
-    // 官方直连（对齐 cfnew v3.0）：workerRegion = 'CF'（wk 留空）时，
-    // 出口语义 = 官方 Cloudflare IP（内置 10 个，或面板自定义 officialIPs），
-    // 与自定义反代 proxyIPs 无关 —— 反代仅在显式指定地区（wk 非空）时生效。
-    if (globalThis.wsConfig.workerRegion === 'CF') {
-        globalThis.wsConfig.panelIPs = officialPool;
-    }
-
-    // 对齐 cfnew：连接时按 workerRegion 动态选择 Proxy IP（服务端选择，不暴露给客户端）
-    // 仅当列表含 @ 地区标签时收敛到匹配域名（纯 IP/IP:port 列表不收敛，全部参与 IP 池轮询）
-    // CF 为 anycast，无地区选择概念：跳过收敛，避免 countryToRegion('CF')→'SG' 把 10 IP 池塌缩成 1 个
-    if (effectiveRegionMatch && globalThis.wsConfig.workerRegion !== 'CF' && effectivePanelIPs.length > 0) {
-        const hasRegionTags = effectivePanelIPs.some(p => parseProxyIPWithRegion(p).region);
-        if (hasRegionTags) {
-            const selected = selectProxyIPByRegion(effectivePanelIPs, globalThis.wsConfig.workerRegion);
-            if (selected) {
-                globalThis.wsConfig.panelIPs = [selected];
-            }
-        }
-    }
+    await prepareWsRuntimeConfig(request, env);
 
     // 使用统一处理器，协议由首包内容自动识别
     return await UnifiedWSHandler(request);
@@ -809,6 +676,7 @@ export async function getURLConfigs() {
             alpn,
             VLConfigs,
             TRConfigs,
+            xhttpConfigs,
             enableECH,
             echServerName,
             hostSniList,
@@ -830,23 +698,22 @@ export async function getURLConfigs() {
     // 已占用 early-data 阈值池：同一份订阅内各节点 ed 两两不同（无放回抽取），作用域与 usedPaths 一致（一次请求一个集合）
     const usedEds = new Set<number>();
 
-    const buildConfig = (protocol: string, addr: string, port: number, host: string, sni: string, remark: string, allowInsecure: boolean) => {
+    // XHTTP 节点只对 Xray 系客户端有意义（见节点生成处注释）；?app=sing-box 的 raw 订阅不混入
+    const isXrayFamilyClient = globalThis.httpConfig.client !== 'sing-box';
+
+    const buildConfig = (protocol: string, addr: string, port: number, host: string, sni: string, remark: string, allowInsecure: boolean, transport: 'ws' | 'xhttp' = 'ws') => {
         const isTLS = isTlsPort(port, addr, entryPortMap);
         const security = isTLS ? 'tls' : 'none';
         const config = new URL(`${protocol}://config`);
+        const isXhttp = transport === 'xhttp';
 
         if (protocol === _VL_) {
             config.username = userID;
             config.searchParams.append('encryption', 'none');
-            // 对齐 cfnew 52143dccb：xPadding 抗指纹 —— 订阅链接带 extra 约定
-            const { header: xPaddingHeader, key: xPaddingKey } = getXPaddingIdentifier(userID);
-            config.searchParams.append('extra', JSON.stringify({
-                xPaddingObfsMode: true,
-                xPaddingMethod: 'tokenish',
-                xPaddingPlacement: 'queryInHeader',
-                xPaddingHeader,
-                xPaddingKey
-            }));
+            // 对齐 cfnew 52143dccb：xPadding 抗指纹 —— 订阅链接带 extra 约定。
+            // 对象内容由 @cores/xhttp 统一维护：raw URI 与 xray JSON 的 extra 必须逐字一致，
+            // 否则同一份订阅里两种客户端的填充头名/键名会漂移。
+            config.searchParams.append('extra', JSON.stringify(buildXhttpExtra(userID)));
         } else {
             config.username = TrPass;
         }
@@ -854,18 +721,25 @@ export async function getURLConfigs() {
         config.hostname = parseHostPort(addr, true).host;
         config.port = port.toString();
         config.searchParams.append('host', host);
-        config.searchParams.append('type', 'ws');
+        config.searchParams.append('type', transport);
         config.searchParams.append('security', security);
         // H11：isTLS=false 的端口会生成 security=none 的明文节点（UUID/口令随首帧明文出网），
         // 在节点备注上显式告警；不改动生成语义（是否使用由用户决定）。
         config.hash = isTLS ? remark : `${remark} ⚠️明文(无TLS)`;
 
-        // 对齐 cfnew：ed 从共享的 usedEds 池无放回抽取（2048..2560 闭区间，513 个取值），
-        // 保证同一份订阅内任意两个节点的 ed 两两不同（独立随机会有明显重复率），同时仍消除固定长度指纹。
-        // 下限不再取更低：ed 是「首包长度阈值」而非缓冲区大小，首包超过它就直接不启用 Early Data（丢 0-RTT），
-        // 而本项目自身的 0xED7F 首包填充有 64..2048 字节，低阈值会让连接大概率退化为非 0-RTT。
-        const ed = pickEarlyData(usedEds);
-        config.searchParams.append('path', `${generateWsPath(usedPaths)}?ed=${ed}`);
+        if (isXhttp) {
+            // XHTTP 没有 WS 的 early-data 语义：ed 只对 ws 传输有效，写进 xhttp 节点是无意义参数，
+            // 因此这里不抽 ed（也就不占用 usedEds 池，WS 节点的 ed 分配与镜像行为保持不变）。
+            config.searchParams.append('path', buildXhttpNodePath(globalThis.settings.randomPath, usedPaths));
+            config.searchParams.append('mode', XHTTP_MODE);
+        } else {
+            // 对齐 cfnew：ed 从共享的 usedEds 池无放回抽取（2048..2560 闭区间，513 个取值），
+            // 保证同一份订阅内任意两个节点的 ed 两两不同（独立随机会有明显重复率），同时仍消除固定长度指纹。
+            // 下限不再取更低：ed 是「首包长度阈值」而非缓冲区大小，首包超过它就直接不启用 Early Data（丢 0-RTT），
+            // 而本项目自身的 0xED7F 首包填充有 64..2048 字节，低阈值会让连接大概率退化为非 0-RTT。
+            const ed = pickEarlyData(usedEds);
+            config.searchParams.append('path', `${generateWsPath(usedPaths)}?ed=${ed}`);
+        }
 
         if (isTLS) {
             config.searchParams.append('sni', sni);
@@ -905,16 +779,34 @@ export async function getURLConfigs() {
             const { host, sni, allowInsecure } = selectSniHost(addr, pickRandomEch(hostSniList));
             if ((port === upstreamPort) !== (addr === upstreamServer)) continue;
 
+            // 同一 (地址, 端口) 的节点备注重用同一个基准名：XHTTP 节点是 WS 节点的并列变体，
+            // 复用基准名 + 后缀不额外消耗 generateRemark 的计数，既有订阅的节点编号（_01/_02…）因此逐字不变。
+            let remarkBase: string | undefined;
+
             if (VLConfigs) {
-                const remark = generateRemark(port, addr, _VL_, false, false);
-                const vlConfig = buildConfig(atob('dmxlc3M='), addr, port, host, sni, remark, allowInsecure);
+                remarkBase = generateRemark(port, addr, _VL_, false, false);
+                const vlConfig = buildConfig(atob('dmxlc3M='), addr, port, host, sni, remarkBase, allowInsecure);
                 nodeConfs += `${vlConfig}\n`;
             }
 
             if (TRConfigs) {
                 const remark = generateRemark(port, addr, _TR_, false, false);
+                remarkBase ??= remark;
                 const trConfig = buildConfig(atob('dHJvamFu'), addr, port, host, sni, remark, allowInsecure);
                 nodeConfs += `${trConfig}\n`;
+            }
+
+            // XHTTP 节点：与 VLESS/Trojan 开关并列的传输开关，生成的是 VLESS-XHTTP 节点（参考 cfnew 的 ex 开关）。
+            // 与参考实现的差异：
+            //   · 不生成链式（outProxy 链仍只作用于 WS 节点），避免链式语义与传输混搭；
+            //   · 只发给 Xray 系客户端：sing-box 内核原生没有 xhttp 传输，
+            //     把 type=xhttp 塞进 ?app=sing-box 的 raw 订阅只会让它在导入时丢节点。
+            //     注意这是「raw 链接」的取舍 —— sing-box 的 normal 订阅里 XHTTP 节点照样存在，
+            //     只是以等价的 ws 传输下发（sing-box/configs.ts 的映射，对齐 cfnew-panel 的做法）。
+            if (xhttpConfigs && isXrayFamilyClient) {
+                const base = remarkBase ?? generateRemark(port, addr, _VL_, false, false);
+                const xhttpConfig = buildConfig(atob('dmxlc3M='), addr, port, host, sni, `${base} XHTTP`, allowInsecure, 'xhttp');
+                nodeConfs += `${xhttpConfig}\n`;
             }
         }
     }

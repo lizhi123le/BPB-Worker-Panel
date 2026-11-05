@@ -1,7 +1,10 @@
 import { getDataset } from '@kv';
 import { buildDNS, retargetDnsDetour } from './dns';
 import { buildRoutingRules, buildBaseRoutingRules, buildRuleProviders, buildBlockRules, buildBypassRules } from './routing';
-import { buildChainOutbound, buildCleanProxyOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound, getChainExplicitEarlyData, redrawChainEarlyData } from './outbounds';
+import { buildChainOutbound, buildCleanProxyOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound, buildXhttpOutbound, getChainExplicitEarlyData, redrawChainEarlyData } from './outbounds';
+
+// XHTTP 节点路径与 raw URI / Xray 侧共用同一份实现（随机路径规则只允许有一个来源）
+import { buildXhttpNodePath } from '@cores/xhttp';
 import type { WireguardOutbound, Config, Outbound } from '#types/clash';
 import { buildEntryPortMap, getConfigItems, cleanProxyEntries, generateRemark, generateWsPath, getProtocols, pickEarlyData, resetRemarkCounter, prependUpstreamItem, portsForHost, appendCleanProxyNodes } from '@utils';
 import { configJsonResponse } from '@common';
@@ -79,7 +82,14 @@ async function buildConfig(
 
 export async function getClNormalConfig(): Promise<Response> {
     resetRemarkCounter();
-    const { outProxy, ports: cachedPorts, upstreamParams: { upstreamServer, upstreamPort } } = globalThis.settings;
+    const {
+        outProxy,
+        ports: cachedPorts,
+        randomPath,
+        xhttpConfigs,
+        upstreamParams: { upstreamServer, upstreamPort }
+    } = globalThis.settings;
+    const { _VL_ } = globalThis.dict;
     // C-01 同型缺陷：解构得到的是 globalThis.settings.ports 的引用，而它与 KV 缓存（kv-cache）
     // 是同一数组对象（init.ts 用 Object.assign 浅拷贝、kv-cache 返回内部引用），原地 unshift 会在
     // 同一 isolate 内每生成一次配置就累积一个重复端口（[443] → [1080,443] → [1080,1080,443]），
@@ -102,8 +112,15 @@ export async function getClNormalConfig(): Promise<Response> {
 
     const proxyTags: string[] = [];
     const chainTags: string[] = [];
+    // XHTTP 节点单独记账：进 ✅ Selector（可选）与 ACL 模板分组，但**不进** proxyTags，
+    // 即不参与「最佳延迟」url-test —— 两种传输混进同一个延迟采样组会改变既有 WS 节点组的切换行为。
+    const xhttpTags: string[] = [];
     const outbounds: Outbound[] = [];
     const selectorTags = ["最佳延迟 🚀"].concatIf(isChain, "🔗 最佳延迟 🚀");
+    // 每个 (地址, 端口) 的 VLESS 节点备注：XHTTP 节点复用同一个基准名（与 raw URI 侧
+    // `${wsRemark} XHTTP` 一致），因此不额外消耗 generateRemark 的编号，既有节点输出逐字不变。
+    const vlRemarks = new Map<string, string>();
+    const remarkKey = (host: string, port: number) => `${host}\u0000${port}`;
 
     // 按 cleanIPs 的输入顺序遍历：普通地址生成 VLESS/Trojan 节点，代理条目生成独立 socks/http(s) 节点
     //（只做节点：不设 dialer-proxy、不进链式分支）
@@ -121,6 +138,8 @@ export async function getClNormalConfig(): Promise<Response> {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
                 const tag = generateRemark(port, host, protocol, false, false);
+                // 记下 VLESS 的备注供第二趟 XHTTP 节点复用（协议可能只有 Trojan，故按协议判定）
+                if (protocol === _VL_) vlRemarks.set(remarkKey(host, port), tag);
                 const outbound = buildWebsocketOutbound(protocol, tag, host, port, generateWsPath(usedPaths), pickEarlyData(usedEds));
 
                 if (outbound) {
@@ -146,6 +165,34 @@ export async function getClNormalConfig(): Promise<Response> {
         }
     }
 
+    // XHTTP 节点（可选）：第二趟遍历，理由与 Xray 侧一致 —— 放在所有 WS/链式节点之后，
+    // 且备注复用 vlRemarks，因此不会移动既有节点的编号。
+    // 取舍：只承载 VLESS（worker 入站无 Trojan 分支）、不生成链式（outProxy 链只作用于 WS 节点）、
+    // 不进 proxyTags（不参与「最佳延迟」url-test）。
+    if (xhttpConfigs === true) {
+        for (const item of items) {
+            // 代理条目有自己的协议与出站，不派生 XHTTP 变体
+            if (item.kind !== 'address') continue;
+
+            const host = item.value;
+            const addrPorts = portsForHost(entryPortMap, host, ports);
+
+            for (const port of addrPorts) {
+                // 与 WS 节点同一条上游代理排除规则
+                if ((port === upstreamPort) !== (host === upstreamServer)) continue;
+
+                const baseTag = vlRemarks.get(remarkKey(host, port))
+                    ?? generateRemark(port, host, _VL_, false, false);
+                const tag = `${baseTag} XHTTP`;
+                // 与 WS 节点共用 usedPaths：同一次生成内两种传输的路径互不相同
+                const outbound = buildXhttpOutbound(tag, host, port, buildXhttpNodePath(randomPath, usedPaths));
+                outbounds.push(outbound);
+                xhttpTags.push(tag);
+                selectorTags.push(tag);
+            }
+        }
+    }
+
     const config = await buildConfig(
         outbounds,
         selectorTags,
@@ -167,7 +214,9 @@ export async function getClNormalConfig(): Promise<Response> {
             // 用户只看到「开关已启用却仍是内置分组」。故退回内置地址再试一次；两次都取不到才保持内置分组。
             const acl = await loadAclTemplateWithFallback(
                 aclUrl,
-                proxyTags,
+                // XHTTP 节点同样交给模板分组：它们不在 proxyTags 里（不参与内置 url-test），
+                // 但必须出现在模板生成的节点分组中，否则 ACL 接管后这些节点在 UI 上不可选。
+                [...proxyTags, ...xhttpTags],
                 buildAclClash,
                 result => result.groups.length === 0 && result.rules.length === 0
             );

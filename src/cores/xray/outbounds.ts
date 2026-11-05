@@ -9,6 +9,10 @@ import {
     type CleanProxyEntry
 } from '@utils';
 
+// XHTTP 的路径 / xPadding 约定与 raw URI（@common/handlers）共用同一份实现，
+// 避免两种订阅输出对同一节点给出不同的 mode / extra。
+import { XHTTP_MODE, buildXhttpExtra } from '@cores/xhttp';
+
 import {
     Outbound,
     StreamSettings,
@@ -21,6 +25,7 @@ import {
     WsSettings,
     HttpupgradeSettings,
     GrpcSettings,
+    XhttpSettings,
     HttpSocksSettings,
     ShadowsocksSettings,
     VmessSettings,
@@ -82,6 +87,59 @@ export function buildFreedomOutbound(
     } satisfies Outbound;
 }
 
+/**
+ * 地址型传输节点（WS / XHTTP）共用的 TLS 上下文。
+ *
+ * 抽成一处是为了让两种传输**永远**共用同一套 SNI / ECH / alpn / allowInsecure 判定：
+ * 它们是「同一个服务器地址的两条传输」，一旦判定分叉，同一订阅里就会出现
+ * 一条 URI 写 tls+ech、另一条 JSON 写 none 的自相矛盾节点。
+ */
+interface NodeTlsContext {
+    /** selectSniHost 给出的 Host 头值（同时用作 wsSettings / xhttpSettings 的 host） */
+    host: string;
+    /** 该 (地址, 端口) 是否按 TLS 处理 */
+    isTLS: boolean;
+    tlsSettings?: TlsSettings & { allowInsecure: boolean };
+}
+
+function buildNodeTlsContext(address: string, port: number, isFragment: boolean): NodeTlsContext {
+    const {
+        settings: {
+            fingerprint,
+            alpn,
+            enableECH,
+            echServerName,
+            hostSniList
+        }
+    } = globalThis;
+
+    // 与 handlers.ts#buildConfig（URI 侧）的判定逐字一致：显式端口表里出现过该端口即按 TLS 处理，
+    // 否则同一节点会出现 URI 写 security=tls、JSON 写 security=none 的自相矛盾配置。
+    // 判据（含 entryPortMap 的按调用求值）统一由 @utils 的 isTlsPort 维护。
+    const isTLS = isTlsPort(port, address);
+    // 随机抽取顺序（先 hostSniList 再 echServerName）必须保持不变：它决定同一份订阅里
+    // SNI 与 ECH 名的配对，改变顺序会让既有节点的输出漂移。
+    const { host, sni, allowInsecure } = selectSniHost(address, pickRandomEch(hostSniList));
+    // G13-C10：echServerName 名单为空时回退到该节点的 host，与 handlers.ts#buildConfig（URI 侧）的
+    // `pickRandomEch(echServerName) || host` 逐字一致，避免同一节点出现「URI 有 ech、JSON 无 ECH」的分歧。
+    const pickedEch = enableECH && !isFragment ? (pickRandomEch(echServerName) || host) : undefined;
+
+    return {
+        host,
+        isTLS,
+        tlsSettings: isTLS ? buildTlsSettings(
+            sni,
+            fingerprint,
+            allowInsecure,
+            !!pickedEch,
+            pickedEch,
+            // G13-C7：仅当本节点真的启用 ECH（pickedEch 有值）时才抑制 alpn；分片节点本就不启用 ECH
+            // （pickedEch 为 undefined），必须放行 alpn，否则该节点既无 ECH 也无 alpn。
+            pickedEch ? undefined : (alpn || undefined),
+        ) : undefined
+    };
+}
+
 export function buildWebsocketOutbound(
     tag: string,
     protocol: string,
@@ -94,36 +152,12 @@ export function buildWebsocketOutbound(
     fragInterval?: string
 ): Outbound {
     const {
-        settings: {
-            fingerprint,
-            alpn,
-            enableTFO,
-            enableECH,
-            echServerName,
-            hostSniList
-        },
+        settings: { enableTFO },
         globalConfig: { userID, TrPass },
         dict: { _VL_ }
     } = globalThis;
 
-    // 与 handlers.ts#buildConfig（URI 侧）的判定逐字一致：显式端口表里出现过该端口即按 TLS 处理，
-    // 否则同一节点会出现 URI 写 security=tls、JSON 写 security=none 的自相矛盾配置。
-    // 判据（含 entryPortMap 的按调用求值）统一由 @utils 的 isTlsPort 维护。
-    const isTLS = isTlsPort(port, address);
-    const { host, sni, allowInsecure } = selectSniHost(address, pickRandomEch(hostSniList));
-    // G13-C10：echServerName 名单为空时回退到该节点的 host，与 handlers.ts#buildConfig（URI 侧）的
-    // `pickRandomEch(echServerName) || host` 逐字一致，避免同一节点出现「URI 有 ech、JSON 无 ECH」的分歧。
-    const pickedEch = enableECH && !isFragment ? (pickRandomEch(echServerName) || host) : undefined;
-    const tlsSettings = isTLS ? buildTlsSettings(
-        sni,
-        fingerprint,
-        allowInsecure,
-        !!pickedEch,
-        pickedEch,
-        // G13-C7：仅当本节点真的启用 ECH（pickedEch 有值）时才抑制 alpn；分片节点本就不启用 ECH
-        // （pickedEch 为 undefined），必须放行 alpn，否则该节点既无 ECH 也无 alpn。
-        pickedEch ? undefined : (alpn || undefined),
-    ) : undefined;
+    const { host, isTLS, tlsSettings } = buildNodeTlsContext(address, port, isFragment);
 
     const streamSettings: StreamSettings = {
         network: "ws",
@@ -155,6 +189,62 @@ export function buildWebsocketOutbound(
             address,
             port,
             password: TrPass
+        }]
+    }, streamSettings);
+}
+
+/**
+ * XHTTP（HTTP POST / stream-one）出站。
+ *
+ * 只承载 VLESS：worker 的 XHTTP 入站按首包直接当 VLESS 处理，没有 Trojan 分支
+ * （与参考实现 cfnew 一致），给 Trojan 生成 type=xhttp 的节点只会连不上。
+ *
+ * 与 buildWebsocketOutbound 的差异：
+ * - 没有 early-data：`ed` 是 WebSocket 协议头的语义，XHTTP 下无意义，故不抽 usedEds；
+ * - 没有 finalmask：TLS 分片只作用于「客户端到目标的 TLS 握手」，XHTTP 走的是 HTTP 层，
+ *   两者叠加没有意义，分片订阅也不会生成 XHTTP 节点；
+ * - 路径与填充参数来自 @cores/xhttp，与 raw URI 共用同一份约定。
+ */
+export function buildXhttpOutbound(
+    tag: string,
+    address: string,
+    port: number,
+    path: string
+): Outbound {
+    const {
+        settings: { enableTFO },
+        globalConfig: { userID },
+        dict: { _VL_ }
+    } = globalThis;
+
+    // isFragment 恒 false：XHTTP 只出现在非分片订阅（分片节点与传输无关），
+    // 因此这里允许启用 ECH，与同地址的 WS 节点保持一致。
+    const { host, isTLS, tlsSettings } = buildNodeTlsContext(address, port, false);
+
+    const streamSettings: StreamSettings = {
+        network: "xhttp",
+        xhttpSettings: {
+            host,
+            path,
+            mode: XHTTP_MODE,
+            // 与 raw URI 的 extra 参数同源，保证两类客户端的填充头名 / 键名逐字一致
+            extra: buildXhttpExtra(userID)
+        } satisfies XhttpSettings,
+        security: isTLS ? "tls" : "none",
+        tlsSettings,
+        sockopt: buildSockopt(true, enableTFO, "UseIP")
+    };
+
+    return buildOutbound<VlessSettings>(_VL_, tag, false, {
+        vnext: [{
+            address,
+            port,
+            users: [
+                {
+                    id: userID,
+                    encryption: "none"
+                }
+            ]
         }]
     }, streamSettings);
 }

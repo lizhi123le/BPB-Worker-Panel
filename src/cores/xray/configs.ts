@@ -7,9 +7,13 @@ import {
     buildChainOutbound,
     buildCleanProxyOutbound,
     buildWebsocketOutbound,
+    buildXhttpOutbound,
     buildWarpOutbound,
     buildFreedomOutbound
 } from './outbounds';
+
+// XHTTP 节点路径与 raw URI 侧共用同一份实现（随机路径规则只允许有一个来源）
+import { buildXhttpNodePath } from '@cores/xhttp';
 
 import {
     buildEntryPortMap,
@@ -275,7 +279,14 @@ async function addWorkerlessConfigs(configs: Config[]) {
 
 export async function getXrCustomConfigs(isFragment: boolean): Promise<Response> {
     resetRemarkCounter();
-    const { outProxy, ports, upstreamParams: { upstreamServer, upstreamPort } } = globalThis.settings;
+    const {
+        outProxy,
+        ports,
+        randomPath,
+        xhttpConfigs,
+        upstreamParams: { upstreamServer, upstreamPort }
+    } = globalThis.settings;
+    const { _VL_ } = globalThis.dict;
     // 已占用路径池词集合（仅「节点随机路径」开启时生效）：每个 ws 出站各抽一个互不相同的伪装路径
     const usedPaths = new Set<string>();
     // 已占用 early-data 阈值集合：与 usedPaths 同粒度、同批次共享，保证任意两个节点的 ed 两两不同
@@ -297,6 +308,10 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
         .filter((item): item is { kind: 'address'; value: string } => item.kind === 'address')
         .map(item => item.value);
     let index = 1;
+    // 每个 (地址, 端口) 的 VLESS 节点备注：XHTTP 节点复用同一个基准名（与 raw URI 侧
+    // `${wsRemark} XHTTP` 的命名逐字一致），这样同一次生成不会额外消耗 generateRemark 的编号。
+    const vlRemarks = new Map<string, string>();
+    const remarkKey = (host: string, port: number) => `${host}\u0000${port}`;
 
     // 按 cleanIPs 的输入顺序遍历：普通地址生成 VLESS/Trojan 节点，代理条目生成该协议自己的独立节点
     for (const item of items) {
@@ -320,6 +335,8 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
                 proxies.push(proxy);
 
                 const remark = generateRemark(port, host, protocol, isFragment, false);
+                // 记下 VLESS 的备注供第二趟 XHTTP 节点复用（协议可能只有 Trojan，故按协议判定）
+                if (protocol === _VL_) vlRemarks.set(remarkKey(host, port), remark);
                 const config = await buildConfig(remark, [outbound], false, false, false, false, false, [host]);
                 configs.push(config);
 
@@ -333,6 +350,51 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
                 }
 
                 index++;
+            }
+        }
+    }
+
+    // XHTTP 节点（可选）：单独走第二趟遍历，而不是塞进上面的端口循环里。
+    // 原因是 generateRemark 的计数是全局递增的：若在上面的循环内插队生成，会把后续
+    // WS / 链式节点的备注编号整体顶后一位，违反「既有节点输出逐字不变」的约束。
+    // 这里做成「遍历在最后 + 备注复用上表 vlRemarks」，因此在 VLESS 正常开启时
+    // 根本不发号，既有节点的备注与编号逐字不变；只有 VLESS 被关闭的兜底分支才会追加编号。
+    //
+    // 取舍说明：
+    // - 只承载 VLESS：worker 的 XHTTP 入站没有 Trojan 分支，给 Trojan 发 type=xhttp 连不上；
+    // - 不生成链式（outProxy 链仍只作用于 WS 节点），避免传输语义与链路语义混搭；
+    // - 不进 proxies 数组，因此不参与「最佳延迟」leastPing 组：两种传输混进同一个组会让
+    //   既有 WS 节点组的采样与切换行为发生变化，保守起见只作为并列的独立节点提供；
+    // - 分片订阅（isFragment=true）不生成：TLS 分片作用于客户端到目标的 TLS 握手，
+    //   与 XHTTP 这一 HTTP 层传输无关，分片订阅里出现 XHTTP 节点没有意义；
+    // - sing-box / mihomo 本轮不生成：sing-box 原生不支持 xhttp，mihomo 支持但版本门槛高，
+    //   贸然下发只会给用户一份「导入后不可用」的配置。
+    if (xhttpConfigs === true && !isFragment) {
+        for (const item of items) {
+            // 代理条目有自己的协议与出站，不派生 XHTTP 变体
+            if (item.kind !== 'address') continue;
+
+            const host = item.value;
+            const addrPorts = portsForHost(entryPortMap, host, totalPorts);
+
+            for (const port of addrPorts) {
+                // 与 WS 节点同一条上游代理排除规则，避免上游条目派生出重复的独立节点
+                if ((port === upstreamPort) !== (host === upstreamServer)) continue;
+
+                const outbound = buildXhttpOutbound(
+                    "proxy",
+                    host,
+                    port,
+                    // 与 WS 节点共用 usedPaths：同一次生成内两种传输的路径互不相同
+                    buildXhttpNodePath(randomPath, usedPaths)
+                );
+                // 备注加传输后缀：基准名优先复用同地址 VLESS 节点的备注（与 raw URI 侧
+                // `${wsRemark} XHTTP` 一致）；仅当 VLESS 被关掉、该键没有记录时才现取一次。
+                // 两条路径都不会让既有 WS / 链式节点的编号发生变化（复用不发号，兜底发生在主循环之后）。
+                const baseRemark = vlRemarks.get(remarkKey(host, port))
+                    ?? generateRemark(port, host, _VL_, isFragment, false);
+                const remark = `${baseRemark} XHTTP`;
+                configs.push(await buildConfig(remark, [outbound], false, false, false, false, false, [host]));
             }
         }
     }

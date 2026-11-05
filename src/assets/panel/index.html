@@ -206,6 +206,12 @@
                                         onchange="handleProtocolChange(event)">
                                     <label for="TRConfigs">Trojan</label>
                                 </div>
+                                <div class="proto">
+                                    <input type="checkbox" id="xhttpConfigs" name="xhttpConfigs" value="true"
+                                        onchange="handleProtocolChange(event)"
+                                        title="XHTTP transport (HTTP POST). Adds VLESS-XHTTP nodes in addition to the WebSocket nodes, and lets the Worker accept XHTTP inbound. Requires a client that supports type=xhttp (Xray-family).">
+                                    <label for="xhttpConfigs">XHTTP</label>
+                                </div>
                             </div>
                         </div>
                     </div>

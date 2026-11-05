@@ -27,14 +27,16 @@ const PRIVACY_PAD_MAX = 2048;
 // 超过它只会来自畸形/恶意帧，直接判为无填充交回，放任缓冲增长就是内存放大面。
 const PRIVACY_PROBE_LIMIT = 4 + PRIVACY_PAD_MAX;
 // 跨帧累积状态：pending === null 表示「未在等待」，此时无缓冲、无额外拷贝（热路径直通）。
-type PrivacyProbe = { pending: Uint8Array | null };
+// 导出给 XHTTP 入站复用：XHTTP 的首包同样被 request body 的 chunk 边界切开，需要完全同一套
+// 「攒够再判定」的跨帧状态机，复制一份必然与 WS 侧逐渐分叉。
+export type PrivacyProbe = { pending: Uint8Array | null };
 
 /**
  * 判定并剥离首包 0xED7F 填充（跨帧安全，取代 V-02 之前的单块 stripPrivacyPadding）。
  * 返回 null：当前字节不足以判定（头部已累积进 state.pending），调用方应丢弃本帧、等后续帧补齐；
  * 返回 ArrayBuffer：判定完成 —— 有填充则已剥离，无填充则按原字节序交回（未进入等待态时是同一个对象，零拷贝）。
  */
-function probePrivacyPadding(chunk: ArrayBuffer, state: PrivacyProbe): ArrayBuffer | null {
+export function probePrivacyPadding(chunk: ArrayBuffer, state: PrivacyProbe): ArrayBuffer | null {
     let buf: ArrayBuffer;
     if (state.pending) {
         // 只有等待态才发生拷贝：把上一帧留下的头部与当前帧按序拼成一个块再次判定
@@ -89,10 +91,9 @@ function probePrivacyPadding(chunk: ArrayBuffer, state: PrivacyProbe): ArrayBuff
 //      攻击者用“猜测的 UUID 算出的头名 + 非法长度填充”即可区分 400 与放行 → UUID 校验 oracle；
 //   2. 101 响应回写 UUID 派生头会把 UUID 的 12 个 hex 字符泄露给未认证调用方。
 
-// 从 UUID 派生隐蔽的头名/键名，与订阅侧 extra 约定一致
-export function getXPaddingIdentifier(uuid: string): { header: string; key: string } {
-    return { header: uuid.slice(1, 7), key: '_' + uuid.slice(25, 31) };
-}
+// 从 UUID 派生隐蔽的头名/键名，与订阅侧 extra 约定一致。
+// 实现已下沉到 @utils（xray JSON / raw URI / XHTTP 入站共用同一份派生规则），此处保留再导出以兼容既有 import。
+export { getXPaddingIdentifier } from '@utils';
 
 export async function UnifiedWSHandler(request: Request): Promise<Response> {
     // 对齐 cfnew d4b2b7f：优先用请求绑定的 fetcher 建连（新版 Workers 运行时可能缺全局 connect）
@@ -419,7 +420,9 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
     });
 }
 
-function parseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
+// 导出给 XHTTP 入站复用：VLESS 头解析只有这一份实现，WS / XHTTP 必须共用，
+// 否则两条入站对「什么算合法首包」的判定会各自漂移（尤其 F-17/F-18 的边界与版本归一）。
+export function parseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
     if (VLBuffer.byteLength < 24) {
         return { hasError: true, message: "invalid data" };
     }
@@ -777,13 +780,13 @@ async function hashPassword(password: string): Promise<string> {
 
 // ===== 测速站点检测 + 本地 204 响应（对齐 cfnew L4974-5008）=====
 
-function isSpeedTestSite(hostname: string): boolean {
+export function isSpeedTestSite(hostname: string): boolean {
     const speedTestDomains = ['speed.cloudflare.com', 'cp.cloudflare.com'];
     hostname = hostname.toLowerCase();
     return speedTestDomains.some(domain => hostname === domain || hostname.endsWith('.' + domain));
 }
 
-function buildWsLocal204Response(respHeader: Uint8Array | null): Uint8Array {
+export function buildWsLocal204Response(respHeader: Uint8Array | null): Uint8Array {
     const wsLocal204 = new TextEncoder().encode(
         'HTTP/1.1 204 No Content\r\n' +
         'Content-Length: 0\r\n' +
@@ -968,7 +971,9 @@ async function pumpTcpDnsMessages(
     }
 }
 
-async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Array<ArrayBuffer> | null, log: Function, protocol: 'vless' | 'trojan', fetcher?: any, trAddrHeader?: Uint8Array) {
+// 导出给 XHTTP 入站复用：UDP(DNS) 帧的拆包/缓存/回填只有这一份实现（含 F-12 兼容形态与全局 DNS 缓存），
+// XHTTP 只需提供一个把「下行帧」写进响应体的假 WebSocket，不必再复制一套 DNS 逻辑。
+export async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: Uint8Array<ArrayBuffer> | null, log: Function, protocol: 'vless' | 'trojan', fetcher?: any, trAddrHeader?: Uint8Array) {
     if (protocol === 'vless') {
         // VLESS UDP DNS: TCP socket to 8.8.4.4:53 with caching (cfnew style)
         let isVLHeaderSent = false;
