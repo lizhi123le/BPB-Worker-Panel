@@ -896,7 +896,8 @@ table tr:not(:last-child) {
     display: none;
 }
 
-/* 蓝色折叠箭头：与标题同一行、左侧垂直居中，展开时朝下 */
+/* 蓝色折叠箭头：与标题同一行、左侧垂直居中，展开时朝下
+   尺寸对齐其它 <summary> 原生 marker（实测 12×14px @16px 根字号） */
 #system-status-container > summary::before {
     content: "";
     position: absolute;
@@ -904,9 +905,9 @@ table tr:not(:last-child) {
     top: 50%;
     width: 0;
     height: 0;
-    border-top: 0.375rem solid transparent;
-    border-bottom: 0.375rem solid transparent;
-    border-left: 0.625rem solid var(--color-brand-primary);
+    border-top: 0.4375rem solid transparent;
+    border-bottom: 0.4375rem solid transparent;
+    border-left: 0.75rem solid var(--color-brand-primary);
     transform: translateY(-50%) rotate(0deg);
     transition: transform 0.2s ease;
 }
