@@ -915,7 +915,6 @@ table tr:not(:last-child) {
     content: "";
     flex: none;
     width: 0.75rem;
-    height: 0.875rem;
 }
 
 #system-status-container > summary h2 {
