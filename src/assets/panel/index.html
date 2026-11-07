@@ -24,8 +24,10 @@
         </span>
     </h1>
     <!-- System Status Panel -->
-    <div class="form-container container" id="system-status-container">
-        <h2><span class="material-symbols-rounded">terminal</span> System Status</h2>
+    <details class="form-container container" id="system-status-container">
+        <summary>
+            <h2><span class="material-symbols-rounded">terminal</span> System Status</h2>
+        </summary>
         <div id="system-status" class="status-grid">
             <div class="status-item">
                 <span class="status-label">Worker Region</span>
@@ -60,7 +62,7 @@
                 <span id="status-ech" class="status-value">-</span>
             </div>
         </div>
-    </div>
+    </details>
     <div class="form-container container">
         <h2><span class="material-symbols-rounded">settings</span> Settings</h2>
         <form id="configForm" class="configForm" onsubmit="updateSettings(event)">

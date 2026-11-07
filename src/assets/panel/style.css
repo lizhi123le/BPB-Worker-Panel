@@ -883,11 +883,20 @@ table tr:not(:last-child) {
 
 /* System Status Panel */
 #system-status-container {
+    display: block;
     margin-top: 0;
 }
 
-#system-status-container h2 {
-    margin: 0 0 12px 0;
+#system-status-container > summary {
+    display: list-item;
+}
+
+#system-status-container > summary h2 {
+    margin: 0;
+}
+
+#system-status-container .status-grid {
+    margin-top: 12px;
 }
 
 .status-grid {
