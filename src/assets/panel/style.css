@@ -887,8 +887,11 @@ table tr:not(:last-child) {
     margin-top: 0;
 }
 
+/* 标题行：箭头、标题、右侧占位全部在文档流内，
+   避免绝对定位在部分浏览器里被画到卡片背景下面而发暗 */
 #system-status-container > summary {
-    position: relative;
+    display: flex;
+    align-items: center;
     list-style: none;
 }
 
@@ -896,28 +899,32 @@ table tr:not(:last-child) {
     display: none;
 }
 
-/* 蓝色折叠箭头：与标题同一行、左侧垂直居中，展开时朝下
-   尺寸对齐其它 <summary> 原生 marker（实测 12×14px @16px 根字号） */
-#system-status-container > summary::before {
-    content: "";
-    position: absolute;
-    left: 0;
-    top: 50%;
+/* 蓝色折叠箭头：尺寸对齐其它 <summary> 原生 marker（12×14px @16px 根字号） */
+.status-toggle-arrow {
+    flex: none;
     width: 0;
     height: 0;
     border-top: 0.4375rem solid transparent;
     border-bottom: 0.4375rem solid transparent;
     border-left: 0.75rem solid var(--color-brand-primary);
-    transform: translateY(-50%) rotate(0deg);
     transition: transform 0.2s ease;
 }
 
-#system-status-container[open] > summary::before {
-    transform: translateY(-50%) rotate(90deg);
+/* 右侧等宽占位，让居中的标题不受左侧箭头影响 */
+#system-status-container > summary::after {
+    content: "";
+    flex: none;
+    width: 0.75rem;
+    height: 0.875rem;
 }
 
 #system-status-container > summary h2 {
+    flex: 1;
     margin: 0;
+}
+
+#system-status-container[open] .status-toggle-arrow {
+    transform: rotate(90deg);
 }
 
 #system-status-container .status-grid {
