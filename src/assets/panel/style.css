@@ -887,43 +887,15 @@ table tr:not(:last-child) {
     margin-top: 0;
 }
 
-/* 标题行：箭头、标题、右侧占位全部在文档流内，
-   避免绝对定位在部分浏览器里被画到卡片背景下面而发暗 */
-#system-status-container > summary {
-    display: flex;
-    align-items: center;
-    list-style: none;
-}
-
-#system-status-container > summary::-webkit-details-marker {
-    display: none;
-}
-
-/* 蓝色折叠箭头：尺寸对齐其它 <summary> 原生 marker（12×14px @16px 根字号） */
-.status-toggle-arrow {
-    flex: none;
-    width: 0;
-    height: 0;
-    border-top: 0.4375rem solid transparent;
-    border-bottom: 0.4375rem solid transparent;
-    border-left: 0.75rem solid var(--color-brand-primary);
-    transition: transform 0.2s ease;
-}
-
-/* 右侧等宽占位，让居中的标题不受左侧箭头影响 */
-#system-status-container > summary::after {
-    content: "";
-    flex: none;
-    width: 0.75rem;
-}
-
+/* 箭头直接复用浏览器原生 <summary> marker：与其它折叠项同源、同尺寸、同颜色。
+   不要用 border 画箭头——部分深色模式扩展会把 border 颜色压暗，
+   导致卡片上的箭头变暗而其它选项的 marker 仍是亮蓝色。 */
 #system-status-container > summary h2 {
-    flex: 1;
+    display: inline-flex;
+    position: relative;
+    left: 50%;
+    transform: translateX(-50%);
     margin: 0;
-}
-
-#system-status-container[open] .status-toggle-arrow {
-    transform: rotate(90deg);
 }
 
 #system-status-container .status-grid {
