@@ -887,12 +887,48 @@ table tr:not(:last-child) {
     margin-top: 0;
 }
 
+/* 折叠箭头改为自定义 flex 行内元素，保证与标题同一行且垂直居中 */
 #system-status-container > summary {
-    display: list-item;
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    list-style: none;
+}
+
+#system-status-container > summary::-webkit-details-marker {
+    display: none;
+}
+
+#system-status-container > summary::marker {
+    content: "";
+}
+
+/* 右侧等宽占位，让居中的标题不受左侧箭头影响 */
+#system-status-container > summary::after {
+    content: "";
+    flex: none;
+    width: 0.625rem;
+    height: 0.75rem;
 }
 
 #system-status-container > summary h2 {
+    flex: 1;
     margin: 0;
+}
+
+.status-toggle-arrow {
+    flex: none;
+    width: 0;
+    height: 0;
+    border-top: 0.375rem solid transparent;
+    border-bottom: 0.375rem solid transparent;
+    border-left: 0.625rem solid var(--color-brand-primary);
+    transition: transform 0.2s ease;
+    transform-origin: 50% 50%;
+}
+
+#system-status-container[open] .status-toggle-arrow {
+    transform: rotate(90deg);
 }
 
 #system-status-container .status-grid {
