@@ -22,6 +22,10 @@
  *      不混入其它地区的 IP
  *   7. 不砍 IPv6：解析 A + AAAA 时，AAAA 以 `[v6]` 入池并**同等参与**抽取与探测
  *      （回归钉：防止以后有人把 v6 候选过滤掉，或用 `split(':')` 之类把 v6 键解析坏）
+ *   8. 指定地区 + 默认模式 + CF 目标：反代池（含内置兜底）应该是池首跳的**第一优先**，
+ *      成功即不再拨官方直连池（官方池只留在回退阶梯的下一级）
+ *   9. 首字节超时（FIRST_BYTE_TIMEOUT）在回退阶梯每一级都要能触发：直连 → 反代池 → 官方池
+ *      → 直连兜底逐级降级，且旧 socket 的 closed 清理不能把新连接所在的 WS 误关
  *
  * 前提：先构建过（`NODE_ENV=mangle node scripts/build.js`），本测试加载
  * .build/worker.reference.js（混淆前产物，行为等价且可读）。
@@ -39,6 +43,8 @@ const KR_DOMAIN = 'kr-pool.example.net';
 const SG_DOMAIN = 'sg-pool.example.net';
 const V6_DOMAIN = 'v6-pool.example.net';
 const TARGET = 'ipv4.icanhazip.com';
+// 命中 Cloudflare 网段的目标域名（DoH 桩解析到 104.16.0.0/13），用于验证池首跳的目标识别路径
+const CF_TARGET = 'cf-target.example.com';
 
 // 14 条候选：前 6 条「不通」（connect 立即失败），后 8 条「通」（3ms 建连）
 const POOL = Array.from({ length: 14 }, (_, i) => `10.20.0.${i + 1}`);
@@ -116,7 +122,7 @@ globalThis.WebSocketPair = class {
             addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); },
             removeEventListener(type, fn) { this.listeners[type] = (this.listeners[type] || []).filter((f) => f !== fn); },
             send(payload) { this.sent.push(payload); },
-            close() {}
+            close() { webSocketCloseCalls++; }
         });
         this[0] = make();
         this[1] = make();
@@ -128,19 +134,27 @@ globalThis.WebSocketPair = class {
  *  IPv6 地址本身含冒号，用 `split(':')[0]` 解析会把 `2001:db8::1` 截成 `2001`，v6 断言必然假绿。 */
 let dialedThisConnection = [];
 let dialedHostsThisConnection = [];
+/** 阶段 H 专用：让 socket.close() 真正 resolve closed，以验证「旧 socket 清理不误关新连接的 WS」 */
+let socketCloseResolvesClosed = false;
+/** WS close 调用计数（阶段 H 断言回退期间 WS 没被旧 socket 清理关掉） */
+let webSocketCloseCalls = 0;
 globalThis.connect = ({ hostname, port }) => {
     dialedThisConnection.push(`${hostname}:${port}`);
     dialedHostsThisConnection.push(hostname);
     let resolveOpened;
     let rejectOpened;
+    let resolveClosed = () => {};
     const opened = new Promise((res, rej) => { resolveOpened = res; rejectOpened = rej; });
     opened.catch(() => {}); // 未被 await 的分支也别变成 unhandled rejection
+    const closed = socketCloseResolvesClosed
+        ? new Promise((res) => { resolveClosed = res; })
+        : new Promise(() => {});
     const socket = {
         opened,
-        closed: new Promise(() => {}),
+        closed,
         readable: new ReadableStream({ start() {} }), // 永不产出：避免 remoteSocketToWS 早退
         writable: new WritableStream({ write() {} }),
-        close() {}
+        close() { resolveClosed(); }
     };
     if (FAILING.has(hostname)) rejectOpened(new Error('ECONNREFUSED'));
     else setTimeout(resolveOpened, 3);
@@ -156,6 +170,8 @@ function dohRecordsFor(name) {
     if (n.includes('kr-pool')) return { a: KR_POOL, aaaa: [] };
     if (n.includes('sg-pool')) return { a: SG_POOL, aaaa: [] };
     if (n.includes('v6-pool')) return { a: V6_A, aaaa: V6_AAAA };
+    // 目标识别测试：解析到 Cloudflare 网段（104.16.0.0/13），首跳应走池
+    if (n.includes('cf-target')) return { a: ['104.16.0.1'], aaaa: [] };
     return { a: dohIps, aaaa: [] };
 }
 globalThis.fetch = async (url) => {
@@ -198,12 +214,14 @@ const env = {
 
 const PACKET = vlessDomainPacket(TARGET);
 
-/** 发一次 WS 升级（仅走代理模式），等首包处理跑完，返回本次观测 */
-async function runConnection(query = '?qj=only') {
+/** 发一次 WS 升级，等首包处理跑完，返回本次观测。
+ *  target 默认是 TARGET；验证目标识别（CF 网段）时传 CF_TARGET。 */
+async function runConnection(query = '?qj=only', target = TARGET) {
     dialedThisConnection = [];
     dialedHostsThisConnection = [];
     logs.length = 0;
-    const earlyData = Buffer.from(PACKET).toString('base64url');
+    const packet = target === TARGET ? PACKET : vlessDomainPacket(target);
+    const earlyData = Buffer.from(packet).toString('base64url');
     const request = new Request(`${ORIGIN}/${query}`, {
         headers: {
             Host: 'panel.example.com',
@@ -385,6 +403,86 @@ check('wk=SG 时抽取的候选全部来自 SG 池（不同地区 = 不同池）
 check('wk=SG 时绝不混入 KR 池的 IP',
     ![...sgRun.probed].some((ip) => KR_POOL.includes(ip)),
     `probed=${[...sgRun.probed].sort().join(',')}`);
+
+// ── 阶段 F：留空 + 指定地区 → 内置 DEFAULT_PROXY_IPS 必须真正参与拨号
+//    回归钉：hasProxyPool 曾要求 hasCustomProxyIPs（用户显式配置），而 connectWithRaceDial 的
+//    panelIPs → DEFAULT_PROXY_IPS 兜底只在 hasProxyPool 为真后才可达 —— 结果「留空 + wk=SG」
+//    收敛出的内置池永远拨不到，地区锚定形同虚设。这里清空 KV / env PROXY_IP 后验证内置池确实被拨号。
+out('— 阶段 F：清空反代池配置，?qj=only&wk=SG 应仍用内置池拨号（地区锚定生效） —');
+env.PROXY_IP = undefined;
+env.kv = makeKv();
+// setSettings 用 Object.assign 合并，清空 KV 不会抹掉已合并进 globalThis.settings 的 proxyIPs，这里显式复位
+if (globalThis.settings) globalThis.settings.proxyIPs = [];
+if (globalThis.__kvCache) globalThis.__kvCache.timestamp = 0;
+
+const builtinRun = await runConnection('?qj=only&wk=SG');
+check('留空 + wk=SG：反代池拨号路径被触发（不再退化为直连首跳）',
+    logs.some((l) => l.includes('proxy-first: attempting race dial through reverse-proxy pool')),
+    `logs=${logs.join(' | ')}`);
+check('留空 + wk=SG：内置池完成解析并进入竞速（drawLog 非空）',
+    builtinRun.poolSize !== null && builtinRun.probed.size > 0,
+    `poolSize=${builtinRun.poolSize} probed=${[...builtinRun.probed].join(',')}`);
+check('留空 + wk=SG：抽到的候选来自内置池解析结果',
+    builtinRun.probed.size > 0 && [...builtinRun.probed].every((ip) => BIG_POOL.includes(ip)),
+    `probed=${[...builtinRun.probed].join(',')}`);
+
+// ── 阶段 G：指定地区 + 默认模式 + CF 目标 → 反代池优先于官方直连池
+//    hasProxyPool 修好后，wk 非空时内置池也进入 needsTargetProbe 的池首跳候选：
+//    CF 目标必须先拨反代池，成功即不再拨官方池（官方池只作为回退阶梯的下一级）。
+out('— 阶段 G：清空配置 + ?wk=SG（默认模式）+ CF 目标，应由反代池首跳且官方池不抢跑 —');
+const cfRun = await runConnection('?wk=SG', CF_TARGET);
+check('默认模式 + CF 目标：目标识别命中 Cloudflare 网段，走池首跳',
+    logs.some((l) => l.includes('target-check:') && l.includes('Cloudflare range, pool-first')),
+    `logs=${logs.join(' | ')}`);
+check('默认模式 + CF 目标：首跳先拨反代池（内置池兜底）',
+    logs.some((l) => l.includes('pool-first: reverse-proxy pool race dial')),
+    `logs=${logs.join(' | ')}`);
+check('默认模式 + CF 目标：反代池成功后不再拨官方直连池',
+    !logs.some((l) => l.includes('CF official IP pool race dial')),
+    `logs=${logs.join(' | ')}`);
+check('默认模式 + CF 目标：拨号候选来自反代池解析结果（不是官方直连 IP）',
+    cfRun.probed.size > 0 && [...cfRun.probed].every((ip) => BIG_POOL.includes(ip)),
+    `probed=${[...cfRun.probed].join(',')}`);
+check('默认模式 + CF 目标：连接成功返回 101',
+    cfRun.status === 101,
+    `status=${cfRun.status}`);
+
+// ── 阶段 H：回退阶梯每一级都要挂首字节超时回调（池/官方池不再「TCP 通了就挂死」）
+//    用 1/200 加速 FIRST_BYTE_TIMEOUT（6000ms → 30ms），跑完 直连首跳 → 反代池 → 官方池 → 直连兜底。
+//    同时让 socket.close() 真正 resolve closed，验证旧 socket 的清理不会把新连接所在的 WS 误关。
+out('— 阶段 H：默认模式 + 非 CF 目标，首字节超时应在回退阶梯逐级降级（不卡死在某一级） —');
+const realSetTimeout = globalThis.setTimeout;
+socketCloseResolvesClosed = true;
+webSocketCloseCalls = 0;
+globalThis.setTimeout = (fn, ms, ...args) => realSetTimeout(fn, ms === 6000 ? 30 : ms, ...args);
+let timeoutRun;
+try {
+    timeoutRun = await runConnection('?wk=SG');
+    await new Promise((r) => realSetTimeout(r, 600));
+} finally {
+    globalThis.setTimeout = realSetTimeout;
+    socketCloseResolvesClosed = false;
+}
+const logIndex = (needle) => logs.findIndex((l) => l.includes(needle));
+const directFirstIdx = logIndex('direct race dial connected');
+const poolRetryIdx = logIndex('retry: attempting reverse-proxy pool race dial');
+const officialRetryIdx = logIndex('retry: attempting CF official IP pool race dial');
+const finalDirectIdx = logIndex('retry: falling back to direct connection');
+check('阶梯 H：直连首跳后首字节超时，触发反代池回退',
+    directFirstIdx >= 0 && poolRetryIdx > directFirstIdx,
+    `idx=${directFirstIdx},${poolRetryIdx} logs=${logs.join(' | ')}`);
+check('阶梯 H：反代池回退后首字节超时，继续降到官方池',
+    officialRetryIdx > poolRetryIdx,
+    `idx=${poolRetryIdx},${officialRetryIdx} logs=${logs.join(' | ')}`);
+check('阶梯 H：官方池回退后首字节超时，继续降到直连兜底',
+    finalDirectIdx > officialRetryIdx,
+    `idx=${officialRetryIdx},${finalDirectIdx} logs=${logs.join(' | ')}`);
+check('阶梯 H：逐级回退期间客户端 WS 未被旧 socket 的清理误关',
+    webSocketCloseCalls === 0,
+    `closeCalls=${webSocketCloseCalls} status=${timeoutRun?.status}`);
+check('阶梯 H：整个降级链跑完后仍返回 101',
+    timeoutRun?.status === 101,
+    `status=${timeoutRun?.status}`);
 
 for (const level of ['log', 'info', 'warn', 'error', 'debug']) console[level] = originalConsole[level];
 

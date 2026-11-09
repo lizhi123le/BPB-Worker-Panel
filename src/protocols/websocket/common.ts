@@ -856,9 +856,9 @@ export async function handleTCPOutBound(
 
     // —— 出站模式与首跳决策 ——
     //   hasUpstreamProxy —— 上游 SOCKS5 / HTTP CONNECT 出口代理（settings.upstreamProxy）
-    //   hasProxyPool     —— 用户显式配置的反代池（settings.proxyIPs 或 env PROXY_IP）
-    //                       不含内置 DEFAULT_PROXY_IPS 公共备用中继，也不含 CF 模式下被 handlers
-    //                       替换成的官方直连 IP 池；CF 模式下仅「仅走代理」仍可用它（见下方判定）
+    //   hasProxyPool     —— 本连接可拨的反代池（含内置 DEFAULT_PROXY_IPS 兜底）
+    //                       指定地区取 panelIPs（已按 wk 收敛）；CF 模式下仅「仅走代理」取
+    //                       用户显式配置的 customProxyPool（见下方判定）
     //   hasOfficialPool  —— CF 内置 / 面板配置的官方直连 IP 池（handlers.ts 归一化后写入 officialPool）
     //   默认（两者皆 false）→ 配了上游代理则上游代理首跳；否则按目标分类：
     //                        目标命中 Cloudflare 网段 → 池首跳（反代池 → 官方池），否则直连目标首跳
@@ -875,9 +875,14 @@ export async function handleTCPOutBound(
     const customProxyPool = globalThis.wsConfig?.customProxyPool?.length ? globalThis.wsConfig.customProxyPool : [];
     // workerRegion === 'CF'（wk 留空 = 官方直连）时 handlers.ts 会把 panelIPs 换成官方直连 IP 池。
     // 反代池是否作为代理参与本连接：
-    //   仅走代理（proxyOnly）→ 与指定地区保持同一套逻辑，不受地区设置影响：配了反代池就能用
-    //   默认 / 直连目标       → 只在指定地区生效；CF 模式下反代池不参与，改走官方直连池
-    const hasProxyPool = Boolean(hasCustomProxyIPs) && (proxyOnly || workerRegion !== 'CF');
+    //   指定地区（wk 非空）→ panelIPs 恒有可拨条目（最次也是内置 DEFAULT_PROXY_IPS 兜底），
+    //                        因此「留空 + 指定地区」同样能用内置池并做地区锚定
+    //   仅走代理（proxyOnly）→ 与指定地区同一套逻辑；CF 模式下用 customProxyPool（配了才能用）
+    //   默认 / 直连目标       → CF 模式下反代池不参与，改走官方直连池
+    // 这里只判断「本模式下有没有可拨的池条目」，不再要求用户显式配置：
+    // panelIPs 已按 proxyIPs > env PROXY_IP > DEFAULT_PROXY_IPS 兜底，内置公共备用中继同样参与拨号。
+    const poolEntriesForDial = workerRegion === 'CF' ? customProxyPool : (globalThis.wsConfig?.panelIPs ?? []);
+    const hasProxyPool = poolEntriesForDial.length > 0 && (proxyOnly || workerRegion !== 'CF');
     // 「反代池」这一级实际拨的池：指定地区用 panelIPs（handlers 已按 wk 地区收敛候选）；
     // CF 模式下 panelIPs 已被官方直连池覆盖，仅走代理必须改用用户配置的反代池。
     const proxyPoolForDial = workerRegion === 'CF' ? customProxyPool : undefined;
@@ -898,10 +903,36 @@ export async function handleTCPOutBound(
 
     let retryInFlight = false;
 
+    // —— 活跃出口 socket 的世代号 ——
+    // 首跳 / 回退阶梯每一级都会挂上新的出口 socket。旧 socket 的 closed 清理必须失效：
+    // 首字节超时触发回退时，旧 socket 的 finally 若仍然关 WS，会把刚接手的新连接一起关死。
+    let activeSocketGeneration = 0;
+
+    /** 登记一级出口 socket：只有它仍是当前活跃世代时，closed 才允许关闭客户端 WS。 */
+    function attachActiveSocket(socket: Socket, label: string): void {
+        const generation = ++activeSocketGeneration;
+        socket.closed
+            .catch(error => console.log(`${label} TCP socket closed error`, error))
+            .finally(() => {
+                if (generation === activeSocketGeneration) safeCloseWebSocket(webSocket);
+            });
+    }
+
+    /** 一级出口首字节超时 → 按同一阶梯继续回退（仅走代理时由 handleRetryConnection 直接断连）。 */
+    function retryFromLevel(label: string, socket: Socket): () => void {
+        return () => {
+            log(`${label}: no data within FIRST_BYTE_TIMEOUT, retrying fallback`);
+            try { socket.close?.(); } catch {}
+            handleRetryConnection();
+        };
+    }
+
     async function handleRetryConnection(): Promise<void> {
         // 重入保护：回退阶梯本身是异步的，避免并发触发多条回退连接
         if (retryInFlight) return;
         retryInFlight = true;
+        // 当前出口 socket 已被放弃：立即作废它的世代，避免其 closed 清理关掉即将挂上的新连接
+        activeSocketGeneration++;
         try {
             // 1. 仅走代理（proxyOnly）：任何失败都不回退直连，直接断（防 IP 泄漏，对齐 cfnew 处理重试连接 L4816-4819）
             if (proxyOnly) {
@@ -918,13 +949,12 @@ export async function handleTCPOutBound(
                     log(`retry: attempting upstream proxy for ${originalAddress}:${originalPort}`);
                     const upstreamSocket = await connectThroughUpstreamProxy(originalAddress, originalPort, rawClientData, fetcher);
                     if (upstreamSocket) {
-                        upstreamSocket.closed
-                            .catch(error => console.log('retry upstream-proxy TCP socket closed error', error))
-                            .finally(() => safeCloseWebSocket(webSocket));
+                        attachActiveSocket(upstreamSocket, 'retry upstream-proxy');
 
                         log(`retry upstream-proxy connected to ${originalAddress}:${originalPort}`);
                         remoteSocket.value = upstreamSocket;
-                        remoteSocketToWS(upstreamSocket, webSocket, VLResponseHeader, null, log);
+                        // 挂首字节超时回调：上游代理建连成功但无数据时，继续走下一级（反代池）
+                        remoteSocketToWS(upstreamSocket, webSocket, VLResponseHeader, retryFromLevel('retry upstream-proxy', upstreamSocket), log);
                         return;
                     }
                     log('retry: upstream proxy unavailable (empty or invalid config)');
@@ -933,20 +963,20 @@ export async function handleTCPOutBound(
                 }
             }
 
-            // 3. 反代池竞速回退（仅用户显式配置且当前模式生效的反代池）
+            // 3. 反代池竞速回退（本模式下可拨的反代池：指定地区用 panelIPs，含内置 DEFAULT_PROXY_IPS
+            //    兜底；CF 模式仅「仅走代理」用用户显式配置的 customProxyPool）
             if (hasProxyPool && !triedHops.has('pool')) {
                 triedHops.add('pool');
                 try {
                     log(`retry: attempting reverse-proxy pool race dial for ${originalAddress}:${originalPort}`);
                     const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, proxyPoolForDial);
 
-                    tcpSocket.closed
-                        .catch(error => console.log('reverse-proxy pool TCP socket closed error', error))
-                        .finally(() => safeCloseWebSocket(webSocket));
+                    attachActiveSocket(tcpSocket, 'reverse-proxy pool');
 
                     log(`reverse-proxy pool connected via ${usedIp}:${originalPort}`);
                     remoteSocket.value = tcpSocket;
-                    remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+                    // 挂首字节超时回调：池 TCP 通了但目标无数据时，继续走下一级（CF 官方池）
+                    remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, retryFromLevel('retry reverse-proxy pool', tcpSocket), log);
                     return;
                 } catch (poolErr) {
                     log(`retry: reverse-proxy pool failed: ${safeErrorMessage(poolErr)}`);
@@ -961,13 +991,12 @@ export async function handleTCPOutBound(
                     log(`retry: attempting CF official IP pool race dial for ${originalAddress}:${originalPort}`);
                     const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool);
 
-                    tcpSocket.closed
-                        .catch(error => console.log('CF official pool TCP socket closed error', error))
-                        .finally(() => safeCloseWebSocket(webSocket));
+                    attachActiveSocket(tcpSocket, 'CF official pool');
 
                     log(`CF official pool connected via ${usedIp}:${originalPort}`);
                     remoteSocket.value = tcpSocket;
-                    remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
+                    // 挂首字节超时回调：官方池 TCP 通了但目标无数据时，继续走最后一级（直连兜底）
+                    remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, retryFromLevel('retry CF official pool', tcpSocket), log);
                     return;
                 } catch (officialErr) {
                     log(`retry: CF official pool failed: ${safeErrorMessage(officialErr)}`);
@@ -979,9 +1008,8 @@ export async function handleTCPOutBound(
             try {
                 log(`retry: falling back to direct connection for ${originalAddress}:${originalPort}`);
                 const tcpSocket = await connectAndWriteLocal(originalAddress, originalPort, fetcher);
-                tcpSocket.closed
-                    .catch(error => console.log('direct TCP socket closed error', error))
-                    .finally(() => safeCloseWebSocket(webSocket));
+                // 最后一级：不再挂首字节超时回调，连接结束即收口
+                attachActiveSocket(tcpSocket, 'direct');
                 remoteSocket.value = tcpSocket;
                 remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, null, log);
                 return;
@@ -1059,7 +1087,7 @@ export async function handleTCPOutBound(
             }
         }
 
-        // 第二优先：用户配置的反代池
+        // 第二优先：反代池（指定地区用 panelIPs，含内置 DEFAULT_PROXY_IPS 兜底；CF 模式用 customProxyPool）
         if (!proxySocket && hasProxyPool) {
             triedHops.add('pool');
             try {
@@ -1074,18 +1102,12 @@ export async function handleTCPOutBound(
 
         if (proxySocket) {
             const activeSocket = proxySocket;
-            activeSocket.closed
-                .catch(error => console.log('proxy-first TCP socket closed error', error))
-                .finally(() => safeCloseWebSocket(webSocket));
+            attachActiveSocket(activeSocket, 'proxy-first');
 
             log(`proxy-first connected to ${originalAddress}:${originalPort}`);
             remoteSocket.value = activeSocket;
             // 传 retry 回调以便 FIRST_BYTE_TIMEOUT 超时触发回退（仅走代理时回调内直接断连）
-            remoteSocketToWS(activeSocket, webSocket, VLResponseHeader, () => {
-                log(`proxy-first: no data within FIRST_BYTE_TIMEOUT, retrying fallback`);
-                try { activeSocket.close?.(); } catch {}
-                handleRetryConnection();
-            }, log);
+            remoteSocketToWS(activeSocket, webSocket, VLResponseHeader, retryFromLevel('proxy-first', activeSocket), log);
             return;
         }
 
@@ -1129,17 +1151,11 @@ export async function handleTCPOutBound(
 
         if (poolSocket) {
             const activeSocket = poolSocket;
-            activeSocket.closed
-                .catch(error => console.log('pool-first TCP socket closed error', error))
-                .finally(() => safeCloseWebSocket(webSocket));
+            attachActiveSocket(activeSocket, 'pool-first');
 
             log(`pool-first connected to ${originalAddress}:${originalPort}`);
             remoteSocket.value = activeSocket;
-            remoteSocketToWS(activeSocket, webSocket, VLResponseHeader, () => {
-                log('pool-first: no data within FIRST_BYTE_TIMEOUT, retrying fallback');
-                try { activeSocket.close?.(); } catch {}
-                handleRetryConnection();
-            }, log);
+            remoteSocketToWS(activeSocket, webSocket, VLResponseHeader, retryFromLevel('pool-first', activeSocket), log);
             return;
         }
 
@@ -1155,18 +1171,12 @@ export async function handleTCPOutBound(
         log(`attempting direct race dial for ${originalAddress}:${originalPort}`);
         const { socket: tcpSocket, usedIp } = await connectWithDirectRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
 
-        tcpSocket.closed
-            .catch(error => console.log('direct race dial TCP socket closed error', error))
-            .finally(() => safeCloseWebSocket(webSocket));
+        attachActiveSocket(tcpSocket, 'direct race dial');
 
         log(`direct race dial connected via ${usedIp}:${originalPort}`);
         remoteSocket.value = tcpSocket;
         // 关键对齐 cfnew：传 retry 回调，直连握手成功但 6s 首字节超时无数据时触发回退重试！
-        remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, () => {
-            log(`direct race dial: no data within FIRST_BYTE_TIMEOUT, retrying fallback`);
-            try { tcpSocket.close?.(); } catch {}
-            handleRetryConnection();
-        }, log);
+        remoteSocketToWS(tcpSocket, webSocket, VLResponseHeader, retryFromLevel('direct race dial', tcpSocket), log);
         return;
     } catch (directError) {
         log(`direct race dial failed: ${safeErrorMessage(directError)}`);
@@ -1365,8 +1375,9 @@ async function remoteSocketToWS(
 
         batcher.flush();
     } catch (error) {
-        // Don't close WS if retry is about to re-mount a new socket
-        if (!hasRetryFired) safeCloseWebSocket(webSocket);
+        // 有 retry 回调且尚未收到数据时，函数末尾的 retry 会接管连接：
+        // 此时不能先关 WS，否则回退挂上的新 socket 无处可写（超时路径已有 hasRetryFired 保护）。
+        if (!hasRetryFired && !(retry && !hasIncomingData)) safeCloseWebSocket(webSocket);
     } finally {
         try { batcher.flush(); } catch {}
         try { reader?.releaseLock(); } catch {}
