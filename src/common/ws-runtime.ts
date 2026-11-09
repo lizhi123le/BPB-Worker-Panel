@@ -95,9 +95,8 @@ export async function prepareWsRuntimeConfig(request: Request, env: Env): Promis
         ? [globalThis.wsConfig.envProxyIPs]
         : [];
     // 自定义代理 = 面板手动设置的 proxyIPs 非空，或配置了 env PROXY_IP（envFallbackIPs 非空）。
-    // 写入 wsConfig.hasCustomProxyIPs：出站模式用它判断「有没有反代池可走」，
-    // 与下方 effectivePanelIPs 的取值链（proxyIPs > envFallbackIPs > DEFAULT_PROXY_IPS）保持一致。
-    // 注意：内置 DEFAULT_PROXY_IPS 属于公共备用中继，不计入 hasCustomProxyIPs。
+    // 仅用于区分「用户显式配置的反代池实体」与内置 DEFAULT_PROXY_IPS 公共备用中继：
+    // customProxyPool 只装前者（CF 模式下「仅走代理」拨它）；内置池经 panelIPs 兜底参与拨号。
     const hasCustomProxyIPs = proxyIPs.length > 0 || envFallbackIPs.length > 0;
     const effectivePanelIPs = proxyIPs.length > 0
         ? proxyIPs

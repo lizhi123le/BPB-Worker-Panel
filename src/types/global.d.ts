@@ -34,11 +34,9 @@ declare global {
         // 用户显式配置的反代池实体（不含内置 DEFAULT_PROXY_IPS，也不含 CF 模式的官方直连池）。
         // CF 模式下 panelIPs 被官方池覆盖后，「仅走代理」靠它走到用户的反代池。
         customProxyPool?: string[];
-        // 用户是否显式配置了自定义反代池（settings.proxyIPs 或 env PROXY_IP），
-        // 区别于 DEFAULT_PROXY_IPS 公共备用中继。它是「有没有反代池可走」的判据之一
-        // （另一个是 settings.upstreamProxy）。注意 workerRegion === 'CF'（wk 留空 = 官方直连）时
-        // handlers 会把 panelIPs 换成官方直连 IP 池：默认 / 直连目标模式下反代池不参与，
-        // 仅「仅走代理」保持与指定地区同一套逻辑（配了反代池就能用 customProxyPool 拨号）。
+        // 用户是否显式配置了自定义反代池（settings.proxyIPs 或 env PROXY_IP），区别于
+        // DEFAULT_PROXY_IPS 公共备用中继；仅用于构造 customProxyPool（CF 模式下「仅走代理」拨它），
+        // 不再作为「有没有反代池可走」的拨号判据——内置池经 panelIPs 兜底同样参与拨号。
         hasCustomProxyIPs?: boolean;
         // 出站模式首跳决策（面板 Outbound Mode / URL query qj）
         // 反代池与官方直连池只承载 Cloudflare CDN 目标，故仅在「目标命中 Cloudflare 网段」时才做首跳。
