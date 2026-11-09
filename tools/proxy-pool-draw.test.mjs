@@ -24,8 +24,6 @@
  *      （回归钉：防止以后有人把 v6 候选过滤掉，或用 `split(':')` 之类把 v6 键解析坏）
  *   8. 指定地区 + 默认模式 + CF 目标：反代池（含内置兜底）应该是池首跳的**第一优先**，
  *      成功即不再拨官方直连池（官方池只留在回退阶梯的下一级）
- *   9. 首字节超时（FIRST_BYTE_TIMEOUT）在回退阶梯每一级都要能触发：直连 → 反代池 → 官方池
- *      → 直连兜底逐级降级，且旧 socket 的 closed 清理不能把新连接所在的 WS 误关
  *
  * 前提：先构建过（`NODE_ENV=mangle node scripts/build.js`），本测试加载
  * .build/worker.reference.js（混淆前产物，行为等价且可读）。
@@ -122,7 +120,7 @@ globalThis.WebSocketPair = class {
             addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); },
             removeEventListener(type, fn) { this.listeners[type] = (this.listeners[type] || []).filter((f) => f !== fn); },
             send(payload) { this.sent.push(payload); },
-            close() { webSocketCloseCalls++; }
+            close() {}
         });
         this[0] = make();
         this[1] = make();
@@ -134,27 +132,19 @@ globalThis.WebSocketPair = class {
  *  IPv6 地址本身含冒号，用 `split(':')[0]` 解析会把 `2001:db8::1` 截成 `2001`，v6 断言必然假绿。 */
 let dialedThisConnection = [];
 let dialedHostsThisConnection = [];
-/** 阶段 H 专用：让 socket.close() 真正 resolve closed，以验证「旧 socket 清理不误关新连接的 WS」 */
-let socketCloseResolvesClosed = false;
-/** WS close 调用计数（阶段 H 断言回退期间 WS 没被旧 socket 清理关掉） */
-let webSocketCloseCalls = 0;
 globalThis.connect = ({ hostname, port }) => {
     dialedThisConnection.push(`${hostname}:${port}`);
     dialedHostsThisConnection.push(hostname);
     let resolveOpened;
     let rejectOpened;
-    let resolveClosed = () => {};
     const opened = new Promise((res, rej) => { resolveOpened = res; rejectOpened = rej; });
     opened.catch(() => {}); // 未被 await 的分支也别变成 unhandled rejection
-    const closed = socketCloseResolvesClosed
-        ? new Promise((res) => { resolveClosed = res; })
-        : new Promise(() => {});
     const socket = {
         opened,
-        closed,
+        closed: new Promise(() => {}),
         readable: new ReadableStream({ start() {} }), // 永不产出：避免 remoteSocketToWS 早退
         writable: new WritableStream({ write() {} }),
-        close() { resolveClosed(); }
+        close() {}
     };
     if (FAILING.has(hostname)) rejectOpened(new Error('ECONNREFUSED'));
     else setTimeout(resolveOpened, 3);
@@ -446,43 +436,6 @@ check('默认模式 + CF 目标：拨号候选来自反代池解析结果（不�
 check('默认模式 + CF 目标：连接成功返回 101',
     cfRun.status === 101,
     `status=${cfRun.status}`);
-
-// ── 阶段 H：回退阶梯每一级都要挂首字节超时回调（池/官方池不再「TCP 通了就挂死」）
-//    用 1/200 加速 FIRST_BYTE_TIMEOUT（6000ms → 30ms），跑完 直连首跳 → 反代池 → 官方池 → 直连兜底。
-//    同时让 socket.close() 真正 resolve closed，验证旧 socket 的清理不会把新连接所在的 WS 误关。
-out('— 阶段 H：默认模式 + 非 CF 目标，首字节超时应在回退阶梯逐级降级（不卡死在某一级） —');
-const realSetTimeout = globalThis.setTimeout;
-socketCloseResolvesClosed = true;
-webSocketCloseCalls = 0;
-globalThis.setTimeout = (fn, ms, ...args) => realSetTimeout(fn, ms === 6000 ? 30 : ms, ...args);
-let timeoutRun;
-try {
-    timeoutRun = await runConnection('?wk=SG');
-    await new Promise((r) => realSetTimeout(r, 600));
-} finally {
-    globalThis.setTimeout = realSetTimeout;
-    socketCloseResolvesClosed = false;
-}
-const logIndex = (needle) => logs.findIndex((l) => l.includes(needle));
-const directFirstIdx = logIndex('direct race dial connected');
-const poolRetryIdx = logIndex('retry: attempting reverse-proxy pool race dial');
-const officialRetryIdx = logIndex('retry: attempting CF official IP pool race dial');
-const finalDirectIdx = logIndex('retry: falling back to direct connection');
-check('阶梯 H：直连首跳后首字节超时，触发反代池回退',
-    directFirstIdx >= 0 && poolRetryIdx > directFirstIdx,
-    `idx=${directFirstIdx},${poolRetryIdx} logs=${logs.join(' | ')}`);
-check('阶梯 H：反代池回退后首字节超时，继续降到官方池',
-    officialRetryIdx > poolRetryIdx,
-    `idx=${poolRetryIdx},${officialRetryIdx} logs=${logs.join(' | ')}`);
-check('阶梯 H：官方池回退后首字节超时，继续降到直连兜底',
-    finalDirectIdx > officialRetryIdx,
-    `idx=${officialRetryIdx},${finalDirectIdx} logs=${logs.join(' | ')}`);
-check('阶梯 H：逐级回退期间客户端 WS 未被旧 socket 的清理误关',
-    webSocketCloseCalls === 0,
-    `closeCalls=${webSocketCloseCalls} status=${timeoutRun?.status}`);
-check('阶梯 H：整个降级链跑完后仍返回 101',
-    timeoutRun?.status === 101,
-    `status=${timeoutRun?.status}`);
 
 for (const level of ['log', 'info', 'warn', 'error', 'debug']) console[level] = originalConsole[level];
 
