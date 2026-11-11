@@ -6,7 +6,7 @@ import {
     WS_READY_STATE_OPEN,
     connectSocket
 } from './common';
-import { evictOldest } from '@common';
+import { evictOldest, safeErrorMessage } from '@common';
 
 // 对齐 cfnew c0eb20c（明文源吗 L33-40）：隐私增强 —— 智能剥离随机填充前缀
 // 客户端首包可能携带 [0xED 0x7F][2 字节 padLen][padLen 字节随机填充]，若不剥离直接做
@@ -23,6 +23,11 @@ import { evictOldest } from '@common';
 const PRIVACY_MAGIC = 0xED7F;
 const PRIVACY_PAD_MIN = 64;
 const PRIVACY_PAD_MAX = 2048;
+
+// 上行合批（阶段 2）：握手完成后的数据帧是纯字节，攒批直写后端 TCP，减少逐帧 write 调用。
+// 32KiB 与 socket 写批次对齐；2ms 是为了「最后一帧发完就等响应」的场景不至于卡在缓冲里。
+const UPLINK_BATCH_SIZE = 32 * 1024;
+const UPLINK_BATCH_DELAY_MS = 2;
 // 等待态允许保留的字节上限：判定所需的头部最长就是 [魔数 2][长度 2][填充 2048] = 2052。
 // 超过它只会来自畸形/恶意帧，直接判为无填充交回，放任缓冲增长就是内存放大面。
 const PRIVACY_PROBE_LIMIT = 4 + PRIVACY_PAD_MAX;
@@ -128,6 +133,9 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
     const paddingProbe: PrivacyProbe = { pending: null }; // V-02：填充头部被拆帧时的跨帧累积态
     let udpStreamWrite: any = null;
     let isDns = false;
+    // 阶段 2 标记：首包握手完成（write() 里 socket 可直写的那一帧）后置位，
+    // 置位后上行泵不再逐帧穿过 sink，改为攒批直写（见文件末尾的上行泵与切换点注释）。
+    let byteStreamMode = false;
 
     // ===== WS 本地测速模式（对齐 cfnew L4538-4542）=====
     let wsLocalSpeedTestMode = false;
@@ -183,7 +191,7 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
 
     // ===== 首包非法的主动收口（H5 残留）=====
     // 首包已到达却无法建连（既非合法 VLESS 也非合法 Trojan，或协议已认出但头畸形）时统一收口。
-    // 此前只有 write() 抛错，WS 关闭完全依赖 pipeTo 在目标流 write 失败后隐式触发的 source.cancel()
+    // 此前只有 write() 抛错，WS 关闭完全依赖上行泵在目标流 write 失败后隐式触发的 source.cancel()
     // → common.ts 的 safeCloseWebSocket（不带 code → 客户端看到 1005），且日志与「管道异常」混在一起。
     // 现在显式 close(1008)：客户端立刻拿到确定的关闭码，日志也能区分「首包非法」与「管道异常」。
     // 只在「已判定首包非法」时调用（调用点全部在 write() 内、非空帧、协议识别之后）：
@@ -202,7 +210,7 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
      * 「协议已锁定」路径与「首包探测」路径各写了一份 VLESS / Trojan 处理，本函数是唯一实现。
      *  - buffer：两条路径传的是同一个值，只是变量名不同（chunk / firstChunk）；
      *  - onInvalid：探测路径额外把「首包非法」显式收口（close 1008 + 服务端日志），
-     *    已锁定协议那条只抛错（由 pipeTo 的隐式取消关掉，行为与改动前一致）；
+     *    已锁定协议那条只抛错（由上行泵的取消/中止路径关掉，行为与改动前一致）；
      *  - preParsed：探测路径已经解析过一次的结果（tryParse* 的返回值）。传进来就复用，
      *    不再解析第二遍 —— Trojan 的 SHA-224 是纯 JS 实现，二次解析等于白算一次 56 字节哈希；
      *  - 函数内的 return 只结束本函数：两条调用路径在调用点之后都没有尾部代码，
@@ -317,6 +325,30 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
         );
     };
 
+    // 回退阶梯（common.ts handleRetryConnection）可能替换 remoteSocketWrapper.value，
+    // 旧 writer 仍绑着已关闭的 socket；写前必须校验并重建，否则回退路径永远写不出去。
+    // sink 的逐帧写入与上行泵的合批写入共用这一处，避免两份实现漂移。
+    const ensureRemoteWriter = (): WritableStreamDefaultWriter<Uint8Array> | null => {
+        const socket = remoteSocketWrapper.value;
+        if (!socket) return null;
+        if (!remoteWriter || remoteWriterSocket !== socket) {
+            if (remoteWriter) {
+                try { remoteWriter.releaseLock(); } catch (_) { /* already released */ }
+            }
+            remoteWriter = socket.writable.getWriter();
+            remoteWriterSocket = socket;
+        }
+        return remoteWriter;
+    };
+
+    // socket 存在时 ensureRemoteWriter 必然返回 writer；集中在这里报错，调用点不再各自判空
+    // （此前 write() 与合批路径各写了一次同样的判空 + 同样的错误文案）。
+    const writerOrThrow = (): WritableStreamDefaultWriter<Uint8Array> => {
+        const writer = ensureRemoteWriter();
+        if (!writer) throw new Error('remote socket is not available');
+        return writer;
+    };
+
     const writableStream = new WritableStream({
         async write(chunk) {
             // 对齐 cfnew c0eb20c：0xED7F 魔数+随机填充只在本次连接的首包上判定/剥离一次。
@@ -342,16 +374,12 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
             }
 
             if (remoteSocketWrapper.value) {
-                // FIRST_BYTE_TIMEOUT 回退会替换 remoteSocketWrapper.value（common.ts handleRetryConnection），
-                // 旧 writer 仍指向已关闭的 socket；写前校验并解绑重建，否则回退路径永远写不出去。
-                if (!remoteWriter || remoteWriterSocket !== remoteSocketWrapper.value) {
-                    if (remoteWriter) {
-                        try { remoteWriter.releaseLock(); } catch (_) { /* already released */ }
-                    }
-                    remoteWriter = remoteSocketWrapper.value.writable.getWriter();
-                    remoteWriterSocket = remoteSocketWrapper.value;
-                }
-                await remoteWriter.write(chunk);
+                await writerOrThrow().write(chunk);
+                // ===== 两阶段切换点（阶段 1 → 阶段 2）=====
+                // 不变量：能走到这里说明填充判定已结束（paddingStripped）、协议已识别（protocolType）、
+                // 后端 TCP 已建立且这一帧写成功；DNS / 本地测速分支都在前面 return，到不了这里。
+                // 从下一帧起帧边界不再有意义，交给上行泵攒批直写，不再逐帧穿过本 sink。
+                byteStreamMode = true;
                 return;
             }
 
@@ -404,12 +432,108 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
         },
     });
 
-    readableWebSocketStream
-        .pipeTo(writableStream)
-        .catch(error => {
-            log("readableWebSocketStream pipeTo error", error);
-            safeCloseTcpSocket(remoteSocketWrapper.value);
-        });
+    // ===== 上行泵（替代 readableWebSocketStream.pipeTo(writableStream)）=====
+    // 两阶段：
+    //   阶段 1（握手期）：逐帧交给 writableStream，由它完成填充剥离、测速拦截、DNS 分流、协议识别；
+    //   阶段 2（byteStreamMode）：sink 判定后端 TCP 可直写后，后续帧是纯字节流，
+    //     由泵攒批（32KiB / 2ms）后直接写 remoteWriter，不再逐帧穿过 sink。
+    // 背压：主循环在每次读新帧前 await 上一批写；内存上界约一批 32KiB（缓冲按需分配，只走阶段 1 的连接不占）。
+    // 收尾：两个阶段结束都仍走 uplinkWriter.close()，由 sink 的 close() 解绑 writer 并关 TCP；
+    //   任一侧出错 → cancel 源 + abort 目标，并关掉出站 socket。
+    // 日志文案保持 "readableWebSocketStream pipeTo error" 不变，避免影响既有排障习惯。
+    const uplinkReader = readableWebSocketStream.getReader();
+    const uplinkWriter = writableStream.getWriter();
+
+    let batchBuffer: Uint8Array | null = null;
+    let batchOffset = 0;
+    let batchTimer: ReturnType<typeof setTimeout> | null = null;
+    let activeFlush: Promise<void> | null = null;
+    let uplinkFailed = false;
+
+    const clearBatchTimer = () => {
+        if (batchTimer) { clearTimeout(batchTimer); batchTimer = null; }
+    };
+
+    const writeRemote = (chunk: Uint8Array): Promise<void> => writerOrThrow().write(chunk);
+
+    // 唯一收口：同一笔 flush 失败可能同时被 2ms 定时器与主循环观察到（两者拿到的是同一个 rejection），
+    // first-wins 保证只记一条日志、只关一次 socket。
+    const failUplink = (error: unknown): void => {
+        if (uplinkFailed) return;
+        uplinkFailed = true;
+        log("readableWebSocketStream pipeTo error", safeErrorMessage(error));
+        safeCloseTcpSocket(remoteSocketWrapper.value);
+    };
+
+    // 刷批前先拷贝：batchBuffer 立即复用，不会被在途写读到半截数据。
+    const flushBatch = (): Promise<void> => {
+        clearBatchTimer();
+        if (!batchOffset || !batchBuffer) return activeFlush ?? Promise.resolve();
+        const length = batchOffset;
+        batchOffset = 0;
+        const chunk = batchBuffer.subarray(0, length).slice();
+        const pending = writeRemote(chunk);
+        activeFlush = pending;
+        // 成功即清空；失败保留 activeFlush，让主循环拿到同一个 rejection 走 failUplink 统一收口。
+        pending.then(
+            () => { if (activeFlush === pending) activeFlush = null; },
+            () => { /* 保留 activeFlush，异常由定时器或主循环收口 */ }
+        );
+        return pending;
+    };
+
+    const scheduleFlush = () => {
+        if (batchTimer) return;
+        batchTimer = setTimeout(() => {
+            batchTimer = null;
+            // 定时器路径无人 await：失败就地交给 failUplink（幂等），避免连接半死不活。
+            flushBatch().catch(failUplink);
+        }, UPLINK_BATCH_DELAY_MS);
+    };
+
+    const writeBatched = async (value: ArrayBuffer): Promise<void> => {
+        const chunk = new Uint8Array(value);
+        // 大帧直写：不进 32KiB 缓冲，省掉一次拷贝。
+        if (chunk.byteLength >= UPLINK_BATCH_SIZE) {
+            await flushBatch();
+            await writeRemote(chunk);
+            return;
+        }
+        if (batchOffset + chunk.byteLength > UPLINK_BATCH_SIZE) await flushBatch();
+        // 缓冲按需分配：只走阶段 1 的连接（DNS / 本地测速 / 握手失败）不占这 32KiB。
+        const buffer = batchBuffer ?? (batchBuffer = new Uint8Array(UPLINK_BATCH_SIZE));
+        buffer.set(chunk, batchOffset);
+        batchOffset += chunk.byteLength;
+        if (batchOffset >= UPLINK_BATCH_SIZE) await flushBatch();
+        else scheduleFlush();
+    };
+
+    void (async () => {
+        try {
+            for (;;) {
+                if (activeFlush) await activeFlush;
+                const { done, value } = await uplinkReader.read();
+                if (done) break;
+                if (!value?.byteLength) continue;
+                if (!byteStreamMode) {
+                    // 阶段 1；byteStreamMode 可能在本帧的 write() 内被置位，下一帧生效（首包保持单帧）。
+                    await uplinkWriter.write(value);
+                    continue;
+                }
+                await writeBatched(value);
+            }
+            await flushBatch();
+            await uplinkWriter.close();
+        } catch (error) {
+            failUplink(error);
+            try { await uplinkReader.cancel(error); } catch (_) { /* 流已关闭/已取消 */ }
+            try { await uplinkWriter.abort(error); } catch (_) { /* 流已关闭/已中止 */ }
+        } finally {
+            clearBatchTimer();
+            try { uplinkReader.releaseLock(); } catch (_) { /* 已释放 */ }
+            try { uplinkWriter.releaseLock(); } catch (_) { /* 已释放 */ }
+        }
+    })();
 
     // 自定义头泄露修复：不再回写 UUID 派生的填充头。
     // 旧实现用 getXPaddingIdentifier(uuid) 的头名/键名回写随机填充，等于把 UUID 的 12 个 hex 字符

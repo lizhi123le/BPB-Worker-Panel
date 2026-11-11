@@ -57,7 +57,7 @@ const ORIGIN = 'https://panel.example.com';
 /** 需要"上一步刚拿到的登录 cookie"的请求用这个哨兵，实际值在发请求时替换。 */
 const COOKIE_SENTINEL = '__live_cookie__';
 
-// 让"挂在那里"的 WebSocket pipeTo() promise 自己烂掉，而不是拖死进程。
+// 让"挂在那里"的 WebSocket 上行泵 promise 自己烂掉，而不是拖死进程。
 // uncaughtException 故意不吞：真崩溃必须让闸门失败。
 process.on('unhandledRejection', (reason) => {
   const message = reason && reason.message ? reason.message : String(reason);
