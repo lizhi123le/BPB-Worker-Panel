@@ -71,7 +71,8 @@ export default {
 				// 与空段根路径，而下面的字典校验对「含字典外段」的 WS 路径已经直接拦成 429。
 				// 换句话说，能通过字典校验的 WS 请求，按 guardPermanentBlacklist 的判据本来就一定
 				// 会 return null；再调一次只是白付一次函数调用与潜在的 KV 读。
-				const wsSegments = globalThis.globalConfig.pathName.split('/').filter(Boolean);
+				const wsPathName = globalThis.globalConfig.pathName;
+				const wsSegments = wsPathName.split('/').filter(Boolean);
 
 				// F-22（H5 剩余项）：路径字典校验 —— 与 HTTP 非内置路径同一判据。
 				// 只补字典校验、不补限流：每一次 WS 连接（含客户端断线自动重连）都是一个请求，
@@ -86,12 +87,12 @@ export default {
 					|| !!(wsAdminPath && wsSegments[0].toLowerCase() === wsAdminPath)
 					|| isPathInDictionary(wsSegments);
 				if (!wsPathAllowed) {
-					console.warn(`[路径字典] WS 升级路径 ${globalThis.globalConfig.pathName} 不在公共路径字典内，按伪造探测拦截`);
+					console.warn(`[路径字典] WS 升级路径 ${wsPathName} 不在公共路径字典内，按伪造探测拦截`);
 					return await cf1101RateLimitedResponse(new URL(request.url).host, request.headers.get('CF-Connecting-IP') || '');
 				}
 
 				// C-13：与 HTTP 路径共用同一套必填凭据校验（此前 WS 完全跳过，缺凭据时静默鉴权失败）
-				assertRequiredCredentials(env, globalThis.globalConfig.pathName);
+				assertRequiredCredentials(env, wsPathName);
 
 				initWs(env);
 				await setSettings(request, env);

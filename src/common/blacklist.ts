@@ -69,20 +69,11 @@ async function readPermanentBlacklist(kv: KVNamespace): Promise<Set<string> | nu
         if (!Array.isArray(parsed)) throw new Error('KV 永久黑名单数据格式异常');
         const fresh = new Set<string>(parsed);
         for (const ip of blacklistCache ?? []) fresh.add(ip);
-        trimBlacklist(fresh);
+        evictOldest(fresh, BLACKLIST_MAX_ENTRIES);
         return fresh;
     } catch (e) {
         console.warn('[永久黑名单] KV 读取失败:', (e as Error)?.message ?? String(e));
         return null;
-    }
-}
-
-/** 超限时丢弃最旧的封禁，把名单规模钉在 BLACKLIST_MAX_ENTRIES。 */
-function trimBlacklist(blacklist: Set<string>): void {
-    while (blacklist.size > BLACKLIST_MAX_ENTRIES) {
-        const oldest = blacklist.values().next();
-        if (oldest.done) return;
-        blacklist.delete(oldest.value);
     }
 }
 
@@ -194,7 +185,7 @@ export async function recordViolationAndMaybeBan(
             blacklist.add(ip);
             // 入列后同样封顶：否则写回 KV 的会是一份无界增长的名单，
             // 下次任何 isolate 载入它都要付 O(条数) 的解析成本
-            trimBlacklist(blacklist);
+            evictOldest(blacklist, BLACKLIST_MAX_ENTRIES);
             blacklistCacheTime = Date.now();
             ctx.waitUntil(
                 withTimeout(kv.put(BLACKLIST_KV_KEY, JSON.stringify([...blacklist])), 2000, 'KV 黑名单写入')

@@ -36,18 +36,23 @@ export function isKvBound(env: any): boolean {
 }
 
 /**
- * 按插入顺序淘汰最旧条目，直到 `map.size <= maxSize`（Map 的迭代顺序就是插入顺序）。
+ * 按插入顺序淘汰最旧条目，直到 `size <= maxSize`（Map/Set 的迭代顺序就是插入顺序）。
  *
- * 全仓库「内存 Map 容量兜底」共用这一份实现。两点语义要注意，改动时必须对照调用点：
+ * 全仓库「内存容器容量兜底」共用这一份实现。三点语义要注意，改动时必须对照调用点：
  *  1) 判据是「超出 maxSize 才删」。插入**之后**调用、要求落库后不超过 MAX 的，传 MAX；
  *     插入**之前**先腾位置的（原写法 `while (size >= MAX)`），传 `MAX - 1`，插入后才正好 ≤ MAX。
  *  2) 只在真超限时迭代，未超限时 0 次分配、0 次迭代。
+ *  3) 参数用结构化类型而不是 Map：永久黑名单是 Set，算法完全相同，
+ *     不该为了类型差异再写第二份实现。
  */
-export function evictOldest<K, V>(map: Map<K, V>, maxSize: number): void {
-    while (map.size > maxSize) {
-        const oldest = map.keys().next();
+export function evictOldest<K>(
+    container: { size: number; keys(): IterableIterator<K>; delete(key: K): unknown },
+    maxSize: number
+): void {
+    while (container.size > maxSize) {
+        const oldest = container.keys().next();
         if (oldest.done) return;
-        map.delete(oldest.value);
+        container.delete(oldest.value);
     }
 }
 

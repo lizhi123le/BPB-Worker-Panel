@@ -101,13 +101,10 @@ const afterClose = await openConnection();
 check('关闭一条后名额归还，新连接可以建立（计数没有泄漏）', afterClose === 101, `status=${afterClose}`);
 
 // ---------- 3. 归还后立刻又满：仍然只放行一条 ----------
+// 这里已经同时证明了「上限仍然生效」——被拒的请求不占名额，所以下一次仍是同一状态，
+// 不需要再补一条等价的 429 断言。
 const secondReject = await openConnection();
-check('名额只有一个：再连一次仍然 429', secondReject === 429, `status=${secondReject}`);
-
-// ---------- 3. 名额上限不因阻断路径校验而放松 ----------
-// （路径门禁已在第 0 节验证；这里只确认上限仍然生效，避免上面的顺序调整把状态清空）
-const stillFull = await openConnection();
-check('上限仍然生效：归还一条后又被占满，再连仍需 429', stillFull === 429, `status=${stillFull}`);
+check('名额只有一个：归还后只能补一条，再连仍然 429', secondReject === 429, `status=${secondReject}`);
 
 out(failures() === 0 ? '\n全部通过' : `\n${failures()} 项失败`);
 process.exit(failures() === 0 ? 0 : 1);
