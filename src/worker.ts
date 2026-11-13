@@ -65,7 +65,13 @@ export default {
 			if (upgradeHeader === 'websocket') {
 				// H5：WS 分支此前完全绕过守卫，任何路径都能稳定拿到 101。
 				// 现在的顺序：永久黑名单（H5）→ 路径字典（F-22）→ 必填凭据（C-13）→ handleWebsocket。
-				const wsGuarded = await guardPermanentBlacklist(request, env);
+				// 先算出路径段再交给守卫：守卫内部要用它们判「是否为内置随机路径组合」，
+				// 下面第 F-22 步的字典校验还要用同一组段 —— 算一次、传下去，别再算第二遍。
+				const wsUrl = new URL(request.url);
+				const { pathName: wsPathName } = globalThis.globalConfig;
+				const wsSegments = wsPathName.split('/').filter(Boolean);
+
+				const wsGuarded = await guardPermanentBlacklist(request, env, wsSegments);
 				if (wsGuarded) return wsGuarded;
 
 				// F-22（H5 剩余项）：黑名单之外再补路径字典校验 —— 与 HTTP 非内置路径同一判据。
@@ -76,9 +82,6 @@ export default {
 				// 另：WS 分支无法按「已认证连接豁免」—— 认证要等首包，101 之前拿不到身份。
 				// 两类豁免都不能误杀：根路径（旧订阅的 `/?ed=2560` 形态）与管理员路径
 				// （用户手工把 WS 路径设成 SUB_PATH / UUID 的旧配置）。
-				const wsUrl = new URL(request.url);
-				const { pathName: wsPathName } = globalThis.globalConfig;
-				const wsSegments = wsPathName.split('/').filter(Boolean);
 				const wsAdminPath = String((env as any).SUB_PATH || (globalThis as any).globalConfig?.userID || '')
 					.toLowerCase()
 					.replace(/^\//, '');
@@ -155,16 +158,10 @@ export default {
 					default:
 						// 根路径 /：从设置的 URL 伪装地址池随机抽一个，图片则全屏拉伸显示
 						//
-						// 这里刻意**不**做永久黑名单检查（曾经加过，已撤回）。原因不是安全语义，
-						// 而是 CPU 成本模型：loadPermanentBlacklist 每 60s 过期一次，过期后由
-						// 「第一个到达的请求」承担 KV 读 + JSON.parse(整个名单) + new Set(全部条目)，
-						// 成本是 O(黑名单规模) 且集中摊在单个请求上。`/` 承担了几乎所有流量，
-						// 于是每个 isolate 每 60s 就有一次请求要额外烧 4~25ms（视名单大小），
-						// 在 10ms 预算下表现为「CPU 超限规律性复发」。
-						// 实测：2 万条 ≈4.3ms，5 万条 ≈13.7ms，10 万条 ≈25ms。
-						// 扫路径的违规计数仍是黑名单的触发源，而黑名单只对不守规矩的 IP 有意义；
-						// 让每个正常访客的首页请求替它摊销这点收益并不划算。
-						// 若要重新引入，必须换成每 IP 一个 KV 键（O(1) 读）而不是整表解析。
+						// 这里刻意**不**做永久黑名单检查：黑名单是整表 JSON，刷新成本 O(名单规模)
+						// 且每 60s 集中摊在一个请求上，`/` 流量最大，承受不起（曾因此导致
+						// 「CPU 超限规律性复发」）。完整成本模型与豁免规则见
+						// firstCheck.ts 的 guardPermanentBlacklist 注释，此处不再重复。
 						if (pathName === '/' || pathName === '') {
 							return await camouflageProxy(request, env);
 						}

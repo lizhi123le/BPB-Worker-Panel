@@ -4,7 +4,8 @@ import { camouflageProxy, cf1101RateLimitedResponse } from "./camouflage";
 
 /**
  * 非内置路径守卫 — 对齐 cfnew 的安全三件套：
- *  1. 永久黑名单检查（IP 累计违规超阈值 → 直接 429）
+ *  1. 永久黑名单检查（IP 累计违规超阈值 → 直接 429）；
+ *     注意：根路径与「每段都在字典内」的随机路径组合豁免此步，见 guardPermanentBlacklist。
  *  2. 路径字典校验 + 速率限制（字典路径视为合法公开路径，不限流不计数；
  *     仅路径含字典外段才触发限流与违规计数，避免误伤伪装站点正常流量）
  *  3. 未命中限流 → 全路径伪装反代（字典内路径同样伪装）
@@ -33,16 +34,23 @@ interface GuardContext {
  *     随机路径的 CPU 上限由 camouflageProxy 的熔断兜底（覆盖全部路径、O(1)）。
  *
  * 缺 IP / 缺 env.kv 时一律放行：KV 未绑定不能把隧道打死。
+ *
+ * @param segments 调用方已算好的路径段。传进来可省掉本函数内一次 split 与字典判定
+ *                 （调用方通常已经为「字典校验」算过同一组段）。
  */
-export async function guardPermanentBlacklist(request: Request, env: any): Promise<Response | null> {
+export async function guardPermanentBlacklist(
+    request: Request,
+    env: any,
+    segments?: string[]
+): Promise<Response | null> {
     const ip = request.headers.get('CF-Connecting-IP') || '';
     const kv = env?.kv as KVNamespace | undefined;
     if (!ip || !kv) return null;
 
     const reqURL = new URL(request.url);
     // 根路径（空段）与「每段都在字典内」的随机路径组合：豁免，不触发整表解析
-    const segments = reqURL.pathname.split('/').filter(Boolean);
-    if (segments.length === 0 || isPathInDictionary(segments)) return null;
+    const segs = segments ?? reqURL.pathname.split('/').filter(Boolean);
+    if (segs.length === 0 || isPathInDictionary(segs)) return null;
 
     if (!await isPermanentBlacklisted(ip, kv)) return null;
 
@@ -77,8 +85,8 @@ export async function guardNonBuiltinPath(
     const ip = request.headers.get('CF-Connecting-IP') || '';
     const kv = env?.kv as KVNamespace | undefined;
 
-    // 1. 永久黑名单（与根路径、WS 升级共用同一份守卫）
-    const blocked = await guardPermanentBlacklist(request, env);
+    // 1. 永久黑名单（与 WS 升级共用同一份守卫；传入已算好的 segments 避免重复判定）
+    const blocked = await guardPermanentBlacklist(request, env, segments);
     if (blocked) return blocked;
 
     // 2. 路径字典校验 + 限流（字典路径视为合法公开路径，不限流不计数；
