@@ -71,7 +71,7 @@ check('WS：字典内随机路径仍可正常升级（未被误伤）', okPath.s
 if (okPath.status === 101) state.lastPair[1].listeners.close?.forEach((fn) => fn());
 
 // ---------- 1. 一直连到被拒，确认上限数值与拒绝方式 ----------
-const EXPECTED_LIMIT = 128;   // 与 unified.ts 的 WS_MAX_CONNECTIONS 对齐
+const EXPECTED_LIMIT = 512;   // 与 unified.ts 的 WS_MAX_CONNECTIONS 对齐
 let opened = 0;
 let rejectedAt = null;
 for (let i = 0; i < EXPECTED_LIMIT + 5; i++) {
@@ -87,7 +87,8 @@ for (let i = 0; i < EXPECTED_LIMIT + 5; i++) {
 check(`上限内全部建立成功（${EXPECTED_LIMIT} 条）`, opened === EXPECTED_LIMIT, `opened=${opened}`);
 check('超限请求被拒，且状态码为 429', rejectedAt !== null && rejectedAt.status === 429,
     `rejectedAt=${JSON.stringify(rejectedAt)}`);
-check('拒绝发生在第 129 次尝试（边界不多不少）', rejectedAt !== null && rejectedAt.attempt === EXPECTED_LIMIT + 1,
+check(`拒绝发生在第 ${EXPECTED_LIMIT + 1} 次尝试（边界不多不少）`,
+    rejectedAt !== null && rejectedAt.attempt === EXPECTED_LIMIT + 1,
     `attempt=${rejectedAt?.attempt}`);
 check('拒绝时打出了「已达上限」日志', logs.some((l) => l.includes('[WS 连接上限]')));
 
