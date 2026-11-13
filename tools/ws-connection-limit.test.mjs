@@ -71,7 +71,7 @@ check('WS：字典内随机路径仍可正常升级（未被误伤）', okPath.s
 if (okPath.status === 101) state.lastPair[1].listeners.close?.forEach((fn) => fn());
 
 // ---------- 1. 一直连到被拒，确认上限数值与拒绝方式 ----------
-const EXPECTED_LIMIT = 512;   // 与 unified.ts 的 WS_MAX_CONNECTIONS 对齐
+const EXPECTED_LIMIT = 256;   // 与 unified.ts 的 WS_MAX_CONNECTIONS 对齐
 let opened = 0;
 let rejectedAt = null;
 for (let i = 0; i < EXPECTED_LIMIT + 5; i++) {

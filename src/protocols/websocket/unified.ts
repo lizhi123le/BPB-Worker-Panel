@@ -106,19 +106,19 @@ export { getXPaddingIdentifier } from '@utils';
  * 为什么按「连接数」而不是「请求数」限量：一条 WS 连接是长连接，可以承载几个 GB，
  * 用请求数计量对它没有意义。真正的约束是 isolate 的内存 —— 每条连接固定占
  * 下载 BYOB 缓冲 64KiB + 下载合批缓冲 24~40KiB + 上行合批缓冲 32KiB ≈ 130KiB，
- * 512 条满载 ≈ 66MiB，相对 128MiB 上限属于「贴着上限走」：
- * 再叠加 4MiB 伪装缓存、面板资源与 GC 峰值，离触发 exceededMemory 已经不远。
+ * 256 条满载 ≈ 33MiB，相对 128MiB 上限留出约 1/4 的余量给伪装缓存、面板资源与 GC 峰值。
+ * （512 条时 ≈ 66MiB，属于「贴着上限走」，因此下调回 256。）
  *
  * 这个值是**可调上界**而非安全值：如果你的部署确实需要更多并发，
  * 可以继续调高，但请同步观察 Memory 指标（Workers 的 exceededMemory 不会提前告警）。
- * 反过来，正常自用场景几条到几十条足够，512 已经是相当宽松的余量。
+ * 反过来，正常自用场景几条到几十条足够，256 已经是相当宽松的余量。
  *
  * 超限时直接 429，不 accept 服务端 socket、不分配任何缓冲 —— 成本几乎为零。
  * 批量开 WS 是常见探测手法，上限把它的内存占用钉死（对齐 XHTTP 的 XHTTP_MAX_CONNECTIONS 思路）。
  * 名额在 close / error / 流 cancel 三条路径上释放：复用 registerWsCleanup 的清理钩子，
  * 那条路径已经覆盖全部退出方式，不需要再挂 close 监听。
  */
-const WS_MAX_CONNECTIONS = 512;
+const WS_MAX_CONNECTIONS = 256;
 let activeWsConnections = 0;
 
 export async function UnifiedWSHandler(request: Request): Promise<Response> {
