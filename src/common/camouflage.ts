@@ -348,6 +348,17 @@ function wrapImageResponse(body: ArrayBuffer, status: number, contentType: strin
     return new Response(html, { status, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
+/**
+ * 图片缓存命中则返回包装页，未命中返回 null（不产生任何网络请求）。
+ * 抽出来是为了让 camouflageProxy 能在**扣熔断额度之前**先判命中 —— 缓存命中是廉价路径，
+ * 不该消耗保护真实出站的额度。
+ */
+function peekImageCache(maskURL: URL): Response | null {
+    const cached = maskImageCache.get(maskURL.href);
+    if (!cached) return null;
+    return wrapImageResponse(cached.body as ArrayBuffer, cached.status, cached.contentType, maskURL.hostname);
+}
+
 /** 图片伪装分支（对齐 cfnew）：
  *  - 无论请求路径是什么（/ 或 /随机路径），都返回同一张样式化图片；
  *    缓存键 = 目标图片完整地址（非请求路径），无 TTL，仅 12 张 FIFO 淘汰。
@@ -356,10 +367,8 @@ function wrapImageResponse(body: ArrayBuffer, status: number, contentType: strin
  *  - 失败返回 null，降级普通伪装反代。 */
 async function tryServeImage(maskURL: URL): Promise<Response | null> {
     const url = maskURL.href;
-    const cached = maskImageCache.get(url);
-    if (cached) {
-        return wrapImageResponse(cached.body as ArrayBuffer, cached.status, cached.contentType, maskURL.hostname);
-    }
+    const cached = peekImageCache(maskURL);
+    if (cached) return cached;
     const headers = buildMaskedHeaders(new Headers(), maskURL);
     headers.set('Referer', maskURL.origin + '/');
     headers.set('Accept', 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8');
@@ -604,13 +613,14 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
         });
     }
 
-    // 图片伪装
-    if (IMAGE_EXT_RE.test(target)) {
-        const imgResp = await tryServeImage(maskURL);
-        if (imgResp) return imgResp;
+    const reqURL = new URL(request.url);
+    // 图片目标：缓存命中先短路 —— 命中不消耗熔断额度（与首页缓存同一套语义）
+    const isImageTarget = IMAGE_EXT_RE.test(target);
+    if (isImageTarget) {
+        const cachedImg = peekImageCache(maskURL);
+        if (cachedImg) return cachedImg;
     }
 
-    const reqURL = new URL(request.url);
     // 缓存键用「实际转发给上游的 path + query」按噪声参数归一化后拼成，
     // 保证「键」与「内容」严格对应：请求原样转发，只有键被归一化。
     const cacheKey = maskURL.origin + reqURL.pathname + normalizeCacheQuery(reqURL.search);
@@ -628,6 +638,10 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
 
     // 熔断必须在 fetch 之前：一旦放行，后面就是 clone + text() + replaceAll 的 1MB 级字符串处理，
     // 事后再想省 CPU 已经晚了。命中额度上限时给内建 1101 页（与「未设置伪装域名」同一张页）。
+    //
+    // 位置刻意在**两个缓存查询之后**：命中缓存是廉价路径，不消耗额度；
+    // 同时又刻意在**图片分支之前** —— 图片取图要 arrayBuffer + base64 拼接，同样是重 CPU，
+    // 此前它跑在熔断之外，等于图片伪装目标完全没有保护（每个请求只扣一次额度）。
     // 不区分路径：根路径与节点随机路径（字典内路径）共用同一份额度，否则随机路径等于没有保护。
     if (maskProxyBudgetExhausted()) {
         console.warn('[伪装熔断] 本窗口真实反代额度已用尽，降级内建页');
@@ -635,6 +649,12 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
             status: 200,
             headers: withHsts({ 'Content-Type': 'text/html; charset=UTF-8' }, env)
         });
+    }
+
+    // 图片伪装：上面已确认缓存未命中，这里的取图会真正出站
+    if (isImageTarget) {
+        const imgResp = await tryServeImage(maskURL);
+        if (imgResp) return imgResp;
     }
 
     const headers = buildMaskedHeaders(request.headers, maskURL);

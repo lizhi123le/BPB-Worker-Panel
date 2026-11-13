@@ -100,11 +100,39 @@ export function probePrivacyPadding(chunk: ArrayBuffer, state: PrivacyProbe): Ar
 // 实现已下沉到 @utils（xray JSON / raw URI / XHTTP 入站共用同一份派生规则），此处保留再导出以兼容既有 import。
 export { getXPaddingIdentifier } from '@utils';
 
+/**
+ * 每 isolate 的活动 WS 连接上限。
+ *
+ * 为什么按「连接数」而不是「请求数」限量：一条 WS 连接是长连接，可以承载几个 GB，
+ * 用请求数计量对它没有意义。真正的约束是 isolate 的内存 —— 每条连接固定占
+ * 下载 BYOB 缓冲 64KiB + 下载合批缓冲 24~40KiB + 上行合批缓冲 32KiB ≈ 130KiB，
+ * 128 条 ≈ 17MiB，相对 128MiB 夹上留足余量（还要容纳 4MiB 伪装缓存与面板资源）。
+ *
+ * 超限时直接 429，不 accept 服务端 socket、不分配任何缓冲 —— 成本几乎为零。
+ * 批量开 WS 是常见探测手法，上限把它的内存占用钉死（对齐 XHTTP 的 XHTTP_MAX_CONNECTIONS 思路）。
+ * 名额在 close / error / 流 cancel 三条路径上释放：复用 registerWsCleanup 的清理钩子，
+ * 那条路径已经覆盖全部退出方式，不需要再挂 close 监听。
+ */
+const WS_MAX_CONNECTIONS = 128;
+let activeWsConnections = 0;
+
 export async function UnifiedWSHandler(request: Request): Promise<Response> {
     // 对齐 cfnew d4b2b7f：优先用请求绑定的 fetcher 建连（新版 Workers 运行时可能缺全局 connect）
     const fetcher = request.fetcher;
     const webSocketPair = new WebSocketPair();
     const [client, webSocket] = Object.values(webSocketPair);
+
+    // 先抢名额再 accept：超限时连 socket 都不接，直接回 429（与 XHTTP 的同名响应保持一致）
+    if (activeWsConnections >= WS_MAX_CONNECTIONS) {
+        console.warn(`[WS 连接上限] 已达 ${WS_MAX_CONNECTIONS} 条，拒绝新连接`);
+        return new Response('Too many connections', { status: 429 });
+    }
+    activeWsConnections++;
+    // 名额随连接生命周期释放；release 幂等（清理钩子只跑一次，且计数不会降到负）
+    registerWsCleanup(webSocket, () => {
+        if (activeWsConnections > 0) activeWsConnections--;
+    });
+
     webSocket.accept();
     webSocket.binaryType = 'arraybuffer';
 

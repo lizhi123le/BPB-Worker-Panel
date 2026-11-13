@@ -15,6 +15,7 @@
     "test:wsbatch": "node tools/ws-uplink-batch.test.mjs",
     "test:proxyip": "node tools/proxy-ip-limit.test.mjs",
     "test:camouflage": "node tools/camouflage-cpu.test.mjs",
+    "test:wslimit": "node tools/ws-connection-limit.test.mjs",
     "test:pool": "node tools/proxy-pool-draw.test.mjs",
     "obfuscate": "node scripts/obfuscate.mjs",
     "verify": "node scripts/verify.mjs",

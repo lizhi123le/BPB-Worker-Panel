@@ -279,7 +279,28 @@ await (await get(`/about?bulk=${distinct - 1}`)).text();
 check('缓存字节有界：最近的条目仍在缓存（0 次出站）', fetchCount === beforeHot,
     `before=${beforeHot} now=${fetchCount}`);
 
-// ---------- 9. 熔断必须覆盖「内置随机路径」，而不只是根路径 ----------
+// ---------- 9. 图片伪装：正常出站一次，之后命中图片缓存 ----------
+// 图片目标没走改写，但 arrayBuffer + base64 拼接同样是重 CPU，因此它也要在熔断范围内。
+const IMAGE_TARGET = 'https://upstream.example.net/photo.jpg';
+const imageEnv = { ...env, FALLBACK: IMAGE_TARGET };
+const getImage = () => handler.fetch(
+    new Request(ORIGIN + '/', { headers: { Host: 'panel.example.com', 'CF-Connecting-IP': '203.0.113.9' } }),
+    imageEnv,
+    ctx
+);
+
+plan = { mode: 'known', body: 'JPEGDATA'.repeat(100), extra: { 'content-type': 'image/jpeg' } };
+const beforeImage = fetchCount;
+const firstImage = await getImage();
+const firstImageText = await firstImage.text();
+check('图片伪装：首请求确实出站取图（1 次 fetch）', fetchCount === beforeImage + 1, `before=${beforeImage} now=${fetchCount}`);
+check('图片伪装：返回内联 data URI 包装页', firstImageText.includes('data:image/jpeg;base64,'), firstImageText.slice(0, 80));
+
+const beforeImageCached = fetchCount;
+await (await getImage()).text();
+check('图片伪装：第二次命中图片缓存（0 次出站）', fetchCount === beforeImageCached, `before=${beforeImageCached} now=${fetchCount}`);
+
+// ---------- 10. 熔断必须覆盖「内置随机路径」，而不只是根路径 ----------
 // 回归点：熔断判据曾写成 `pathname === '/'`，而随机路径按构造落在路径字典内、
 // 被 firstCheck 的限流豁免，于是随机路径成了唯一没有 CPU 保护的入口。
 // 这里用字典内路径 + 每次不同的 query（必然未命中缓存）持续打，必须出现「0 次出站」。
@@ -297,6 +318,24 @@ const beforeShared = fetchCount;
 await (await get('/')).text();
 check('熔断：根路径与随机路径共享同一份额度', fetchCount === beforeShared,
     `before=${beforeShared} now=${fetchCount}`);
+
+// ---------- 11. 图片目标同样受熔断约束（额度已耗尽） ----------
+// 回归点：图片分支曾跑在熔断检查之前，图片目标因此完全不受保护。
+// 现在熔断在图片分支之前：额度耗尽时连图都不取，直接给内建 1101 页。
+// 注意必须换一个**未被缓存**的图片地址：上一节那张已在 maskImageCache 里，
+// 而缓存命中会在扣额度之前短路（这是有意为之），用它测不出熔断。
+const IMAGE_TARGET_COLD = 'https://upstream.example.net/photo-cold.jpg';
+const coldImageEnv = { ...env, FALLBACK: IMAGE_TARGET_COLD };
+const beforeBrokeImage = fetchCount;
+const brokeImage = await handler.fetch(
+    new Request(ORIGIN + '/', { headers: { Host: 'panel.example.com', 'CF-Connecting-IP': '203.0.113.9' } }),
+    coldImageEnv,
+    ctx
+);
+const brokeImageText = await brokeImage.text();
+check('熔断：额度耗尽时未缓存的图片目标不再出站（0 次 fetch）', fetchCount === beforeBrokeImage,
+    `before=${beforeBrokeImage} now=${fetchCount}`);
+check('熔断：图片目标降级为内建 1101 页', brokeImageText.includes('1101'), brokeImageText.slice(0, 80));
 
 out(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);
