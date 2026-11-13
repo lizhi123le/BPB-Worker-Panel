@@ -1,0 +1,186 @@
+/**
+ * tools/camouflage-cpu.test.mjs
+ *
+ * `GET /` 伪装反代的 CPU 防护行为测试。运行：node tools/camouflage-cpu.test.mjs
+ * （package.json 里是 `npm run test:camouflage`）
+ *
+ * 被测规则（src/common/camouflage.ts）：
+ *   1. 小页面（content-length 已知且 <1MB）→ 缓冲改写，上游 host 被换成面板 host，且结果进缓存；
+ *   2. 上游**不报长度**（chunked）→ 不再把「未知大小」当成「小」，改走流式改写，
+ *      但内容量在预算内时同样把 host 换掉（伪装效果不退化）；
+ *   3. 体积超过改写预算 → 立即停止改写，余下原样流出，且**不缓存**这份半改写的产物；
+ *   4. 根路径突发超过额度 → 熔断为内建页（0 次出站 fetch）；
+ *   5. 缓存键剥离 utm_* 等噪声参数 → 两个只有噪声参数不同的请求命中同一份缓存。
+ *
+ * 为什么需要它：这四条都靠「体积」和「次数」这类边界触发，手测很难稳定复现；
+ * 而回归的方向又极其具体 —— 退化成「全部缓冲」就是 CPU 超限复发，
+ * 退化成「全部不缓存」就是伪装效果悄悄消失。期望值在这里显式写死，不照抄实现常量。
+ *
+ * 打桩：globalThis.fetch 只服务伪装上游，记录每次出站 URL 与调用次数。
+ *
+ * 前提：先构建过（`npm run build`，或快速版 `NODE_ENV=mangle node scripts/build.js`），
+ * 本测试加载 .build/worker.reference.js（混淆前产物，行为等价且可读）。
+ */
+import { existsSync } from 'fs';
+import { pathToFileURL } from 'url';
+
+const BUNDLE = '.build/worker.reference.js';
+const UUID = '11111111-2222-4333-8444-555555555555';
+const TR_PASS = 'trojan-secret';
+const PWD = 'Admin-pass-1';
+const ORIGIN = 'https://panel.example.com';
+const UPSTREAM_HOST = 'upstream.example.net';
+
+let failures = 0;
+const out = (...args) => process.stdout.write(args.join(' ') + '\n');
+const check = (name, ok, detail = '') => {
+    out(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !detail ? '' : `\n      ${detail}`}`);
+    if (!ok) failures++;
+};
+
+if (!existsSync(BUNDLE)) {
+    console.error(`找不到 ${BUNDLE} —— 请先构建：npm run build`);
+    process.exit(1);
+}
+
+/**
+ * 上游桩。`plan` 由各用例设置：
+ *   mode: 'known'（带 content-length）| 'chunked'（不报长度）
+ *   body: 要返回的字符串
+ */
+let plan = { mode: 'known', body: 'hello' };
+let outbound = [];
+let fetchCount = 0;
+
+globalThis.fetch = async (url) => {
+    const u = String(url);
+    fetchCount++;
+    outbound.push(u);
+    if (!u.includes(UPSTREAM_HOST)) {
+        return new Response('{}', { headers: { 'content-type': 'application/json' } });
+    }
+    const headers = { 'content-type': 'text/html; charset=utf-8' };
+    if (plan.mode === 'known') headers['content-length'] = String(Buffer.byteLength(plan.body));
+    // 分块吐字，确保 TransformStream 会看到多个 chunk（更接近真实的 chunked 上游）
+    const stream = new ReadableStream({
+        start(controller) {
+            const enc = new TextEncoder();
+            const bytes = enc.encode(plan.body);
+            const step = 4096;
+            for (let i = 0; i < bytes.length; i += step) {
+                controller.enqueue(bytes.subarray(i, i + step));
+            }
+            controller.close();
+        }
+    });
+    return new Response(stream, { headers });
+};
+
+const store = new Map([['pwd', PWD]]);
+const kv = {
+    async get(key, opts) {
+        const value = store.has(key) ? store.get(key) : null;
+        if (value === null) return null;
+        if (opts && opts.type === 'json') return typeof value === 'string' ? JSON.parse(value) : value;
+        return value;
+    },
+    async put(key, value) { store.set(key, value); },
+    async delete(key) { store.delete(key); },
+    async list() { return { keys: [], list_complete: true, cursor: '' }; }
+};
+const env = { UUID, TR_PASS, SUB_PATH: 'p', FALLBACK: UPSTREAM_HOST, kv };
+const ctx = { waitUntil() {}, passThroughOnException() {} };
+
+const handler = (await import(pathToFileURL(BUNDLE).href)).default;
+if (!handler || typeof handler.fetch !== 'function') throw new Error(`${BUNDLE} 没有 default.fetch()`);
+
+const get = (path) => handler.fetch(new Request(ORIGIN + path, {
+    headers: { Host: 'panel.example.com', 'CF-Connecting-IP': '203.0.113.9' }
+}), env, ctx);
+
+// ---------- 1. 小页面：缓冲改写 + 缓存 ----------
+plan = { mode: 'known', body: '<html><a href="https://upstream.example.net/x">link</a></html>' };
+outbound = [];
+let resp = await get('/');
+let text = await resp.text();
+check('小页面：上游 host 被改写为面板 host', text.includes('panel.example.com') && !text.includes('upstream.example.net'), text.slice(0, 120));
+check('小页面：确实发起了 1 次出站 fetch', fetchCount === 1, `fetchCount=${fetchCount}`);
+check('小页面：响应保持 200', resp.status === 200, `status=${resp.status}`);
+
+// ---------- 2. 缓存命中：第二次不再出站 ----------
+const before = fetchCount;
+resp = await get('/');
+text = await resp.text();
+check('缓存命中：第二次请求 0 次出站 fetch', fetchCount === before, `before=${before} now=${fetchCount}`);
+check('缓存命中：返回的仍是改写后的内容', text.includes('panel.example.com'));
+
+// ---------- 3. 噪声 query 归一化：只有 utm_* 不同 → 命中同一份缓存 ----------
+const beforeUtm = fetchCount;
+resp = await get('/?utm_source=newsletter&utm_medium=email');
+text = await resp.text();
+check('噪声 query：utm_* 不参与缓存键，未额外出站', fetchCount === beforeUtm, `before=${beforeUtm} now=${fetchCount}`);
+check('噪声 query：仍返回改写后的缓存内容', text.includes('panel.example.com'));
+
+// 反过来验证「非噪声参数确实区分缓存」
+const beforeReal = fetchCount;
+await (await get('/?page=2')).text();
+check('非噪声 query：产生独立缓存条目（额外出站 1 次）', fetchCount === beforeReal + 1, `before=${beforeReal} now=${fetchCount}`);
+
+// ---------- 4. chunked（不报长度）、体积在预算内：流式改写仍然替换 host ----------
+plan = { mode: 'chunked', body: '<html><link href="https://upstream.example.net/a.css"></html>' };
+resp = await get('/chunked-small');
+text = await resp.text();
+check('chunked 小页面：流式改写后 host 已替换', text.includes('panel.example.com') && !text.includes('upstream.example.net'), text.slice(0, 120));
+
+// ---------- 5. chunked（不报长度）、体积巨大：停止改写，且不缓存半成品 ----------
+// 远大于 1MB 预算：旧实现会把整份 body 缓冲后 replaceAll，这正是 CPU 超时路径。
+const unit = '<div>upstream.example.net</div>';
+const REPEAT = 80000;
+const huge = unit.repeat(REPEAT); // ≈ 2.4MB
+plan = { mode: 'chunked', body: huge };
+resp = await get('/huge-chunked');
+text = await resp.text();
+
+// 预算内的前半段被改写（每个 host 变短 UPSTREAM_HOST.length - 9 = 1 字节），
+// 预算外的后半段原样流出，所以总长**应当**缩短，缩掉的正是「已改写次数 × 1」。
+// 期望值用独立算式重算（不复用实现里的常量与分块大小）：按 4096 切块累计，
+// 直到累计字节越过 1MB 预算为止，此前每个 chunk 都改写、此后原样。
+const hostDrop = UPSTREAM_HOST.length - 'panel.example.com'.length;
+const BUDGET = 1 << 20;
+const CHUNK = 4096;
+const rawBytes = Buffer.byteLength(huge);
+// 精确统计「预算内被改写的 host 实例数」：按 4096 切块，逐块统计该块内 host 的出现次数
+const countIn = (str, sub) => str.split(sub).length - 1;
+let consumed = 0;
+let rewrittenHosts = 0;
+for (let i = 0; i < rawBytes; i += CHUNK) {
+    const size = Math.min(CHUNK, rawBytes - i);
+    if (consumed + size > BUDGET) break;
+    consumed += size;
+    const slice = huge.slice(i, i + size);
+    rewrittenHosts += countIn(slice, UPSTREAM_HOST);
+}
+const expectedLen = rawBytes - rewrittenHosts * hostDrop;
+check('超大 chunked：body 未被结构性截断（长度与独立算式一致）',
+    text.length === expectedLen,
+    `raw=${rawBytes} got=${text.length} expected=${expectedLen} rewrittenHosts=${rewrittenHosts}`);
+check('超大 chunked：预算外部分原样保留（末尾仍是未改写形态）', text.trimEnd().endsWith(unit));
+
+// 再请求一次同一个 URL：若缓存了半成品，这次会 0 次出站 —— 说明错误产物被固化了
+const beforeHuge = fetchCount;
+await (await get('/huge-chunked')).text();
+check('超大 chunked：未缓存（第二次仍出站）', fetchCount === beforeHuge + 1, `before=${beforeHuge} now=${fetchCount}`);
+
+// ---------- 6. 熔断：根路径突发超额度 → 内建页，0 次出站 ----------
+// 上面已消耗若干次额度，这里持续打到一个明显超过额度的次数，中间必须出现「0 次出站」的响应。
+let tripped = false;
+for (let i = 0; i < 400; i++) {
+    const c = fetchCount;
+    const r = await get('/');
+    await r.text();
+    if (fetchCount === c) { tripped = true; break; }
+}
+check('熔断：持续打根路径后出现「0 次出站」的降级响应', tripped, `fetchCount=${fetchCount}`);
+
+out(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`);
+process.exit(failures === 0 ? 0 : 1);

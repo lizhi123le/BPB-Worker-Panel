@@ -21,9 +21,23 @@ import {
 
 const MASK_HOME_CACHE_TTL = 300000;       // 5 分钟
 const MASK_IMAGE_CACHE_MAX = 12;          // 图片缓存最大张数
-const MASK_HOME_CACHE_MAX = 100;          // 文本缓存最大条目
-const TEXT_REWRITE_MAX = 2 * 1024 * 1024; // 2MB
+const MASK_HOME_CACHE_MAX = 200;          // 文本缓存最大条目
+const TEXT_REWRITE_MAX = 1 * 1024 * 1024; // 1MB
 const FETCH_TIMEOUT = 39000;
+
+/**
+ * 首页真实反代的 CPU 熔断：每 isolate 每窗口最多 MASK_PROXY_MAX_PER_WINDOW 次。
+ *
+ * 为什么需要：`/` 的 CPU 成本与上游响应体大小线性相关（clone + text() + replaceAll），
+ * 批量扫描会把同一个 isolate 打成一串 exceededCpu。超限后改为返回内建 1101 页（0 次 fetch、
+ * 0 次字符串改写），把「持续超限」降级成「偶发超限」。
+ * 放行额度刻意取得很小：正常访客刷首页不会有节奏地超过 60 次/分钟，
+ * 而达到这个量级基本只有抓取/压测。
+ */
+const MASK_PROXY_WINDOW_MS = 60000;
+const MASK_PROXY_MAX_PER_WINDOW = 60;
+let maskProxyWindowStart = 0;
+let maskProxyCount = 0;
 
 type CacheEntry = {
     body: string | ArrayBuffer;
@@ -353,7 +367,150 @@ function cacheCleansing(): void {
     for (const [k, v] of maskHomeCache) {
         if (now - v.time >= MASK_HOME_CACHE_TTL) maskHomeCache.delete(k);
     }
-    if (maskHomeCache.size > MASK_HOME_CACHE_MAX) maskHomeCache.clear();
+    // 逐条淘汰最旧，而不是整体 clear()：原来的 clear() 会把热点键（真实访客反复访问的首页）
+    // 和冷门键一起扔掉，扫描器只要灌满 100 条就能让缓存对所有人失效。
+    evictOldest(maskHomeCache, MASK_HOME_CACHE_MAX);
+}
+
+/**
+ * 噪声 query 参数名（小写）。这些只影响上游的统计/归因，不影响返回的页面内容 ——
+ * 若纳入缓存键，真实站点首页常见的 `?utm_source=…&_=17…` 会让缓存几乎永不命中，
+ * 每个请求都重新走一遍「clone + text + replaceAll」的 CPU 密集路径。
+ * 只收高频的几类：长尾参数收益低，而产物体积有硬上限（raw ≤552960）。
+ */
+const NOISE_QUERY_KEYS: ReadonlySet<string> = new Set([
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+    'gclid', 'fbclid', 'msclkid', 'dclid', 'spm', '_ga', '_gl', '_'
+]);
+
+/**
+ * 缓存键归一化：按原出现顺序保留非噪声参数，值原样保留。
+ *
+ * 刻意不用 url.searchParams 序列化 —— 它会重新编码（空格 %20/+, 中文转义）并重排，
+ * 那样「缓存键」与「实际转发给上游的 URL」会变成两个东西，排查时极易误判。
+ * 这里只做纯字符串过滤：不命中的参数一段不漏地保留原样。
+ */
+function normalizeCacheQuery(search: string): string {
+    if (!search || search === '?') return '';
+    const kept: string[] = [];
+    for (const pair of search.slice(1).split('&')) {
+        if (!pair) continue;
+        const eq = pair.indexOf('=');
+        const rawKey = eq === -1 ? pair : pair.slice(0, eq);
+        if (NOISE_QUERY_KEYS.has(rawKey.toLowerCase())) continue;
+        kept.push(pair);
+    }
+    return kept.length ? '?' + kept.join('&') : '';
+}
+
+/**
+ * 首页反代的 CPU 熔断闸门。
+ * 返回 true = 本窗口额度已用尽，调用方应直接返回内建页。
+ * 窗口整体滚动（不做滑动窗口）：这里只需挡住突发，不需要精确计量。
+ */
+function maskProxyBudgetExhausted(): boolean {
+    const now = Date.now();
+    if (now - maskProxyWindowStart >= MASK_PROXY_WINDOW_MS) {
+        maskProxyWindowStart = now;
+        maskProxyCount = 0;
+    }
+    if (maskProxyCount >= MASK_PROXY_MAX_PER_WINDOW) return true;
+    maskProxyCount++;
+    return false;
+}
+
+/**
+ * 写入首页缓存，并保持「最近使用」顺序。
+ *
+ * Map 的插入顺序就是淘汰顺序，所以命中后重新 set 会把该键挪到队尾（最近使用）——
+ * 这正是「逐条淘汰最旧」想要的效果：热点键不会被冷门键挤掉。
+ */
+function cacheHomeEntry(key: string, entry: CacheEntry): void {
+    maskHomeCache.delete(key);
+    maskHomeCache.set(key, entry);
+}
+
+/**
+ * 边流边改写：把上游 body 的每个 chunk 解码、替换 host、再编码流出。
+ *
+ * 为什么不用 `clone().text()` 一把梭：那会先把整份 body 读进内存再全量 replaceAll，
+ * CPU 与体积线性相关。这里同一个 token 预算（TEXT_REWRITE_MAX）卡的是「累计已处理字节」，
+ * 一旦超出预算立刻停止改写、把当前与后续 chunk 原样流出 —— 除了一次性的
+ * 判断开销，CPU 不再随页面变大而增长。
+ *
+ * 为什么可以跨 chunk 直接 replace：替换目标是 host（如 `example.com`），
+ * 且 replaceAll 是纯字符串替换、不涉及正则会话保持。chunk 边界恰好切断 host 时，
+ * 该处替换会被漏掉（极低概率，且只影响页面里对上游域名的引用），
+ * 换来的收益是不必在多 MB 文本上做跨 chunk 拼接 —— 这里刻意选择前者。
+ */
+function streamWithBudgetRewrite(
+    resp: Response,
+    maskURL: URL,
+    reqURL: URL,
+    cacheKey: string,
+    contentType: string,
+    env: any
+): Response {
+    const source = resp.body;
+    const headersOut = withHsts(filterResponseHeaders(resp.headers, maskURL, reqURL), env);
+
+    if (!source) {
+        return new Response(null, { status: resp.status, statusText: resp.statusText, headers: headersOut });
+    }
+
+    const decoder = new TextDecoder('utf-8');
+    const encoder = new TextEncoder();
+    let processed = 0;
+    // 只在「全程未超预算」时才值得缓存：超预算的部分是未改写的原文，缓存它会把错误结果固化 5 分钟
+    let rewritable = true;
+    let collected = '';
+
+    const transform = new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+            if (!rewritable) {
+                controller.enqueue(chunk);
+                return;
+            }
+
+            // 预算耗尽：本 chunk 与后续一律原样流出，并放弃缓存
+            if (processed + chunk.byteLength > TEXT_REWRITE_MAX) {
+                rewritable = false;
+                collected = '';
+                console.warn(`伪装页超过 ${TEXT_REWRITE_MAX}B 改写预算，余下部分原样流出`);
+                controller.enqueue(chunk);
+                return;
+            }
+            processed += chunk.byteLength;
+
+            // stream:true 让跨 chunk 的多字节字符不被截断
+            const rewritten = decoder.decode(chunk, { stream: true }).replaceAll(maskURL.host, reqURL.host);
+            collected += rewritten;
+            controller.enqueue(encoder.encode(rewritten));
+        },
+        flush(controller) {
+            const tail = decoder.decode();
+            if (tail) {
+                const rewrittenTail = tail.replaceAll(maskURL.host, reqURL.host);
+                if (rewritable) collected += rewrittenTail;
+                controller.enqueue(encoder.encode(rewrittenTail));
+            }
+
+            if (rewritable) {
+                cacheHomeEntry(cacheKey, {
+                    body: collected,
+                    status: resp.status,
+                    contentType,
+                    time: Date.now()
+                });
+            }
+        }
+    });
+
+    return new Response(source.pipeThrough(transform), {
+        status: resp.status,
+        statusText: resp.statusText,
+        headers: headersOut
+    });
 }
 
 /**
@@ -393,9 +550,13 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
     }
 
     const reqURL = new URL(request.url);
-    const cacheKey = maskURL.origin + reqURL.pathname + reqURL.search;
+    // 缓存键用「实际转发给上游的 path + query」按噪声参数归一化后拼成，
+    // 保证「键」与「内容」严格对应：请求原样转发，只有键被归一化。
+    const cacheKey = maskURL.origin + reqURL.pathname + normalizeCacheQuery(reqURL.search);
     const cached = maskHomeCache.get(cacheKey);
     if (cached && Date.now() - cached.time < MASK_HOME_CACHE_TTL) {
+        // 命中即提升为「最近使用」，避免热点键在逐条淘汰时先被扔掉
+        cacheHomeEntry(cacheKey, cached);
         return new Response(cached.body, {
             status: cached.status,
             headers: withHsts({ 'Content-Type': cached.contentType, 'Cache-Control': 'no-store' }, env)
@@ -403,6 +564,18 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
     }
 
     cacheCleansing();
+
+    // 熔断必须在 fetch 之前：一旦放行，后面就是 clone + text() + replaceAll 的 1MB 级字符串处理，
+    // 事后再想省 CPU 已经晚了。命中额度上限时给内建 1101 页（与「未设置伪装域名」同一张页）。
+    // 只对根路径计数：伪装站点自身的子路径流量（访客浏览某篇文章）不足以构成扫描特征，
+    // 把它们一并熔断等于让伪装站自己打不开。
+    if (reqURL.pathname === '/' && maskProxyBudgetExhausted()) {
+        console.warn('[伪装熔断] 本窗口真实反代额度已用尽，降级内建页');
+        return new Response(await cf1101Page(reqURL.host, request.headers.get('CF-Connecting-IP') || ''), {
+            status: 200,
+            headers: withHsts({ 'Content-Type': 'text/html; charset=UTF-8' }, env)
+        });
+    }
 
     const headers = buildMaskedHeaders(request.headers, maskURL);
     const fetchInit: RequestInit = { method: request.method, headers, cf: {} };
@@ -417,17 +590,21 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
         const contentType = resp.headers.get('content-type') || '';
         const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
 
-        // 文本且 <2MB：缓冲 + 重写上游 host + 缓存。
+        // 文本且长度已知且 <1MB：缓冲 + 重写上游 host + 缓存。
         // 判据与 filterResponseHeaders（缓存策略）共用同一个常量：原先这里内联了一份**少了 /i** 的副本，
         // 大写 content-type（如 `Text/HTML`）会走"不重写"的另一条分支，与缓存策略的判定自相矛盾。
-        if (REWRITTEN_CONTENT_TYPE_RE.test(contentType) && (contentLength === 0 || contentLength < TEXT_REWRITE_MAX)) {
+        //
+        // contentLength === 0（上游不报长度 / chunked）不再直接进入这条分支：
+        // 旧写法会把「未知大小」当成「小」，把任意体积的 body 全部 clone + 解码 + replaceAll，
+        // 正是 GET / 打穿 CPU 预算的主要路径。现在改走下面的限流式改写。
+        if (REWRITTEN_CONTENT_TYPE_RE.test(contentType) && contentLength > 0 && contentLength < TEXT_REWRITE_MAX) {
             const clone = resp.clone();
             try {
                 const text = await withTimeout(clone.text(), 5000, '伪装页读取');
                 const rewritten = text.replaceAll(maskURL.host, reqURL.host);
                 const filtered = filterResponseHeaders(resp.headers, maskURL, reqURL);
                 const headersFinal = withHsts(filtered, env);
-                maskHomeCache.set(cacheKey, {
+                cacheHomeEntry(cacheKey, {
                     body: rewritten,
                     status: resp.status,
                     contentType,
@@ -437,6 +614,14 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
             } catch (e) {
                 console.warn('伪装页缓冲超时，改为流式转发');
             }
+        }
+        // 长度未知或 ≥1MB 的文本：边流边改写，超过上限立即放弃改写、按原样继续流出。
+        // 这样既不把上游域名暴露在「超预算」页面上，也不会因 body 巨大而烧穿 CPU。
+        if (REWRITTEN_CONTENT_TYPE_RE.test(contentType)) {
+            if (contentLength >= TEXT_REWRITE_MAX) {
+                console.warn(`伪装页 ${contentLength}B 超过改写上限，直接流式转发（不重写 host）`);
+            }
+            return streamWithBudgetRewrite(resp, maskURL, reqURL, cacheKey, contentType, env);
         }
         // 流式转发路径：过滤上游头，防止服务器信息泄露
         return new Response(resp.body, {
