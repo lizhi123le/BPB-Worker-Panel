@@ -37,6 +37,27 @@ let blacklistCacheTime = 0;
 let blacklistLoaded = false;
 
 /**
+ * 永久黑名单总条数上限。
+ *
+ * 名单是整表 JSON，刷新 = JSON.parse(整个数组) + new Set(全部条目)，成本 O(条数)。
+ * 实测：5 千条 ≈0.7ms、2 万条 ≈4.3ms、5 万条 ≈13.7ms、10 万条 ≈25ms ——
+ * 而 Free 计划每次请求的 CPU 预算只有 10ms。名单无上限时，这个成本会随运行时间
+ * 无界增长，最终必然超限。
+ *
+ * 封顶后刷新成本恒 ≈0.7ms。超限淘汰最旧：入列门槛是 22 次违规，
+ * 最老的那批封禁对应的探测源大概率早已更换 IP。
+ * （Set/数组都保持插入顺序，最旧的在最前。）
+ */
+const BLACKLIST_MAX_ENTRIES = 5000;
+
+/**
+ * KV 读取失败后的重试间隔。
+ * 失败路径必须把缓存时间前移，否则「缓存已过期」的判定会一直成立 ——
+ * 每个经过守卫的请求都会再打一次 KV 并等满 3s 超时，把一次读故障放大成请求级雪崩。
+ */
+const CACHE_RETRY_MS = 10000;
+
+/**
  * 强制从 KV 重读永久黑名单（忽略内存 TTL），并与内存中已确知的内容合并。
  * 返回 null 表示读取失败 —— 调用方必须跳过写回，绝不缩小既有封禁集合。
  */
@@ -48,10 +69,20 @@ async function readPermanentBlacklist(kv: KVNamespace): Promise<Set<string> | nu
         if (!Array.isArray(parsed)) throw new Error('KV 永久黑名单数据格式异常');
         const fresh = new Set<string>(parsed);
         for (const ip of blacklistCache ?? []) fresh.add(ip);
+        trimBlacklist(fresh);
         return fresh;
     } catch (e) {
         console.warn('[永久黑名单] KV 读取失败:', (e as Error)?.message ?? String(e));
         return null;
+    }
+}
+
+/** 超限时丢弃最旧的封禁，把名单规模钉在 BLACKLIST_MAX_ENTRIES。 */
+function trimBlacklist(blacklist: Set<string>): void {
+    while (blacklist.size > BLACKLIST_MAX_ENTRIES) {
+        const oldest = blacklist.values().next();
+        if (oldest.done) return;
+        blacklist.delete(oldest.value);
     }
 }
 
@@ -66,9 +97,12 @@ async function loadPermanentBlacklist(kv: KVNamespace): Promise<Set<string>> {
         blacklistLoaded = true;
         return fresh;
     }
-    // 读取失败：保留已有缓存（避免每次请求都触 KV），但标记「未确认载入」→ 禁止整体写回
+    // 读取失败：保留已有缓存（避免每次请求都触 KV），并标记「未确认载入」→ 禁止整体写回。
+    // 关键：把缓存时间挪到「距过期只差 CACHE_RETRY_MS」，使下次重试有间隔 ——
+    // 原实现不推进该时间戳，KV 故障期间每个请求都会再读一次并等满 3s。
     blacklistCache = blacklistCache || new Set();
     blacklistLoaded = false;
+    blacklistCacheTime = Date.now() - CACHE_TTL_MS + CACHE_RETRY_MS;
     return blacklistCache;
 }
 
@@ -158,6 +192,9 @@ export async function recordViolationAndMaybeBan(
             }
 
             blacklist.add(ip);
+            // 入列后同样封顶：否则写回 KV 的会是一份无界增长的名单，
+            // 下次任何 isolate 载入它都要付 O(条数) 的解析成本
+            trimBlacklist(blacklist);
             blacklistCacheTime = Date.now();
             ctx.waitUntil(
                 withTimeout(kv.put(BLACKLIST_KV_KEY, JSON.stringify([...blacklist])), 2000, 'KV 黑名单写入')

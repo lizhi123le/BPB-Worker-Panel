@@ -24,7 +24,8 @@ import {
     makeReporter,
     importBundle,
     earlyDataRequest,
-    vlessPacket
+    vlessPacket,
+    ORIGIN
 } from './ws-test-harness.mjs';
 
 const { out, check, failures } = makeReporter();
@@ -49,6 +50,25 @@ async function openConnection() {
     }
     return response.status;
 }
+
+// ---------- 0. 路径门禁：移除 WS 黑名单检查后，保护没有减少 ----------
+// WS 分支不再调 guardPermanentBlacklist（与 cfnew 一致），但「含字典外段」的 WS 路径
+// 仍被下一步的字典校验拦成 429 —— 能通过字典校验的请求，按黑名单的豁免判据本来就必然放行。
+// 注意：这一段必须跑在上限测试**之前**，否则名额已满，429 会来自连接上限而不是路径门禁。
+const badPath = await handler.fetch(new Request(ORIGIN + '/zzz-not-in-dictionary', {
+    headers: { Host: 'panel.example.com', Upgrade: 'websocket', 'CF-Connecting-IP': '203.0.113.9' }
+}), env, ctx);
+await badPath.text();
+check('WS：非字典路径被字典校验拦成 429（移除黑名单检查后保护不减）', badPath.status === 429, `status=${badPath.status}`);
+
+// 字典内路径（= 随机路径形态）仍可正常升级
+const okPath = await handler.fetch(new Request(ORIGIN + '/blog/news', {
+    headers: { Host: 'panel.example.com', Upgrade: 'websocket', 'CF-Connecting-IP': '203.0.113.9' }
+}), env, ctx);
+check('WS：字典内随机路径仍可正常升级（未被误伤）', okPath.status === 101, `status=${okPath.status}`);
+
+// 释放这条连接占用的名额，避免影响下面的上限测试（桩的 close() 不触发监听器，显式驱动）
+if (okPath.status === 101) state.lastPair[1].listeners.close?.forEach((fn) => fn());
 
 // ---------- 1. 一直连到被拒，确认上限数值与拒绝方式 ----------
 const EXPECTED_LIMIT = 128;   // 与 unified.ts 的 WS_MAX_CONNECTIONS 对齐
@@ -82,6 +102,11 @@ check('关闭一条后名额归还，新连接可以建立（计数没有泄漏�
 // ---------- 3. 归还后立刻又满：仍然只放行一条 ----------
 const secondReject = await openConnection();
 check('名额只有一个：再连一次仍然 429', secondReject === 429, `status=${secondReject}`);
+
+// ---------- 3. 名额上限不因阻断路径校验而放松 ----------
+// （路径门禁已在第 0 节验证；这里只确认上限仍然生效，避免上面的顺序调整把状态清空）
+const stillFull = await openConnection();
+check('上限仍然生效：归还一条后又被占满，再连仍需 429', stillFull === 429, `status=${stillFull}`);
 
 out(failures() === 0 ? '\n全部通过' : `\n${failures()} 项失败`);
 process.exit(failures() === 0 ? 0 : 1);

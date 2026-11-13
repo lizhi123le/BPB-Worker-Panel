@@ -12,7 +12,7 @@ import {
 	handleDoH,
 	handleProxyIPs
 } from '@handlers';
-import { guardNonBuiltinPath, guardPermanentBlacklist } from './common/firstCheck';
+import { guardNonBuiltinPath } from './common/firstCheck';
 import { isBuiltinRouteWord, isPathInDictionary, PUBLIC_PATH_POOL } from './common/ratelimit';
 import { camouflageProxy, cf1101RateLimitedResponse } from './common/camouflage';
 import { prepareWsRuntimeConfig } from './common/ws-runtime';
@@ -63,22 +63,19 @@ export default {
 			init(request, env);
 
 			if (upgradeHeader === 'websocket') {
-				// H5：WS 分支此前完全绕过守卫，任何路径都能稳定拿到 101。
-				// 现在的顺序：永久黑名单（H5）→ 路径字典（F-22）→ 必填凭据（C-13）→ handleWebsocket。
-				// 先算出路径段再交给守卫：守卫内部要用它们判「是否为内置随机路径组合」，
-				// 下面第 F-22 步的字典校验还要用同一组段 —— 算一次、传下去，别再算第二遍。
-				const wsUrl = new URL(request.url);
-				const { pathName: wsPathName } = globalThis.globalConfig;
-				const wsSegments = wsPathName.split('/').filter(Boolean);
+				// 顺序：路径字典（F-22）→ 必填凭据（C-13）→ handleWebsocket。
+				//
+				// WS 分支**不查永久黑名单**，与参考实现（cfnew）一致：cfnew 用
+				// `!是否网页套接字` 把整个 WS 分支排除在守卫之外。
+				// 保护并没有减少 —— 黑名单豁免的本来就只有「每段都在路径字典内」的随机路径组合
+				// 与空段根路径，而下面的字典校验对「含字典外段」的 WS 路径已经直接拦成 429。
+				// 换句话说，能通过字典校验的 WS 请求，按 guardPermanentBlacklist 的判据本来就一定
+				// 会 return null；再调一次只是白付一次函数调用与潜在的 KV 读。
+				const wsSegments = globalThis.globalConfig.pathName.split('/').filter(Boolean);
 
-				const wsGuarded = await guardPermanentBlacklist(request, env, wsSegments);
-				if (wsGuarded) return wsGuarded;
-
-				// F-22（H5 剩余项）：黑名单之外再补路径字典校验 —— 与 HTTP 非内置路径同一判据。
-				// 注意 firstCheck.ts 里 guardPermanentBlacklist 上方「不加字典校验」的注释是 H5 当时的结论，
-				// F-22 已裁决推翻它（仅就字典校验而言），该注释待后续单独更新。
+				// F-22（H5 剩余项）：路径字典校验 —— 与 HTTP 非内置路径同一判据。
 				// 只补字典校验、不补限流：每一次 WS 连接（含客户端断线自动重连）都是一个请求，
-				// 套用「6 次/小时」的路径限流会直接打死自己的客户端（见 guardPermanentBlacklist 注释）。
+				// 套用「6 次/小时」的路径限流会直接打死自己的客户端。
 				// 另：WS 分支无法按「已认证连接豁免」—— 认证要等首包，101 之前拿不到身份。
 				// 两类豁免都不能误杀：根路径（旧订阅的 `/?ed=2560` 形态）与管理员路径
 				// （用户手工把 WS 路径设成 SUB_PATH / UUID 的旧配置）。
@@ -89,12 +86,12 @@ export default {
 					|| !!(wsAdminPath && wsSegments[0].toLowerCase() === wsAdminPath)
 					|| isPathInDictionary(wsSegments);
 				if (!wsPathAllowed) {
-					console.warn(`[路径字典] WS 升级路径 ${wsPathName} 不在公共路径字典内，按伪造探测拦截`);
-					return await cf1101RateLimitedResponse(wsUrl.host, request.headers.get('CF-Connecting-IP') || '');
+					console.warn(`[路径字典] WS 升级路径 ${globalThis.globalConfig.pathName} 不在公共路径字典内，按伪造探测拦截`);
+					return await cf1101RateLimitedResponse(new URL(request.url).host, request.headers.get('CF-Connecting-IP') || '');
 				}
 
 				// C-13：与 HTTP 路径共用同一套必填凭据校验（此前 WS 完全跳过，缺凭据时静默鉴权失败）
-				assertRequiredCredentials(env, wsPathName);
+				assertRequiredCredentials(env, globalThis.globalConfig.pathName);
 
 				initWs(env);
 				await setSettings(request, env);

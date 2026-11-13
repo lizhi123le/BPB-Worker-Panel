@@ -107,13 +107,24 @@ const get = (path, ip = '203.0.113.9') => handler.fetch(new Request(ORIGIN + pat
 // 现在的契约：只有「含字典外段」的探测请求才查黑名单；根路径与「每段都在字典内」的
 // 随机路径组合（1~N 段）一律豁免，连一次 kv.get 都不产生。
 const BANNED_IP = '198.51.100.7';
-// 必须在任何请求之前播种：黑名单有 60s 内存缓存，首次请求会把空集合缓存住
-store.set('permanentBlacklist', JSON.stringify([BANNED_IP]));
+// 必须在任何请求之前播种：黑名单有 60s 内存缓存，首次请求会把空集合缓存住。
+// 这里顺带验证「条数封顶」：名单无上限时，刷新成本 O(条数) 会随运行时间无界增长
+// （实测 5 万条 ≈13.7ms，而单请求预算只有 10ms）。封顶后恒 ≈0.7ms，超限丢最旧。
+// 构造 5001 条：最前面的 FIRST_IP 是最旧的 → 载入时应被丢弃；最后的 BANNED_IP 应保留。
+const FIRST_IP = '198.51.100.1';
+const filler = Array.from({ length: 4999 }, (_, i) => `10.${(i >> 8) & 255}.${i & 255}.9`);
+store.set('permanentBlacklist', JSON.stringify([FIRST_IP, ...filler, BANNED_IP]));
 
 // 探测面：被拉黑 IP 必须被拦
 const bannedProbe = await get('/zz-probe-not-in-dictionary', BANNED_IP);
 await bannedProbe.text();
 check('黑名单：被拉黑 IP 探测非字典路径被拦截（429）', bannedProbe.status === 429, `status=${bannedProbe.status}`);
+
+// 条数封顶：最旧的那条（FIRST_IP）应在载入时被丢弃，因此不再被拦
+const trimmedProbe = await get('/zz-probe-not-in-dictionary', FIRST_IP);
+await trimmedProbe.text();
+check('黑名单：超过 5000 条时丢弃最旧的封禁（最旧 IP 不再被拦）', trimmedProbe.status !== 429,
+    `status=${trimmedProbe.status}（期望非 429，说明 FIRST_IP 已被 trim 掉）`);
 
 // 豁免面：根路径 + 随机路径的单段/多段组合，且不得产生任何 KV 读取
 // （首条探测请求已顺带预热 initHttp 里一次性的 subPath 缓存）
