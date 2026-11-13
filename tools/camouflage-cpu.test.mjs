@@ -47,8 +47,9 @@ if (!existsSync(BUNDLE)) {
  * 上游桩。`plan` 由各用例设置：
  *   mode: 'known'（带 content-length）| 'chunked'（不报长度）
  *   body: 要返回的字符串
+ *   extra: 额外响应头（用于验证「正文被改写后 framing 头必须被剥掉」）
  */
-let plan = { mode: 'known', body: 'hello' };
+let plan = { mode: 'known', body: 'hello', extra: {} };
 let outbound = [];
 let fetchCount = 0;
 
@@ -59,7 +60,7 @@ globalThis.fetch = async (url) => {
     if (!u.includes(UPSTREAM_HOST)) {
         return new Response('{}', { headers: { 'content-type': 'application/json' } });
     }
-    const headers = { 'content-type': 'text/html; charset=utf-8' };
+    const headers = { 'content-type': 'text/html; charset=utf-8', ...plan.extra };
     if (plan.mode === 'known') headers['content-length'] = String(Buffer.byteLength(plan.body));
     // 分块吐字，确保 TransformStream 会看到多个 chunk（更接近真实的 chunked 上游）
     const stream = new ReadableStream({
@@ -171,7 +172,49 @@ const beforeHuge = fetchCount;
 await (await get('/huge-chunked')).text();
 check('超大 chunked：未缓存（第二次仍出站）', fetchCount === beforeHuge + 1, `before=${beforeHuge} now=${fetchCount}`);
 
-// ---------- 6. 熔断：根路径突发超额度 → 内建页，0 次出站 ----------
+// ---------- 6. 正文被改写后，上游的 framing 头必须被剥掉 ----------
+// 回归点：改写会改变长度、且 body 已被 fetch 解压。若继续沿用上游的 content-length /
+// content-encoding，客户端会按旧长度读取或二次解压，表现为页面坏掉 + 不断重试，
+// 每次重试都是缓存未命中的昂贵反代 —— 曾表现为「CPU 超限规律性复发」。
+plan = {
+    mode: 'known',
+    body: '<html><a href="https://upstream.example.net/y">y</a></html>',
+    extra: { 'content-encoding': 'gzip' }
+};
+const framingResp = await get('/about?framing=1');
+await framingResp.text();
+check('改写后：content-length 已被移除', !framingResp.headers.has('content-length'),
+    `content-length=${framingResp.headers.get('content-length')}`);
+check('改写后：content-encoding 已被移除', !framingResp.headers.has('content-encoding'),
+    `content-encoding=${framingResp.headers.get('content-encoding')}`);
+check('改写后：transfer-encoding 已被移除', !framingResp.headers.has('transfer-encoding'));
+
+// ---------- 7. 首页缓存必须按字节有界，而不是只按条目数 ----------
+// 回归点：条目上限 × 单条正文上限（100 × 1MB）曾逼近甚至超过 isolate 的 128MB 内存，
+// 持续 GC 烧掉 CPU，表现为「CPU 超限规律性复发」。这里用行为验证：灌入远超字节预算的
+// 大页面后，最早的键必须被淘汰（否则说明预算没生效）。
+plan = { mode: 'known', body: 'p'.repeat(300 * 1024), extra: {} };  // 每条约 300KB
+const BYTE_BUDGET = 4 * 1024 * 1024;
+const distinct = Math.ceil(BYTE_BUDGET / (300 * 1024)) + 12;        // 明显超出预算的条目数
+
+// /about 在路径字典内 → 不触发限流；用 query 区分缓存键
+for (let i = 0; i < distinct; i++) {
+    await (await get(`/about?bulk=${i}`)).text();
+}
+
+// 最早的键应已被字节预算淘汰：再次请求它必然重新出站
+const beforeRevisit = fetchCount;
+await (await get('/about?bulk=0')).text();
+check('缓存字节有界：最早的条目已被淘汰（重新出站）', fetchCount === beforeRevisit + 1,
+    `flush 了 ${distinct} 条 300KB 页面，字节预算 ${BYTE_BUDGET}，期望 bulk=0 已淘汰；before=${beforeRevisit} now=${fetchCount}`);
+
+// 最近的键仍在缓存里：不应出站
+const beforeHot = fetchCount;
+await (await get(`/about?bulk=${distinct - 1}`)).text();
+check('缓存字节有界：最近的条目仍在缓存（0 次出站）', fetchCount === beforeHot,
+    `before=${beforeHot} now=${fetchCount}`);
+
+// ---------- 8. 熔断：根路径突发超额度 → 内建页，0 次出站 ----------
 // 上面已消耗若干次额度，这里持续打到一个明显超过额度的次数，中间必须出现「0 次出站」的响应。
 let tripped = false;
 for (let i = 0; i < 400; i++) {

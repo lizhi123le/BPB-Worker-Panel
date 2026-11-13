@@ -21,7 +21,16 @@ import {
 
 const MASK_HOME_CACHE_TTL = 300000;       // 5 分钟
 const MASK_IMAGE_CACHE_MAX = 12;          // 图片缓存最大张数
-const MASK_HOME_CACHE_MAX = 200;          // 文本缓存最大条目
+const MASK_HOME_CACHE_MAX = 100;          // 文本缓存最大条目
+/**
+ * 首页缓存的**总字节预算**。这是本文件里最关键的资源上限：
+ * isolate 内存只有 128MB，而单条缓存正文最长可达 TEXT_REWRITE_MAX（1MB）。
+ * 只按「条目数」限流时，100 条 × 1MB = 100MB，缓存本身就是内存炸弹 ——
+ * 逼近上限后 V8 会持续高强度 GC，而 GC 消耗的是**CPU 时间**，
+ * 表现为「CPU 超限规律性复发」而不是内存报错。因此必须按字节封顶。
+ * 4MB 相对 128MB 只是零头，命中率损失远小于 GC 抖动带来的代价。
+ */
+const MASK_HOME_CACHE_MAX_BYTES = 4 * 1024 * 1024;
 const TEXT_REWRITE_MAX = 1 * 1024 * 1024; // 1MB
 const FETCH_TIMEOUT = 39000;
 
@@ -44,10 +53,13 @@ type CacheEntry = {
     status: number;
     contentType: string;
     time: number;
+    /** 该条目占用的近似字节数（O(1) 取值，不做真实编码）；用于总分账，不需要精确 */
+    bytes: number;
 };
 
 const maskHomeCache = new Map<string, CacheEntry>();
 const maskImageCache = new Map<string, CacheEntry>();
+let maskHomeCacheBytes = 0;
 
 const SAFE_PROXY_HEADERS = new Set([
     'content-type', 'content-length', 'content-encoding', 'transfer-encoding',
@@ -292,6 +304,21 @@ function withHsts(headers: Headers | Record<string, string>, env: any): Headers 
     return { ...headers, ...hsts };
 }
 
+/**
+ * 正文被改写后必须清掉的三个头。改写会改变长度、也会改变字节语义，
+ * 继续沿用上游的头会让响应在客户端侧「帧错位」：
+ *  - content-length：长度已变，客户端按旧值读会截断或挂起；
+ *  - content-encoding：fetch 已经把 body 解压成明文，再声明 gzip 会让客户端二次解压而失败；
+ *  - transfer-encoding：分块方式由运行时重新决定，手写会与流式 body 冲突。
+ * 帧错位的后果不只是页面坏掉：浏览器与各类客户端会**不断重试**，
+ * 而每次重试都是一次缓存未命中的昂贵反代 —— 这正是「CPU 超限规律性复发」的来源。
+ */
+function stripBodyFramingHeaders(headers: Headers): void {
+    headers.delete('content-length');
+    headers.delete('content-encoding');
+    headers.delete('transfer-encoding');
+}
+
 function arrayBufferToBase64(bytes: ArrayBuffer): string {
     const u8 = new Uint8Array(bytes);
     let binary = '';
@@ -338,7 +365,7 @@ async function tryServeImage(maskURL: URL): Promise<Response | null> {
             if (bytes.byteLength < 2 * 1024 * 1024) {
                 // 插入前腾位置（传 MAX-1），插入后不超过 MASK_IMAGE_CACHE_MAX
                 evictOldest(maskImageCache, MASK_IMAGE_CACHE_MAX - 1);
-                maskImageCache.set(url, { body: bytes, status: resp.status, contentType, time: Date.now() });
+                maskImageCache.set(url, { body: bytes, status: resp.status, contentType, time: Date.now(), bytes: bytes.byteLength });
                 return wrapImageResponse(bytes, resp.status, contentType, maskURL.hostname);
             }
             // content-length 虚标（实际 >2MB）：用已读字节流式直传
@@ -365,11 +392,11 @@ async function tryServeImage(maskURL: URL): Promise<Response | null> {
 function cacheCleansing(): void {
     const now = Date.now();
     for (const [k, v] of maskHomeCache) {
-        if (now - v.time >= MASK_HOME_CACHE_TTL) maskHomeCache.delete(k);
+        if (now - v.time >= MASK_HOME_CACHE_TTL) {
+            maskHomeCacheBytes -= v.bytes;
+            maskHomeCache.delete(k);
+        }
     }
-    // 逐条淘汰最旧，而不是整体 clear()：原来的 clear() 会把热点键（真实访客反复访问的首页）
-    // 和冷门键一起扔掉，扫描器只要灌满 100 条就能让缓存对所有人失效。
-    evictOldest(maskHomeCache, MASK_HOME_CACHE_MAX);
 }
 
 /**
@@ -420,14 +447,33 @@ function maskProxyBudgetExhausted(): boolean {
 }
 
 /**
- * 写入首页缓存，并保持「最近使用」顺序。
+ * 写入首页缓存，同时维持「总字节预算」与「条目上限」两道天花板，并保持最近使用顺序。
  *
- * Map 的插入顺序就是淘汰顺序，所以命中后重新 set 会把该键挪到队尾（最近使用）——
- * 这正是「逐条淘汰最旧」想要的效果：热点键不会被冷门键挤掉。
+ * Map 的插入顺序就是淘汰顺序，所以命中后重新 set 会把该键挪到队尾（最近使用）；
+ * 淘汰时从头删，删到的就是最久未使用的条目。
+ *
+ * 单条超出总预算的正文直接不入缓存：一条就能吃光预算，留着只会把其他热点键挤走。
  */
 function cacheHomeEntry(key: string, entry: CacheEntry): void {
-    maskHomeCache.delete(key);
+    const prev = maskHomeCache.get(key);
+    if (prev) {
+        maskHomeCacheBytes -= prev.bytes;
+        maskHomeCache.delete(key);
+    }
+
+    if (entry.bytes > MASK_HOME_CACHE_MAX_BYTES) return;
+
+    while (maskHomeCache.size && (maskHomeCache.size >= MASK_HOME_CACHE_MAX
+        || maskHomeCacheBytes + entry.bytes > MASK_HOME_CACHE_MAX_BYTES)) {
+        const oldest = maskHomeCache.keys().next();
+        if (oldest.done) break;
+        const victim = maskHomeCache.get(oldest.value);
+        if (victim) maskHomeCacheBytes -= victim.bytes;
+        maskHomeCache.delete(oldest.value);
+    }
+
     maskHomeCache.set(key, entry);
+    maskHomeCacheBytes += entry.bytes;
 }
 
 /**
@@ -452,7 +498,10 @@ function streamWithBudgetRewrite(
     env: any
 ): Response {
     const source = resp.body;
-    const headersOut = withHsts(filterResponseHeaders(resp.headers, maskURL, reqURL), env);
+    const filtered = filterResponseHeaders(resp.headers, maskURL, reqURL);
+    // 本函数一定改写正文（至少改到预算上限），长度不再与上游一致
+    stripBodyFramingHeaders(filtered);
+    const headersOut = withHsts(filtered, env);
 
     if (!source) {
         return new Response(null, { status: resp.status, statusText: resp.statusText, headers: headersOut });
@@ -500,7 +549,8 @@ function streamWithBudgetRewrite(
                     body: collected,
                     status: resp.status,
                     contentType,
-                    time: Date.now()
+                    time: Date.now(),
+                    bytes: collected.length
                 });
             }
         }
@@ -603,12 +653,15 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
                 const text = await withTimeout(clone.text(), 5000, '伪装页读取');
                 const rewritten = text.replaceAll(maskURL.host, reqURL.host);
                 const filtered = filterResponseHeaders(resp.headers, maskURL, reqURL);
+                // 改写后长度已变，且 body 已被 fetch 解压：沿用上游的帧头会让客户端二次解压/按旧长度读取
+                stripBodyFramingHeaders(filtered);
                 const headersFinal = withHsts(filtered, env);
                 cacheHomeEntry(cacheKey, {
                     body: rewritten,
                     status: resp.status,
                     contentType,
-                    time: Date.now()
+                    time: Date.now(),
+                    bytes: rewritten.length
                 });
                 return new Response(rewritten, { status: resp.status, headers: headersFinal });
             } catch (e) {
