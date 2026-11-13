@@ -154,12 +154,18 @@ export default {
 
 					default:
 						// 根路径 /：从设置的 URL 伪装地址池随机抽一个，图片则全屏拉伸显示
+						//
+						// 这里刻意**不**做永久黑名单检查（曾经加过，已撤回）。原因不是安全语义，
+						// 而是 CPU 成本模型：loadPermanentBlacklist 每 60s 过期一次，过期后由
+						// 「第一个到达的请求」承担 KV 读 + JSON.parse(整个名单) + new Set(全部条目)，
+						// 成本是 O(黑名单规模) 且集中摊在单个请求上。`/` 承担了几乎所有流量，
+						// 于是每个 isolate 每 60s 就有一次请求要额外烧 4~25ms（视名单大小），
+						// 在 10ms 预算下表现为「CPU 超限规律性复发」。
+						// 实测：2 万条 ≈4.3ms，5 万条 ≈13.7ms，10 万条 ≈25ms。
+						// 扫路径的违规计数仍是黑名单的触发源，而黑名单只对不守规矩的 IP 有意义；
+						// 让每个正常访客的首页请求替它摊销这点收益并不划算。
+						// 若要重新引入，必须换成每 IP 一个 KV 键（O(1) 读）而不是整表解析。
 						if (pathName === '/' || pathName === '') {
-							// 根路径同样受永久黑名单约束：此前直接进 camouflageProxy，
-							// 被拉黑的 IP 仍能稳定拿到首页（拉黑只由非内置路径的违规计数触发，
-							// 攻击者一旦只打 / 就永远不会被计入，等于绕开整个封禁体系）。
-							const rootBlocked = await guardPermanentBlacklist(request, env);
-							if (rootBlocked) return rootBlocked;
 							return await camouflageProxy(request, env);
 						}
 						// 非内置路径：永久黑名单 → 限流 → 全路径伪装反代（对齐 cfnew）

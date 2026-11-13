@@ -76,8 +76,11 @@ globalThis.fetch = async (url) => {
 };
 
 const store = new Map([['pwd', PWD]]);
+/** 记录每一次 kv.get 的键：用来守护「根路径不得产生 KV 读取」这条性能不变量 */
+const kvReads = [];
 const kv = {
     async get(key, opts) {
+        kvReads.push(key);
         const value = store.has(key) ? store.get(key) : null;
         if (value === null) return null;
         if (opts && opts.type === 'json') return typeof value === 'string' ? JSON.parse(value) : value;
@@ -97,32 +100,38 @@ const get = (path, ip = '203.0.113.9') => handler.fetch(new Request(ORIGIN + pat
     headers: { Host: 'panel.example.com', 'CF-Connecting-IP': ip }
 }), env, ctx);
 
-// ---------- 0. 永久黑名单必须覆盖根路径 ----------
-// 回归点：worker.ts 对 `/` 直接调用 camouflageProxy，绕过了黑名单检查，
-// 被永久拉黑的 IP 仍能稳定拿到首页。更糟的是「拉黑」本身只由非内置路径的违规计数触发，
-// 于是只打 `/` 的攻击者永远不会被计入 —— 等于绕开整个封禁体系。
-// 现在根路径、WS 升级、非内置路径共用 guardPermanentBlacklist 这一份守卫。
+// ---------- 0. 黑名单只覆盖非内置路径；根路径不得承担黑名单刷新成本 ----------
+// 回归点（两次都是它）：
+//  1) worker.ts 对 `/` 直接进 camouflageProxy，被拉黑的 IP 仍能拿到首页 —— 曾补上检查；
+//  2) 但该检查的刷新成本是 O(黑名单规模)：loadPermanentBlacklist 每 60s 过期，过期后由
+//     「第一个到达的请求」承担 KV 读 + JSON.parse(整个名单) + new Set(全部条目)。
+//     `/` 承担几乎所有流量，于是每个 isolate 每 60s 就有一次请求额外烧 4~25ms
+//     （实测 2 万条 ≈4.3ms、5 万条 ≈13.7ms、10 万条 ≈25ms），在 10ms 预算下
+//     表现为「CPU 超限规律性复发」。现已撤回根路径的检查，并用下面的不变量守住。
 const BANNED_IP = '198.51.100.7';
 // 必须在任何请求之前播种：黑名单有 60s 内存缓存，首次请求会把空集合缓存住
 store.set('permanentBlacklist', JSON.stringify([BANNED_IP]));
 
-const beforeBanned = fetchCount;
-const bannedRoot = await get('/', BANNED_IP);
-await bannedRoot.text();
-check('黑名单：被拉黑 IP 访问根路径被拦截（429）', bannedRoot.status === 429, `status=${bannedRoot.status}`);
-check('黑名单：根路径拦截发生在出站之前（0 次 fetch）', fetchCount === beforeBanned,
-    `before=${beforeBanned} now=${fetchCount}`);
-
 const bannedDict = await get('/about?banned=1', BANNED_IP);
 await bannedDict.text();
-check('黑名单：被拉黑 IP 访问字典路径同样被拦截（429）', bannedDict.status === 429, `status=${bannedDict.status}`);
+check('黑名单：被拉黑 IP 访问非内置路径被拦截（429）', bannedDict.status === 429, `status=${bannedDict.status}`);
+
+// 根路径：必须 0 次 KV 读取，且不因黑名单而阻塞
+const kvBeforeRoot = kvReads.length;
+const rootBannedResp = await get('/?blacklist-probe=1', BANNED_IP);
+await rootBannedResp.text();
+const rootKvReads = kvReads.length - kvBeforeRoot;
+check('根路径：不产生任何 KV 读取（不承担黑名单刷新成本）', rootKvReads === 0,
+    `新增 KV 读取 ${rootKvReads} 次：${kvReads.slice(kvBeforeRoot).join(', ') || '无'}`);
+check('根路径：不因黑名单而阻塞（保持 15:04 已知良好行为）', rootBannedResp.status === 200, `status=${rootBannedResp.status}`);
 
 // ---------- 1. 小页面：缓冲改写 + 缓存 ----------
 plan = { mode: 'known', body: '<html><a href="https://upstream.example.net/x">link</a></html>' };
+const beforeSmall = fetchCount;
 let resp = await get('/');
 let text = await resp.text();
 check('小页面：上游 host 被改写为面板 host', text.includes('panel.example.com') && !text.includes('upstream.example.net'), text.slice(0, 120));
-check('小页面：确实发起了 1 次出站 fetch', fetchCount === 1, `fetchCount=${fetchCount}`);
+check('小页面：确实发起了 1 次出站 fetch', fetchCount === beforeSmall + 1, `before=${beforeSmall} now=${fetchCount}`);
 check('小页面：响应保持 200', resp.status === 200, `status=${resp.status}`);
 
 // ---------- 2. 缓存命中：第二次不再出站 ----------
