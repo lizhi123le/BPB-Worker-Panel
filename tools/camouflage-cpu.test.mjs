@@ -100,30 +100,41 @@ const get = (path, ip = '203.0.113.9') => handler.fetch(new Request(ORIGIN + pat
     headers: { Host: 'panel.example.com', 'CF-Connecting-IP': ip }
 }), env, ctx);
 
-// ---------- 0. 黑名单只覆盖非内置路径；根路径不得承担黑名单刷新成本 ----------
-// 回归点（两次都是它）：
-//  1) worker.ts 对 `/` 直接进 camouflageProxy，被拉黑的 IP 仍能拿到首页 —— 曾补上检查；
-//  2) 但该检查的刷新成本是 O(黑名单规模)：loadPermanentBlacklist 每 60s 过期，过期后由
-//     「第一个到达的请求」承担 KV 读 + JSON.parse(整个名单) + new Set(全部条目)。
-//     `/` 承担几乎所有流量，于是每个 isolate 每 60s 就有一次请求额外烧 4~25ms
-//     （实测 2 万条 ≈4.3ms、5 万条 ≈13.7ms、10 万条 ≈25ms），在 10ms 预算下
-//     表现为「CPU 超限规律性复发」。现已撤回根路径的检查，并用下面的不变量守住。
+// ---------- 0. 黑名单只作用于探测面；随机路径与根路径豁免且零 KV 成本 ----------
+// 回归点（两次踩坑都在这条路径上）：
+//  1) 曾把黑名单检查加到 `/` —— 刷新成本 O(名单规模)，`/` 流量最大，于是「CPU 超限规律性复发」；
+//  2) 该成本同样存在于任何会查黑名单的路径，包括 WS 升级与节点随机路径。
+// 现在的契约：只有「含字典外段」的探测请求才查黑名单；根路径与「每段都在字典内」的
+// 随机路径组合（1~N 段）一律豁免，连一次 kv.get 都不产生。
 const BANNED_IP = '198.51.100.7';
 // 必须在任何请求之前播种：黑名单有 60s 内存缓存，首次请求会把空集合缓存住
 store.set('permanentBlacklist', JSON.stringify([BANNED_IP]));
 
-const bannedDict = await get('/about?banned=1', BANNED_IP);
-await bannedDict.text();
-check('黑名单：被拉黑 IP 访问非内置路径被拦截（429）', bannedDict.status === 429, `status=${bannedDict.status}`);
+// 探测面：被拉黑 IP 必须被拦
+const bannedProbe = await get('/zz-probe-not-in-dictionary', BANNED_IP);
+await bannedProbe.text();
+check('黑名单：被拉黑 IP 探测非字典路径被拦截（429）', bannedProbe.status === 429, `status=${bannedProbe.status}`);
 
-// 根路径：必须 0 次 KV 读取，且不因黑名单而阻塞
-const kvBeforeRoot = kvReads.length;
-const rootBannedResp = await get('/?blacklist-probe=1', BANNED_IP);
-await rootBannedResp.text();
-const rootKvReads = kvReads.length - kvBeforeRoot;
-check('根路径：不产生任何 KV 读取（不承担黑名单刷新成本）', rootKvReads === 0,
-    `新增 KV 读取 ${rootKvReads} 次：${kvReads.slice(kvBeforeRoot).join(', ') || '无'}`);
-check('根路径：不因黑名单而阻塞（保持 15:04 已知良好行为）', rootBannedResp.status === 200, `status=${rootBannedResp.status}`);
+// 豁免面：根路径 + 随机路径的单段/多段组合，且不得产生任何 KV 读取
+// （首条探测请求已顺带预热 initHttp 里一次性的 subPath 缓存）
+const EXEMPT_PATHS = [
+    '/?bl-probe=1',                 // 根路径
+    '/about?bl-probe=1',            // 单段
+    '/blog/news?bl-probe=1',        // 两段
+    '/api/video/music?bl-probe=1'   // 三段
+];
+const exemptStatus = [];
+for (const p of EXEMPT_PATHS) {
+    const kvBefore = kvReads.length;
+    const r = await get(p, BANNED_IP);
+    await r.text();
+    const reads = kvReads.length - kvBefore;
+    check(`豁免：${p} 不产生 KV 读取`, reads === 0,
+        `新增 ${reads} 次：${kvReads.slice(kvBefore).join(', ') || '无'}`);
+    exemptStatus.push(r.status);
+}
+check('豁免：被拉黑 IP 仍可访问根路径与随机路径（未被黑名单阻塞）',
+    exemptStatus.every((s) => s === 200), `statuses=${exemptStatus.join(', ')}`);
 
 // ---------- 1. 小页面：缓冲改写 + 缓存 ----------
 plan = { mode: 'known', body: '<html><a href="https://upstream.example.net/x">link</a></html>' };

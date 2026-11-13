@@ -17,16 +17,21 @@ interface GuardContext {
 }
 
 /**
- * 永久黑名单守卫：只做永久黑名单检查，不含限流与字典校验。
+ * 永久黑名单守卫 —— 只对「不像内置随机路径」的请求生效。
  *
- * 三处入口共用（此前是三份重复实现）：WS 升级、根路径 `/`、非内置路径。
- * 根路径必须走这里：worker.ts 对 `/` 直接调用 camouflageProxy，若不做这一步，
- * **被永久拉黑的 IP 仍能访问首页**（拉黑只发生在非内置路径的违规计数里，
- * 一旦攻击者拿到根路径就等于绕开整个封禁体系）。
+ * 豁免范围：根路径，以及**每段都在路径字典内**的组合（1~N 段）——
+ *   这正是 generateWsPath 生成节点随机路径的取值形态（PUBLIC_PATH_POOL ⊂ 字典）。
+ *   只要一段落不进字典，就仍按探测处理、照常查黑名单。
  *
- * 路径字典校验不在本函数（由各调用方按需自行完成）。
- * 为何不在这里加限流：每一次 WS 连接（含客户端断线自动重连）都是一个请求，
- *   套用现有「6 次/小时」的路径限流会直接打死所有客户端；根路径同理是节点的正常入口。
+ * 为什么必须豁免，两条理由：
+ *  1) 成本模型（主因）：黑名单是整表 JSON，刷新 = KV 读 + JSON.parse(整个名单) + new Set(全部条目)，
+ *     成本 O(名单规模)，且每 60s 由「第一个到达的请求」**一次性**承担。
+ *     实测 2 万条 ≈4.3ms、5 万条 ≈13.7ms、10 万条 ≈25ms（Free 计划总预算只有 10ms）。
+ *     随机路径是节点主路径、流量最大，不能让它去扛这个尖峰 —— 根路径同理（已撤回）。
+ *  2) 语义：拉黑是为了拦扫描探测，而随机路径是合法客户端入口。让被拉黑的 IP
+ *     继续使用它自己知道的随机路径，比让每个正常连接去摊销解析成本更划算。
+ *     随机路径的 CPU 上限由 camouflageProxy 的熔断兜底（覆盖全部路径、O(1)）。
+ *
  * 缺 IP / 缺 env.kv 时一律放行：KV 未绑定不能把隧道打死。
  */
 export async function guardPermanentBlacklist(request: Request, env: any): Promise<Response | null> {
@@ -34,10 +39,14 @@ export async function guardPermanentBlacklist(request: Request, env: any): Promi
     const kv = env?.kv as KVNamespace | undefined;
     if (!ip || !kv) return null;
 
+    const reqURL = new URL(request.url);
+    // 根路径（空段）与「每段都在字典内」的随机路径组合：豁免，不触发整表解析
+    const segments = reqURL.pathname.split('/').filter(Boolean);
+    if (segments.length === 0 || isPathInDictionary(segments)) return null;
+
     if (!await isPermanentBlacklisted(ip, kv)) return null;
 
     console.warn(`[永久黑名单] IP ${ip} 命中永久黑名单，直接拦截`);
-    const reqURL = new URL(request.url);
     return await cf1101RateLimitedResponse(reqURL.host, ip);
 }
 
