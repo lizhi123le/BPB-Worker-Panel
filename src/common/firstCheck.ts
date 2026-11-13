@@ -17,22 +17,26 @@ interface GuardContext {
 }
 
 /**
- * WS 升级分支的永久黑名单守卫（H5）：只做永久黑名单检查。
+ * 永久黑名单守卫：只做永久黑名单检查，不含限流与字典校验。
  *
- * 路径字典校验不在本函数：F-22 已在 worker.ts 的 WS 分支前置完成（与 HTTP 非内置路径同一判据，
- *   并豁免根路径与管理员路径），此处不再重复。
- * 为何不加限流：每一次 WS 连接（含客户端断线自动重连）都是一个请求，
- *   套用现有「6 次/小时」的路径限流会直接打死所有客户端，可用性损失远大于探测面收益。
+ * 三处入口共用（此前是三份重复实现）：WS 升级、根路径 `/`、非内置路径。
+ * 根路径必须走这里：worker.ts 对 `/` 直接调用 camouflageProxy，若不做这一步，
+ * **被永久拉黑的 IP 仍能访问首页**（拉黑只发生在非内置路径的违规计数里，
+ * 一旦攻击者拿到根路径就等于绕开整个封禁体系）。
+ *
+ * 路径字典校验不在本函数（由各调用方按需自行完成）。
+ * 为何不在这里加限流：每一次 WS 连接（含客户端断线自动重连）都是一个请求，
+ *   套用现有「6 次/小时」的路径限流会直接打死所有客户端；根路径同理是节点的正常入口。
  * 缺 IP / 缺 env.kv 时一律放行：KV 未绑定不能把隧道打死。
  */
-export async function guardWebsocketBlacklist(request: Request, env: any): Promise<Response | null> {
+export async function guardPermanentBlacklist(request: Request, env: any): Promise<Response | null> {
     const ip = request.headers.get('CF-Connecting-IP') || '';
     const kv = env?.kv as KVNamespace | undefined;
     if (!ip || !kv) return null;
 
     if (!await isPermanentBlacklisted(ip, kv)) return null;
 
-    console.warn(`[永久黑名单] WS 升级 IP ${ip} 命中永久黑名单，直接拦截`);
+    console.warn(`[永久黑名单] IP ${ip} 命中永久黑名单，直接拦截`);
     const reqURL = new URL(request.url);
     return await cf1101RateLimitedResponse(reqURL.host, ip);
 }
@@ -64,11 +68,9 @@ export async function guardNonBuiltinPath(
     const ip = request.headers.get('CF-Connecting-IP') || '';
     const kv = env?.kv as KVNamespace | undefined;
 
-    // 1. 永久黑名单
-    if (ip && kv && await isPermanentBlacklisted(ip, kv)) {
-        console.warn(`[永久黑名单] IP ${ip} 命中永久黑名单，直接拦截`);
-        return await cf1101RateLimitedResponse(reqURL.host, ip);
-    }
+    // 1. 永久黑名单（与根路径、WS 升级共用同一份守卫）
+    const blocked = await guardPermanentBlacklist(request, env);
+    if (blocked) return blocked;
 
     // 2. 路径字典校验 + 限流（字典路径视为合法公开路径，不限流不计数；
     //    仅路径含字典外段才触发限流与违规计数，避免误伤伪装站点正常流量）

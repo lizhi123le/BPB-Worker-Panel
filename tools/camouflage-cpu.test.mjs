@@ -93,9 +93,29 @@ const ctx = { waitUntil() {}, passThroughOnException() {} };
 const handler = (await import(pathToFileURL(BUNDLE).href)).default;
 if (!handler || typeof handler.fetch !== 'function') throw new Error(`${BUNDLE} 没有 default.fetch()`);
 
-const get = (path) => handler.fetch(new Request(ORIGIN + path, {
-    headers: { Host: 'panel.example.com', 'CF-Connecting-IP': '203.0.113.9' }
+const get = (path, ip = '203.0.113.9') => handler.fetch(new Request(ORIGIN + path, {
+    headers: { Host: 'panel.example.com', 'CF-Connecting-IP': ip }
 }), env, ctx);
+
+// ---------- 0. 永久黑名单必须覆盖根路径 ----------
+// 回归点：worker.ts 对 `/` 直接调用 camouflageProxy，绕过了黑名单检查，
+// 被永久拉黑的 IP 仍能稳定拿到首页。更糟的是「拉黑」本身只由非内置路径的违规计数触发，
+// 于是只打 `/` 的攻击者永远不会被计入 —— 等于绕开整个封禁体系。
+// 现在根路径、WS 升级、非内置路径共用 guardPermanentBlacklist 这一份守卫。
+const BANNED_IP = '198.51.100.7';
+// 必须在任何请求之前播种：黑名单有 60s 内存缓存，首次请求会把空集合缓存住
+store.set('permanentBlacklist', JSON.stringify([BANNED_IP]));
+
+const beforeBanned = fetchCount;
+const bannedRoot = await get('/', BANNED_IP);
+await bannedRoot.text();
+check('黑名单：被拉黑 IP 访问根路径被拦截（429）', bannedRoot.status === 429, `status=${bannedRoot.status}`);
+check('黑名单：根路径拦截发生在出站之前（0 次 fetch）', fetchCount === beforeBanned,
+    `before=${beforeBanned} now=${fetchCount}`);
+
+const bannedDict = await get('/about?banned=1', BANNED_IP);
+await bannedDict.text();
+check('黑名单：被拉黑 IP 访问字典路径同样被拦截（429）', bannedDict.status === 429, `status=${bannedDict.status}`);
 
 // ---------- 1. 小页面：缓冲改写 + 缓存 ----------
 plan = { mode: 'known', body: '<html><a href="https://upstream.example.net/x">link</a></html>' };
@@ -186,7 +206,35 @@ check('改写后：content-encoding 已被移除', !framingResp.headers.has('con
     `content-encoding=${framingResp.headers.get('content-encoding')}`);
 check('改写后：transfer-encoding 已被移除', !framingResp.headers.has('transfer-encoding'));
 
-// ---------- 7. 首页缓存必须按字节有界，而不是只按条目数 ----------
+// ---------- 7. 一致性：根路径与「内置随机路径」的处理必须同构 ----------
+// 随机路径由 generateWsPath 生成：1~3 段、每段取自 PUBLIC_PATH_POOL（= 字典剔除内置路由词），
+// 因此按构造必然落在路径字典内 → guardNonBuiltinPath 会跳过限流并直接进 camouflageProxy。
+// 它与根路径进入的是**同一个函数**，所以「体积预算改写 / 剥帧头 / 缓存」必须逐项一致。
+const consistencyBody = '<html><a href="https://upstream.example.net/z">z</a></html>';
+plan = { mode: 'known', body: consistencyBody, extra: { 'content-encoding': 'gzip' } };
+
+const rootResp = await get('/');
+const rootText = await rootResp.text();
+const RANDOM_PATH = '/blog/news?rid=1';   // 两段，均取自字典池，形态同随机路径
+const randResp = await get(RANDOM_PATH);
+const randText = await randResp.text();
+
+check('一致性：根路径与随机路径都改写了上游 host',
+    rootText.includes('panel.example.com') && randText.includes('panel.example.com'),
+    `root=${rootText.slice(0, 60)} rand=${randText.slice(0, 60)}`);
+check('一致性：两者都剥掉了 content-length',
+    !rootResp.headers.has('content-length') && !randResp.headers.has('content-length'));
+check('一致性：两者都剥掉了 content-encoding',
+    !rootResp.headers.has('content-encoding') && !randResp.headers.has('content-encoding'));
+
+// 缓存：两者各自命中自己的键；命中是廉价路径，不应再出站
+const beforeConsistency = fetchCount;
+await (await get('/')).text();
+await (await get(RANDOM_PATH)).text();
+check('一致性：根路径与随机路径均命中缓存（0 次出站）', fetchCount === beforeConsistency,
+    `before=${beforeConsistency} now=${fetchCount}`);
+
+// ---------- 8. 首页缓存必须按字节有界，而不是只按条目数 ----------
 // 回归点：条目上限 × 单条正文上限（100 × 1MB）曾逼近甚至超过 isolate 的 128MB 内存，
 // 持续 GC 烧掉 CPU，表现为「CPU 超限规律性复发」。这里用行为验证：灌入远超字节预算的
 // 大页面后，最早的键必须被淘汰（否则说明预算没生效）。
@@ -211,16 +259,24 @@ await (await get(`/about?bulk=${distinct - 1}`)).text();
 check('缓存字节有界：最近的条目仍在缓存（0 次出站）', fetchCount === beforeHot,
     `before=${beforeHot} now=${fetchCount}`);
 
-// ---------- 8. 熔断：根路径突发超额度 → 内建页，0 次出站 ----------
-// 上面已消耗若干次额度，这里持续打到一个明显超过额度的次数，中间必须出现「0 次出站」的响应。
-let tripped = false;
+// ---------- 9. 熔断必须覆盖「内置随机路径」，而不只是根路径 ----------
+// 回归点：熔断判据曾写成 `pathname === '/'`，而随机路径按构造落在路径字典内、
+// 被 firstCheck 的限流豁免，于是随机路径成了唯一没有 CPU 保护的入口。
+// 这里用字典内路径 + 每次不同的 query（必然未命中缓存）持续打，必须出现「0 次出站」。
+let trippedRandom = false;
 for (let i = 0; i < 400; i++) {
     const c = fetchCount;
-    const r = await get('/');
+    const r = await get(`/blog/news?flare=${i}`);
     await r.text();
-    if (fetchCount === c) { tripped = true; break; }
+    if (fetchCount === c) { trippedRandom = true; break; }
 }
-check('熔断：持续打根路径后出现「0 次出站」的降级响应', tripped, `fetchCount=${fetchCount}`);
+check('熔断：字典内的随机路径同样会被熔断（不再只保护根路径）', trippedRandom, `fetchCount=${fetchCount}`);
+
+// 额度是 isolate 级共享的：随机路径打爆后，根路径应立刻也降级
+const beforeShared = fetchCount;
+await (await get('/')).text();
+check('熔断：根路径与随机路径共享同一份额度', fetchCount === beforeShared,
+    `before=${beforeShared} now=${fetchCount}`);
 
 out(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);

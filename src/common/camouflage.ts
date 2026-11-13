@@ -35,13 +35,20 @@ const TEXT_REWRITE_MAX = 1 * 1024 * 1024; // 1MB
 const FETCH_TIMEOUT = 39000;
 
 /**
- * 首页真实反代的 CPU 熔断：每 isolate 每窗口最多 MASK_PROXY_MAX_PER_WINDOW 次。
+ * 伪装反代的 CPU 熔断：每 isolate 每窗口最多 MASK_PROXY_MAX_PER_WINDOW 次真实反代。
  *
- * 为什么需要：`/` 的 CPU 成本与上游响应体大小线性相关（clone + text() + replaceAll），
- * 批量扫描会把同一个 isolate 打成一串 exceededCpu。超限后改为返回内建 1101 页（0 次 fetch、
- * 0 次字符串改写），把「持续超限」降级成「偶发超限」。
- * 放行额度刻意取得很小：正常访客刷首页不会有节奏地超过 60 次/分钟，
- * 而达到这个量级基本只有抓取/压测。
+ * 为什么需要：单次反代的 CPU 成本与上游响应体大小线性相关（clone + text() + replaceAll），
+ * 批量扫描会把同一个 isolate 打成一串 exceededCpu。超限后改为返回内建 1101 页
+ * （0 次 fetch、0 次字符串改写），把「持续超限」降级成「偶发超限」。
+ *
+ * **覆盖全部伪装路径，不只根路径**：节点随机路径（settings.randomPath，出厂默认 true）
+ * 是 1~3 段、每段都取自 PUBLIC_PATH_POOL 的路径，按构造必然落在路径字典内；
+ * 而 firstCheck 的限流对字典路径是刻意豁免的（视为合法公开路径）。若熔断只认 `/`，
+ * 随机路径就会成为**唯一没有 CPU 保护的入口**——拿到该路径即可无节制打爆 isolate。
+ * 这里按「isolate 的总反代次数」计数，与请求走哪条路径无关。
+ *
+ * 命中缓存不计入（缓存命中是廉价路径，不消耗改写 CPU），因此在出站 fetch 之前判定。
+ * 额度刻意取得很小：正常访客不会以 60 次/分钟的频率触发未命中反代。
  */
 const MASK_PROXY_WINDOW_MS = 60000;
 const MASK_PROXY_MAX_PER_WINDOW = 60;
@@ -621,9 +628,8 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
 
     // 熔断必须在 fetch 之前：一旦放行，后面就是 clone + text() + replaceAll 的 1MB 级字符串处理，
     // 事后再想省 CPU 已经晚了。命中额度上限时给内建 1101 页（与「未设置伪装域名」同一张页）。
-    // 只对根路径计数：伪装站点自身的子路径流量（访客浏览某篇文章）不足以构成扫描特征，
-    // 把它们一并熔断等于让伪装站自己打不开。
-    if (reqURL.pathname === '/' && maskProxyBudgetExhausted()) {
+    // 不区分路径：根路径与节点随机路径（字典内路径）共用同一份额度，否则随机路径等于没有保护。
+    if (maskProxyBudgetExhausted()) {
         console.warn('[伪装熔断] 本窗口真实反代额度已用尽，降级内建页');
         return new Response(await cf1101Page(reqURL.host, request.headers.get('CF-Connecting-IP') || ''), {
             status: 200,

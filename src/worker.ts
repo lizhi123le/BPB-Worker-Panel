@@ -12,7 +12,7 @@ import {
 	handleDoH,
 	handleProxyIPs
 } from '@handlers';
-import { guardNonBuiltinPath, guardWebsocketBlacklist } from './common/firstCheck';
+import { guardNonBuiltinPath, guardPermanentBlacklist } from './common/firstCheck';
 import { isBuiltinRouteWord, isPathInDictionary, PUBLIC_PATH_POOL } from './common/ratelimit';
 import { camouflageProxy, cf1101RateLimitedResponse } from './common/camouflage';
 import { prepareWsRuntimeConfig } from './common/ws-runtime';
@@ -65,14 +65,14 @@ export default {
 			if (upgradeHeader === 'websocket') {
 				// H5：WS 分支此前完全绕过守卫，任何路径都能稳定拿到 101。
 				// 现在的顺序：永久黑名单（H5）→ 路径字典（F-22）→ 必填凭据（C-13）→ handleWebsocket。
-				const wsGuarded = await guardWebsocketBlacklist(request, env);
+				const wsGuarded = await guardPermanentBlacklist(request, env);
 				if (wsGuarded) return wsGuarded;
 
 				// F-22（H5 剩余项）：黑名单之外再补路径字典校验 —— 与 HTTP 非内置路径同一判据。
-				// 注意 firstCheck.ts 里 guardWebsocketBlacklist 上方「不加字典校验」的注释是 H5 当时的结论，
+				// 注意 firstCheck.ts 里 guardPermanentBlacklist 上方「不加字典校验」的注释是 H5 当时的结论，
 				// F-22 已裁决推翻它（仅就字典校验而言），该注释待后续单独更新。
 				// 只补字典校验、不补限流：每一次 WS 连接（含客户端断线自动重连）都是一个请求，
-				// 套用「6 次/小时」的路径限流会直接打死自己的客户端（见 guardWebsocketBlacklist 注释）。
+				// 套用「6 次/小时」的路径限流会直接打死自己的客户端（见 guardPermanentBlacklist 注释）。
 				// 另：WS 分支无法按「已认证连接豁免」—— 认证要等首包，101 之前拿不到身份。
 				// 两类豁免都不能误杀：根路径（旧订阅的 `/?ed=2560` 形态）与管理员路径
 				// （用户手工把 WS 路径设成 SUB_PATH / UUID 的旧配置）。
@@ -155,6 +155,11 @@ export default {
 					default:
 						// 根路径 /：从设置的 URL 伪装地址池随机抽一个，图片则全屏拉伸显示
 						if (pathName === '/' || pathName === '') {
+							// 根路径同样受永久黑名单约束：此前直接进 camouflageProxy，
+							// 被拉黑的 IP 仍能稳定拿到首页（拉黑只由非内置路径的违规计数触发，
+							// 攻击者一旦只打 / 就永远不会被计入，等于绕开整个封禁体系）。
+							const rootBlocked = await guardPermanentBlacklist(request, env);
+							if (rootBlocked) return rootBlocked;
 							return await camouflageProxy(request, env);
 						}
 						// 非内置路径：永久黑名单 → 限流 → 全路径伪装反代（对齐 cfnew）
