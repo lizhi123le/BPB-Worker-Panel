@@ -53,8 +53,11 @@ type CacheEntry = {
     status: number;
     contentType: string;
     time: number;
-    /** 该条目占用的近似字节数（O(1) 取值，不做真实编码）；用于总分账，不需要精确 */
-    bytes: number;
+    /**
+     * 该条目占用的近似字节数（O(1) 取值，不做真实编码）。
+     * 只有首页缓存按字节记账，图片缓存仍按张数淘汰（上限 12 张，天然有界），故为可选。
+     */
+    bytes?: number;
 };
 
 const maskHomeCache = new Map<string, CacheEntry>();
@@ -365,7 +368,7 @@ async function tryServeImage(maskURL: URL): Promise<Response | null> {
             if (bytes.byteLength < 2 * 1024 * 1024) {
                 // 插入前腾位置（传 MAX-1），插入后不超过 MASK_IMAGE_CACHE_MAX
                 evictOldest(maskImageCache, MASK_IMAGE_CACHE_MAX - 1);
-                maskImageCache.set(url, { body: bytes, status: resp.status, contentType, time: Date.now(), bytes: bytes.byteLength });
+                maskImageCache.set(url, { body: bytes, status: resp.status, contentType, time: Date.now() });
                 return wrapImageResponse(bytes, resp.status, contentType, maskURL.hostname);
             }
             // content-length 虚标（实际 >2MB）：用已读字节流式直传
@@ -393,7 +396,7 @@ function cacheCleansing(): void {
     const now = Date.now();
     for (const [k, v] of maskHomeCache) {
         if (now - v.time >= MASK_HOME_CACHE_TTL) {
-            maskHomeCacheBytes -= v.bytes;
+            maskHomeCacheBytes -= v.bytes ?? 0;
             maskHomeCache.delete(k);
         }
     }
@@ -455,25 +458,26 @@ function maskProxyBudgetExhausted(): boolean {
  * 单条超出总预算的正文直接不入缓存：一条就能吃光预算，留着只会把其他热点键挤走。
  */
 function cacheHomeEntry(key: string, entry: CacheEntry): void {
+    const size = entry.bytes ?? 0;
     const prev = maskHomeCache.get(key);
     if (prev) {
-        maskHomeCacheBytes -= prev.bytes;
+        maskHomeCacheBytes -= prev.bytes ?? 0;
         maskHomeCache.delete(key);
     }
 
-    if (entry.bytes > MASK_HOME_CACHE_MAX_BYTES) return;
+    if (size > MASK_HOME_CACHE_MAX_BYTES) return;
 
     while (maskHomeCache.size && (maskHomeCache.size >= MASK_HOME_CACHE_MAX
-        || maskHomeCacheBytes + entry.bytes > MASK_HOME_CACHE_MAX_BYTES)) {
+        || maskHomeCacheBytes + size > MASK_HOME_CACHE_MAX_BYTES)) {
         const oldest = maskHomeCache.keys().next();
         if (oldest.done) break;
         const victim = maskHomeCache.get(oldest.value);
-        if (victim) maskHomeCacheBytes -= victim.bytes;
+        if (victim) maskHomeCacheBytes -= victim.bytes ?? 0;
         maskHomeCache.delete(oldest.value);
     }
 
     maskHomeCache.set(key, entry);
-    maskHomeCacheBytes += entry.bytes;
+    maskHomeCacheBytes += size;
 }
 
 /**
@@ -639,15 +643,14 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
         );
         const contentType = resp.headers.get('content-type') || '';
         const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
+        // 只判定一次：下面两条改写分支与流式兜底都要用它
+        const isTextBody = REWRITTEN_CONTENT_TYPE_RE.test(contentType);
 
         // 文本且长度已知且 <1MB：缓冲 + 重写上游 host + 缓存。
-        // 判据与 filterResponseHeaders（缓存策略）共用同一个常量：原先这里内联了一份**少了 /i** 的副本，
-        // 大写 content-type（如 `Text/HTML`）会走"不重写"的另一条分支，与缓存策略的判定自相矛盾。
-        //
-        // contentLength === 0（上游不报长度 / chunked）不再直接进入这条分支：
-        // 旧写法会把「未知大小」当成「小」，把任意体积的 body 全部 clone + 解码 + replaceAll，
-        // 正是 GET / 打穿 CPU 预算的主要路径。现在改走下面的限流式改写。
-        if (REWRITTEN_CONTENT_TYPE_RE.test(contentType) && contentLength > 0 && contentLength < TEXT_REWRITE_MAX) {
+        // contentLength === 0（上游不报长度 / chunked）不走这条分支：
+        // 旧写法把「未知大小」当成「小」，会把任意体积的 body 全部 clone + 解码 + replaceAll，
+        // 正是 GET / 打穿 CPU 预算的主要路径。现在交给下面的流式改写。
+        if (isTextBody && contentLength > 0 && contentLength < TEXT_REWRITE_MAX) {
             const clone = resp.clone();
             try {
                 const text = await withTimeout(clone.text(), 5000, '伪装页读取');
@@ -668,12 +671,9 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
                 console.warn('伪装页缓冲超时，改为流式转发');
             }
         }
-        // 长度未知或 ≥1MB 的文本：边流边改写，超过上限立即放弃改写、按原样继续流出。
-        // 这样既不把上游域名暴露在「超预算」页面上，也不会因 body 巨大而烧穿 CPU。
-        if (REWRITTEN_CONTENT_TYPE_RE.test(contentType)) {
-            if (contentLength >= TEXT_REWRITE_MAX) {
-                console.warn(`伪装页 ${contentLength}B 超过改写上限，直接流式转发（不重写 host）`);
-            }
+        // 长度未知或 ≥1MB 的文本：边流边改写，超过预算立即停止改写、余下原样流出。
+        // 超预算的具体日志在 streamWithBudgetRewrite 内（那里才是真正发生的地方），此处不重复打印。
+        if (isTextBody) {
             return streamWithBudgetRewrite(resp, maskURL, reqURL, cacheKey, contentType, env);
         }
         // 流式转发路径：过滤上游头，防止服务器信息泄露

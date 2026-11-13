@@ -50,13 +50,11 @@ if (!existsSync(BUNDLE)) {
  *   extra: 额外响应头（用于验证「正文被改写后 framing 头必须被剥掉」）
  */
 let plan = { mode: 'known', body: 'hello', extra: {} };
-let outbound = [];
 let fetchCount = 0;
 
 globalThis.fetch = async (url) => {
     const u = String(url);
     fetchCount++;
-    outbound.push(u);
     if (!u.includes(UPSTREAM_HOST)) {
         return new Response('{}', { headers: { 'content-type': 'application/json' } });
     }
@@ -101,7 +99,6 @@ const get = (path) => handler.fetch(new Request(ORIGIN + path, {
 
 // ---------- 1. 小页面：缓冲改写 + 缓存 ----------
 plan = { mode: 'known', body: '<html><a href="https://upstream.example.net/x">link</a></html>' };
-outbound = [];
 let resp = await get('/');
 let text = await resp.text();
 check('小页面：上游 host 被改写为面板 host', text.includes('panel.example.com') && !text.includes('upstream.example.net'), text.slice(0, 120));
