@@ -135,6 +135,26 @@ You can then access your panel via `https://xyz.bpb.com/panel` and retrieve new 
     - If you connect a domain to the Worker, your traffic becomes probably unlimited.
     - Worker panels support non-TLS ports like 80, 8080, etc. But once you add a custom domain, those ports stop working and won’t be available in the panel.
 
+### Tuning the camouflage fallback (optional)
+
+These variables control the reverse-proxy used to disguise the panel domain. **All of them are optional** — leave them unset and the built-in defaults apply. Invalid values fall back to the default and log a warning, so a typo can never take the site down.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `MASK_REQ_BPS` | `20` | Sustained requests/second allowed through the camouflage proxy (token bucket refill rate). |
+| `MASK_REQ_CAP` | `200` | Burst capacity for the same bucket. One cold first-paint is roughly 30 requests. |
+| `MASK_TEXT_BPS` | `1048576` | Sustained **rewritten text** bytes/second. This is the real CPU driver (decode + replace + encode). |
+| `MASK_TEXT_CAP` | `16777216` | Burst capacity for rewritten text. Keep it comfortably larger than your largest page. |
+| `MASK_TEXT_IP_CAP` | `4194304` | Per-IP rewritten-text budget per 60 s window. Prevents one IP from exhausting the whole isolate. Minimum accepted value: `65536`. |
+| `MASK_CACHE_NOISE_EXTRA` | *(empty)* | Comma-separated extra query parameters to ignore when building the cache key. ⚠️ **Only add parameters that never change the content** — adding `id`, `page` or `token` will make different pages share one cache entry. |
+| `MASK_CACHE_TS_NORM` | `1` | Set to `0` to disable timestamp normalisation in cache keys (rollback switch). |
+| `MASK_IMG_MODE` | `shell` | Set to `data` to fall back to the legacy single-response inline `data:` URI image page (rollback switch). |
+| `WS_UPLINK_ISOLATE_MB` | `32` | Isolate-wide budget (MB) for buffered uplink data, split across active WebSocket connections. |
+| `WS_SESSION_MAX_MB` | `0` (off) | Per-connection downlink byte budget. Set e.g. `2048` to have long sessions closed gracefully instead of hitting the platform CPU/memory limit. |
+
+!!! warning "Rollback order"
+    If the camouflage site misbehaves after an upgrade, revert in this order: (1) `MASK_IMG_MODE=data`, (2) `MASK_CACHE_TS_NORM=0`, (3) raise the `MASK_*` limits, (4) redeploy the previous `worker.js`.
+
 ## Updating the Panel
 
 To update your panel, download the new worker.js file [from here](https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/latest/download/worker.js). In your Cloudflare account, go to `Compute (Workers)` > `Workers & Pages`, select your Worker project, edit it, delete old worker, upload new one and Deploy.

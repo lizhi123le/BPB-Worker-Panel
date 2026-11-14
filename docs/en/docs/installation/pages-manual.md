@@ -121,6 +121,23 @@ In your Cloudflare dashboard, navigate to `Compute (Workers)` > `Workers & Pages
 
 In your domain zone, add a CNAME DNS Record for `xyz.bpb.com` pointing to your Pages domain. Cloudflare will connect the Pages to your domain after a short period. You can then access your panel via `https://xyz.bpb.com/panel` and retrieve new subscriptions.
 
+### Tuning the camouflage fallback (optional)
+
+These environment variables control the reverse-proxy used to disguise the panel domain. Set them the same way as `PROXY_IP` / `FALLBACK` above. **All are optional**; invalid values fall back to the default and log a warning.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `MASK_REQ_BPS` | `20` | Sustained requests/second through the camouflage proxy. |
+| `MASK_REQ_CAP` | `200` | Burst capacity for the same bucket (~30 requests per cold first-paint). |
+| `MASK_TEXT_BPS` | `1048576` | Sustained **rewritten text** bytes/second — the real CPU driver. |
+| `MASK_TEXT_CAP` | `16777216` | Burst capacity for rewritten text; keep it larger than your biggest page. |
+| `MASK_TEXT_IP_CAP` | `4194304` | Per-IP rewritten-text budget per 60 s (minimum `65536`). |
+| `MASK_CACHE_NOISE_EXTRA` | *(empty)* | Extra query parameters to ignore in the cache key. ⚠️ Only parameters that never change content — adding `id`/`page`/`token` merges different pages into one cache entry. |
+| `MASK_CACHE_TS_NORM` | `1` | `0` disables timestamp normalisation (rollback switch). |
+| `MASK_IMG_MODE` | `shell` | `data` restores the legacy inline `data:` URI image page (rollback switch). |
+| `WS_UPLINK_ISOLATE_MB` | `32` | Isolate-wide uplink buffering budget (MB), split across active WebSockets. |
+| `WS_SESSION_MAX_MB` | `0` (off) | Per-connection downlink byte budget; e.g. `2048` closes long sessions gracefully instead of hitting the platform limit. |
+
 ## Updating the Panel
 
 To update your panel, download the new zip file [from here](https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/latest/download/worker.zip). In your Cloudflare account, go to `Compute (Workers)` > `Workers & Pages`, select your Pages project, click `Create deployment`, and upload the new zip file.
