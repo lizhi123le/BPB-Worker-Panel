@@ -119,6 +119,9 @@ store.set('permanentBlacklist', JSON.stringify([FIRST_IP, ...filler, BANNED_IP])
 const bannedProbe = await get('/zz-probe-not-in-dictionary', BANNED_IP);
 await bannedProbe.text();
 check('黑名单：被拉黑 IP 探测非字典路径被拦截（429）', bannedProbe.status === 429, `status=${bannedProbe.status}`);
+// 429 不应带整小时的固定 Retry-After：真实 CF 的 429 不会给这个值，而"429 + 3600"是 cfnew 血统的稳定特征
+check('黑名单：429 不带 Retry-After: 3600', bannedProbe.headers.get('retry-after') !== '3600',
+    `retry-after=${bannedProbe.headers.get('retry-after')}`);
 
 // 条数封顶：最旧的那条（FIRST_IP）应在载入时被丢弃，因此不再被拦
 const trimmedProbe = await get('/zz-probe-not-in-dictionary', FIRST_IP);
@@ -265,6 +268,28 @@ await (await get(RANDOM_PATH)).text();
 check('一致性：根路径与随机路径均命中缓存（0 次出站）', fetchCount === beforeConsistency,
     `before=${beforeConsistency} now=${fetchCount}`);
 
+/**
+ * 把两个令牌桶都放到"实际无限"，并睡一小会儿让惰性补充把令牌补满。
+ *
+ * 为什么必须这样做：桶是 isolate 级单例（生产语义如此），上一段把 requests 打到 0 之后，
+ * 下一段即使改了 cap/rate，令牌也要等"下一次判定时按流逝时间补充"才会回来 —— 不补满的话
+ * 后续请求全部被判 1101，断言会**假通过**（"0 次出站"其实是根本没发请求）。
+ */
+const widenBudget = async (overrides = {}) => {
+    Object.assign(env, {
+        MASK_REQ_CAP: '100000',
+        MASK_REQ_BPS: '1000000',
+        MASK_TEXT_CAP: String(64 * 1024 * 1024),
+        MASK_TEXT_BPS: String(64 * 1024 * 1024),
+        MASK_TEXT_IP_CAP: String(64 * 1024 * 1024),
+        ...overrides
+    });
+    await new Promise((r) => setTimeout(r, 40));
+};
+
+// ---------- 7.5 预算放宽：下面要灌 ~8MB 文本，先把文本桶调大，避免降级污染 #8 的断言 ----------
+await widenBudget();
+
 // ---------- 8. 首页缓存必须按字节有界，而不是只按条目数 ----------
 // 回归点：条目上限 × 单条正文上限（100 × 1MB）曾逼近甚至超过 isolate 的 128MB 内存，
 // 持续 GC 烧掉 CPU，表现为「CPU 超限规律性复发」。这里用行为验证：灌入远超字节预算的
@@ -290,33 +315,169 @@ await (await get(`/about?bulk=${distinct - 1}`)).text();
 check('缓存字节有界：最近的条目仍在缓存（0 次出站）', fetchCount === beforeHot,
     `before=${beforeHot} now=${fetchCount}`);
 
-// ---------- 9. 图片伪装：正常出站一次，之后命中图片缓存 ----------
-// 图片目标没走改写，但 arrayBuffer + base64 拼接同样是重 CPU，因此它也要在熔断范围内。
+// ---------- 9. 图片伪装：壳页 + 同源图片子请求 ----------
+// 形态：页面 ~300B（`<img src="/?<param>=<hash>">`），图片字节由子请求返回，浏览器缓存后不再回源。
+// 改成这样是为了把「每请求 ~2.7MB 内联 data URI」的带宽降下来（CPU 已在上一轮修好）。
 const IMAGE_TARGET = 'https://upstream.example.net/photo.jpg';
-const imageEnv = { ...env, FALLBACK: IMAGE_TARGET };
-const getImage = () => handler.fetch(
-    new Request(ORIGIN + '/', { headers: { Host: 'panel.example.com', 'CF-Connecting-IP': '203.0.113.9' } }),
-    imageEnv,
-    ctx
-);
+const IMAGE_BODY = 'JPEGDATA'.repeat(100);
+const imgEnv = () => ({ ...env, FALLBACK: IMAGE_TARGET });
+const imageReq = (path, extraHeaders = {}) => new Request(ORIGIN + path, {
+    headers: { Host: 'panel.example.com', 'CF-Connecting-IP': '203.0.113.9', ...extraHeaders }
+});
+const getImagePage = () => handler.fetch(imageReq('/'), imgEnv(), ctx);
+const fetchImagePath = (path, extraHeaders = {}) => handler.fetch(imageReq(path, extraHeaders), imgEnv(), ctx);
 
-plan = { mode: 'known', body: 'JPEGDATA'.repeat(100), extra: { 'content-type': 'image/jpeg' } };
+plan = { mode: 'known', body: IMAGE_BODY, extra: { 'content-type': 'image/jpeg' } };
+
 const beforeImage = fetchCount;
-const firstImage = await getImage();
+const firstImage = await getImagePage();
 const firstImageText = await firstImage.text();
 check('图片伪装：首请求确实出站取图（1 次 fetch）', fetchCount === beforeImage + 1, `before=${beforeImage} now=${fetchCount}`);
-check('图片伪装：返回内联 data URI 包装页', firstImageText.includes('data:image/jpeg;base64,'), firstImageText.slice(0, 80));
+check('图片伪装：返回壳页而非 data URI',
+    firstImageText.includes('<img src="/?') && !firstImageText.includes('data:image'),
+    firstImageText.slice(0, 140));
+check('图片伪装：壳页不泄露上游域名', !firstImageText.includes(UPSTREAM_HOST), firstImageText.slice(0, 200));
 
+const imgSrcMatch = firstImageText.match(/<img src="([^"]+)"/);
+const imgPath = imgSrcMatch ? imgSrcMatch[1] : '';
+check('图片伪装：壳页带同源图片子请求', imgPath.startsWith('/?'), `src=${imgPath}`);
+
+// 壳页必须带部署盐（类名/写法随 UUID 变），否则整页字节是一个可被哈希命中的固定常量
+const shellSalt = (firstImageText.match(/class="[wp]([0-9a-f]{5})"/) || [])[1];
+check('图片伪装：壳页类名带部署盐（整页哈希不是固定常量）', !!shellSalt, firstImageText.slice(0, 200));
+check('图片伪装：壳页不再是 cfnew 的固定字节形态',
+    !firstImageText.includes('height:100vh}img{width:100vw'), firstImageText.slice(0, 240));
+
+// 子请求：命中缓存字节 → image/*，逐字节与上游一致，且 0 次出站
+const beforeSub = fetchCount;
+const subResp = await fetchImagePath(imgPath);
+const subBuf = Buffer.from(await subResp.arrayBuffer());
+check('图片子请求：命中缓存 0 次出站', fetchCount === beforeSub, `before=${beforeSub} now=${fetchCount}`);
+check('图片子请求：Content-Type 为 image/*', (subResp.headers.get('content-type') || '').startsWith('image/'),
+    `content-type=${subResp.headers.get('content-type')}`);
+check('图片子请求：字节与上游图逐字节一致', subBuf.equals(Buffer.from(IMAGE_BODY)),
+    `got=${subBuf.length}B expect=${Buffer.byteLength(IMAGE_BODY)}B`);
+check('图片子请求：带 ETag 与长缓存头',
+    !!subResp.headers.get('etag') && (subResp.headers.get('cache-control') || '').includes('max-age'),
+    `etag=${subResp.headers.get('etag')} cc=${subResp.headers.get('cache-control')}`);
+
+// 与真实静态站对齐的三项头（否则"这张图不支持 Range"就是可判定特征）
+check('图片子请求：声明 Accept-Ranges: bytes',
+    subResp.headers.get('accept-ranges') === 'bytes',
+    `accept-ranges=${subResp.headers.get('accept-ranges')}`);
+check('图片子请求：带 Last-Modified',
+    !!subResp.headers.get('last-modified'),
+    `last-modified=${subResp.headers.get('last-modified')}`);
+check('图片子请求：ETag 是内容哈希（不是 URL 哈希）',
+    (subResp.headers.get('etag') || '') !== `"${imgPath.split('=').pop()}"`,
+    `etag=${subResp.headers.get('etag')}`);
+
+// 单段 Range → 206 + Content-Range，且切片字节正确
+const rangeResp = await fetchImagePath(imgPath, { Range: 'bytes=0-9' });
+const rangeBytes = Buffer.from(await rangeResp.arrayBuffer());
+check('图片子请求：Range 请求返回 206 + Content-Range',
+    rangeResp.status === 206
+    && (rangeResp.headers.get('content-range') || '') === `bytes 0-9/${Buffer.byteLength(IMAGE_BODY)}`
+    && rangeBytes.length === 10
+    && rangeBytes.equals(Buffer.from(IMAGE_BODY).subarray(0, 10)),
+    `status=${rangeResp.status} cr=${rangeResp.headers.get('content-range')} len=${rangeBytes.length}`);
+
+// 后缀 Range（bytes=-5）取末 5 字节
+const suffixResp = await fetchImagePath(imgPath, { Range: 'bytes=-5' });
+const suffixBytes = Buffer.from(await suffixResp.arrayBuffer());
+check('图片子请求：后缀 Range（bytes=-5）返回末 5 字节',
+    suffixResp.status === 206 && suffixBytes.equals(Buffer.from(IMAGE_BODY).subarray(-5)),
+    `status=${suffixResp.status} len=${suffixBytes.length}`);
+
+// 越界 Range 不返回 206（回 200 全长，不假装支持）
+const overResp = await fetchImagePath(imgPath, { Range: 'bytes=999999-1000000' });
+check('图片子请求：越界 Range 不返回 206', overResp.status !== 206, `status=${overResp.status}`);
+
+// 壳页也要有统一的安全头与 no-store（与图片字节分支同一套策略）
+check('图片伪装：壳页带 nosniff 且不缓存',
+    firstImage.headers.get('x-content-type-options') === 'nosniff'
+    && (firstImage.headers.get('cache-control') || '').includes('no-store'),
+    `nosniff=${firstImage.headers.get('x-content-type-options')} cc=${firstImage.headers.get('cache-control')}`);
+
+// 条件请求 → 304（浏览器 24h 后重验证不会重下整张图）
+const condResp = await fetchImagePath(imgPath, { 'If-None-Match': subResp.headers.get('etag') || '' });
+check('图片子请求：If-None-Match 命中 304', condResp.status === 304, `status=${condResp.status}`);
+
+// 未命中（伪造哈希）必须回**中性图片**且绝不回 HTML：
+// 回 503 会形成「部署存在性 oracle」，回 HTML 会让 <img> 破图并暴露指纹
+const bogusPath = imgPath.replace(/=([0-9a-f]+)$/, '=deadbeef');
+const bogusResp = await fetchImagePath(bogusPath);
+const bogusText = await bogusResp.text();
+check('图片子请求：未知哈希回中性图片（200 + image/*，非 HTML）',
+    bogusResp.status === 200
+    && (bogusResp.headers.get('content-type') || '').startsWith('image/')
+    && !bogusText.includes('<html'),
+    `status=${bogusResp.status} ct=${bogusResp.headers.get('content-type')}`);
+
+// 页面第二次：字节命中缓存 → 0 次出站，壳页仍一致
 const beforeImageCached = fetchCount;
-await (await getImage()).text();
-check('图片伪装：第二次命中图片缓存（0 次出站）', fetchCount === beforeImageCached, `before=${beforeImageCached} now=${fetchCount}`);
+const secondImageText = await (await getImagePage()).text();
+check('图片伪装：第二次请求 0 次出站（字节命中缓存）', fetchCount === beforeImageCached,
+    `before=${beforeImageCached} now=${fetchCount}`);
+check('图片伪装：壳页与首响应逐字一致', secondImageText === firstImageText,
+    `first=${firstImageText.length}B second=${secondImageText.length}B`);
+
+// 回滚开关：MASK_IMG_MODE=data → 退回"内联 data URI 单请求页"（已知可用但费带宽的旧形态）
+const IMAGE_TARGET_LEGACY = 'https://upstream.example.net/photo-legacy.jpg';
+const legacyEnv = { ...env, FALLBACK: IMAGE_TARGET_LEGACY, MASK_IMG_MODE: 'data' };
+const legacyResp = await handler.fetch(imageReq('/'), legacyEnv, ctx);
+const legacyText = await legacyResp.text();
+check('图片伪装：MASK_IMG_MODE=data 可退回内联 data URI 页（回滚开关）',
+    legacyText.includes('data:image/jpeg;base64,') && !legacyText.includes('<img src="/?'),
+    legacyText.slice(0, 110));
+
+/** 从 data URI 页里解出 base64 并逐字节比对（钉住回滚模式的编码正确性） */
+const decodeDataUri = (html) => {
+    const start = html.indexOf('base64,') + 7;
+    const end = html.indexOf('" alt=');
+    return Buffer.from(html.slice(start, end), 'base64');
+};
+const expectImageBytes = Buffer.from(IMAGE_BODY);
+
+// (1) 原生 toBase64 路径要字节一致
+check('data 回滚模式：base64 与上游字节逐字节一致（原生 toBase64）',
+    decodeDataUri(legacyText).equals(expectImageBytes),
+    `got=${decodeDataUri(legacyText).length}B expect=${expectImageBytes.length}B`);
+
+// (2) 强制走纯 JS 回退：删掉原型方法后再请求（bytesToBase64 是调用时查属性，故此招有效）
+const savedToBase64 = Uint8Array.prototype.toBase64;
+let fallbackText = '';
+try {
+    delete Uint8Array.prototype.toBase64;
+    const fallbackResp = await handler.fetch(imageReq('/?_fb=1'), legacyEnv, ctx);
+    fallbackText = await fallbackResp.text();
+} finally {
+    if (savedToBase64) Uint8Array.prototype.toBase64 = savedToBase64;
+}
+check('data 回滚模式：无原生 toBase64 时回退实现同样字节一致',
+    fallbackText.includes('data:image/jpeg;base64,') && decodeDataUri(fallbackText).equals(expectImageBytes),
+    `len=${fallbackText.length}`);
+
+// (3) 无 content-length / ≥2MB → 流式直传（这一支由 streamImageResponse 统一处理，必须覆盖）
+const STREAM_BODY = 'S'.repeat(64 * 1024);
+plan = { mode: 'chunked', body: STREAM_BODY, extra: { 'content-type': 'image/jpeg' } };
+const streamEnv = { ...env, FALLBACK: 'https://upstream.example.net/photo-stream.jpg' };
+const streamResp = await handler.fetch(imageReq('/'), streamEnv, ctx);
+const streamBytes = Buffer.from(await streamResp.arrayBuffer());
+check('图片流式分支：无 content-length 时直传图片字节（不缓存、不包装 HTML）',
+    (streamResp.headers.get('content-type') || '').startsWith('image/')
+    && streamBytes.length === Buffer.byteLength(STREAM_BODY)
+    && streamBytes[0] === 0x53
+    && !streamBytes.toString('latin1').includes('<html'),
+    `status=${streamResp.status} ct=${streamResp.headers.get('content-type')} len=${streamBytes.length}`);
 
 // ---------- 10. 熔断必须覆盖「内置随机路径」，而不只是根路径 ----------
 // 回归点：熔断判据曾写成 `pathname === '/'`，而随机路径按构造落在路径字典内、
 // 被 firstCheck 的限流豁免，于是随机路径成了唯一没有 CPU 保护的入口。
-// 这里用字典内路径 + 每次不同的 query（必然未命中缓存）持续打，必须出现「0 次出站」。
+// 新模型是令牌桶：把 requests 桶调小（容量 8、补充 1/s），连打必在 8 次内降级。
+Object.assign(env, { MASK_REQ_CAP: '8', MASK_REQ_BPS: '1' });
 let trippedRandom = false;
-for (let i = 0; i < 400; i++) {
+for (let i = 0; i < 60; i++) {
     const c = fetchCount;
     const r = await get(`/blog/news?flare=${i}`);
     await r.text();
@@ -330,23 +491,133 @@ await (await get('/')).text();
 check('熔断：根路径与随机路径共享同一份额度', fetchCount === beforeShared,
     `before=${beforeShared} now=${fetchCount}`);
 
-// ---------- 11. 图片目标同样受熔断约束（额度已耗尽） ----------
-// 回归点：图片分支曾跑在熔断检查之前，图片目标因此完全不受保护。
-// 现在熔断在图片分支之前：额度耗尽时连图都不取，直接给内建 1101 页。
-// 注意必须换一个**未被缓存**的图片地址：上一节那张已在 maskImageCache 里，
-// 而缓存命中会在扣额度之前短路（这是有意为之），用它测不出熔断。
-const IMAGE_TARGET_COLD = 'https://upstream.example.net/photo-cold.jpg';
-const coldImageEnv = { ...env, FALLBACK: IMAGE_TARGET_COLD };
-const beforeBrokeImage = fetchCount;
-const brokeImage = await handler.fetch(
-    new Request(ORIGIN + '/', { headers: { Host: 'panel.example.com', 'CF-Connecting-IP': '203.0.113.9' } }),
-    coldImageEnv,
-    ctx
-);
-const brokeImageText = await brokeImage.text();
-check('熔断：额度耗尽时未缓存的图片目标不再出站（0 次 fetch）', fetchCount === beforeBrokeImage,
-    `before=${beforeBrokeImage} now=${fetchCount}`);
-check('熔断：图片目标降级为内建 1101 页', brokeImageText.includes('1101'), brokeImageText.slice(0, 80));
+// ---------- 11. 分通道额度：文本桶与 requests 桶互不干扰 ----------
+// (a) 只卡文本桶：requests 桶放到实际无限，文本容量 64KB、每次 20KB → 数次内必降级
+await widenBudget({ MASK_TEXT_CAP: '65536', MASK_TEXT_BPS: '1024', MASK_TEXT_IP_CAP: '65536' });
+plan = { mode: 'known', body: 'r'.repeat(20 * 1024), extra: {} };
+let trippedTextAt = -1;
+for (let i = 0; i < 12; i++) {
+    // 注意：文本桶是**出站后**判定的（要先拿到 content-length 才知道成本），
+    // 所以这里用"响应变成 1101 页"作为降级信号，而不是"0 次出站"。
+    const t = await (await get(`/about?tx=${i}`)).text();
+    if (t.includes('1101')) { trippedTextAt = i; break; }
+}
+check('分通道：文本桶耗尽后文本请求降级（改写被跳过）', trippedTextAt >= 0, `trippedAt=${trippedTextAt}`);
+
+// (a2) per-IP 绑定：per-IP 额度小、全局额度大 → 只有该 IP 被降级，别的 IP 照常
+// 注意 65536 是 MASK_TEXT_IP_CAP 的配置下限（低于它会被回退成默认值）
+await widenBudget({ MASK_TEXT_IP_CAP: '65536', MASK_TEXT_CAP: String(64 * 1024 * 1024) });
+plan = { mode: 'known', body: 'z'.repeat(20 * 1024), extra: {} };
+const HOT_IP = '198.51.100.99';
+const OTHER_IP = '198.51.100.42';
+let ipTrippedAt = -1;
+for (let i = 0; i < 10; i++) {
+    const t = await (await get(`/about?ip=${i}`, HOT_IP)).text();
+    if (t.includes('1101')) { ipTrippedAt = i; break; }
+}
+check('熔断：per-IP 文本额度生效（同一 IP 连续大页被降级）', ipTrippedAt >= 0, `trippedAt=${ipTrippedAt}`);
+const beforeOtherIp = fetchCount;
+const otherIpBody = await (await get(`/about?ip=other&x=${Date.now()}`, OTHER_IP)).text();
+check('熔断：per-IP 相互隔离（另一个 IP 不受影响，仍在出站）',
+    fetchCount === beforeOtherIp + 1 && !otherIpBody.includes('1101'),
+    `before=${beforeOtherIp} now=${fetchCount}`);
+
+// (b) 文本桶耗尽时图片页仍应可用 —— 这正是分通道的目的：文本额度不拖垮图片伪装面
+const pageWhileTextDown = await getImagePage();
+const pageWhileTextDownText = await pageWhileTextDown.text();
+check('分通道：文本桶耗尽时图片页仍可用',
+    pageWhileTextDown.status === 200 && pageWhileTextDownText.includes('<img'),
+    `status=${pageWhileTextDown.status} body=${pageWhileTextDownText.slice(0, 60)}`);
+
+// (c) 再卡死 requests 桶：图片页也必须降级（熔断覆盖图片分支，不再有"免额度"的旁路）
+Object.assign(env, { MASK_REQ_CAP: '3', MASK_REQ_BPS: '1' });
+let brokeImage = false;
+let brokeImageStatus = 0;
+for (let i = 0; i < 12; i++) {
+    const c = fetchCount;
+    const r = await getImagePage();
+    const t = await r.text();
+    if (t.includes('1101') && fetchCount === c) { brokeImage = true; brokeImageStatus = r.status; break; }
+}
+check('requests 桶耗尽：图片目标降级为内建 1101 页（熔断覆盖图片分支）', brokeImage, `fetchCount=${fetchCount}`);
+
+// 指纹一致性：真实 CF 的 1101「Worker threw exception」是 5xx；"错误页配 200" 本身就是可判定特征
+check('熔断：1101 降级页状态码为 5xx（不是 200）', brokeImageStatus >= 500 && brokeImageStatus < 600,
+    `status=${brokeImageStatus}`);
+
+// (d) requests 桶耗尽时，`<img>` 子请求必须回 503 空体 —— 回 HTML 会让 <img> 破图并暴露指纹
+const beforeImgGate = fetchCount;
+const gatedImg = await fetchImagePath(imgPath);
+const gatedImgText = await gatedImg.text();
+check('requests 桶耗尽：<img> 子请求回 503 且不是 HTML',
+    gatedImg.status === 503 && !gatedImgText.includes('<html'),
+    `status=${gatedImg.status} body=${gatedImgText.slice(0, 30)}`);
+check('requests 桶耗尽：<img> 子请求不再出站', fetchCount === beforeImgGate,
+    `before=${beforeImgGate} now=${fetchCount}`);
+
+// ---------- 12. 缓存键：时间戳参数按「值形态」归一，语义参数一律不归一 ----------
+await widenBudget();
+plan = { mode: 'known', body: '<html><a href="https://upstream.example.net/cache">c</a></html>', extra: {} };
+const nowSec = Math.floor(Date.now() / 1000);
+const nowMs = Date.now();
+
+// 基线守卫：先确认"请求真的出站了"，否则后面的"0 次额外出站"可能只是额度耗尽造成的假通过
+const beforeBaseline = fetchCount;
+await (await get(`/about?k=ts1&t=${nowSec}`)).text();
+check('缓存键：基线请求确实出站（防止额度耗尽导致假通过）', fetchCount === beforeBaseline + 1,
+    `before=${beforeBaseline} now=${fetchCount}`);
+
+// 同组参数、只差一个"当前时刻"的秒级时间戳 → 必须命中同一份缓存
+let beforeTs = fetchCount;
+await (await get(`/about?k=ts1&t=${nowSec + 1}`)).text();
+check('缓存键：当前时刻的 t= 被归一（0 次额外出站）', fetchCount === beforeTs,
+    `before=${beforeTs} now=${fetchCount}`);
+
+// 13 位毫秒时间戳只在**静态资源路径**上归一（对象 ID / 日志时间戳也常是 13 位，API 路径上归一会投毒）
+const beforeMs = fetchCount;
+await (await get(`/about/app.js?k=ts2&timestamp=${nowMs}`)).text();
+check('缓存键：毫秒 timestamp 基线出站', fetchCount === beforeMs + 1, `before=${beforeMs} now=${fetchCount}`);
+beforeTs = fetchCount;
+await (await get(`/about/app.js?k=ts2&timestamp=${nowMs + 1}`)).text();
+check('缓存键：静态资源路径上的毫秒 timestamp 被归一', fetchCount === beforeTs,
+    `before=${beforeTs} now=${fetchCount}`);
+
+// 同一条毫秒时间戳出现在**接口路径**上时必须保留（否则不同对象会折叠成同一缓存键）
+const beforeApiMs = fetchCount;
+await (await get(`/about/log?k=ts3&timestamp=${nowMs}`)).text();
+await (await get(`/about/log?k=ts3&timestamp=${nowMs + 1000}`)).text();
+check('缓存键：接口路径上的毫秒 timestamp 不被归一（防跨对象折叠）', fetchCount === beforeApiMs + 2,
+    `before=${beforeApiMs} now=${fetchCount}`);
+
+// 出现语义参数（id/page/token…）时整条查询串都不做时间戳归一
+const beforeSemantic = fetchCount;
+await (await get(`/about?k=ts4&id=5&t=${nowSec}`)).text();
+await (await get(`/about?k=ts4&id=5&t=${nowSec + 1}`)).text();
+check('缓存键：带语义参数时不做时间戳归一', fetchCount === beforeSemantic + 2,
+    `before=${beforeSemantic} now=${fetchCount}`);
+
+// 历史时刻（不在 now±1h）的 t= 是**语义参数**（as-of 快照）→ 必须各自出站，不能被缓存投毒
+const oldSec = 1700000000;
+const beforeOld = fetchCount;
+await (await get(`/about?k=old&t=${oldSec}`)).text();
+await (await get(`/about?k=old&t=${oldSec + 1}`)).text();
+check('缓存键：历史时刻的 t= 不被归一（防缓存投毒）', fetchCount === beforeOld + 2,
+    `before=${beforeOld} now=${fetchCount}`);
+
+// 语义参数一律不归一
+const beforeId = fetchCount;
+await (await get('/about?k=id&id=5')).text();
+await (await get('/about?k=id&id=6')).text();
+check('缓存键：id= 等语义参数不被归一', fetchCount === beforeId + 2,
+    `before=${beforeId} now=${fetchCount}`);
+
+// 回滚开关：MASK_CACHE_TS_NORM=0 时时间戳不再归一
+await widenBudget({ MASK_CACHE_TS_NORM: '0' });
+const beforeOff = fetchCount;
+await (await get(`/about?k=off&t=${nowSec}`)).text();
+await (await get(`/about?k=off&t=${nowSec + 1}`)).text();
+check('缓存键：MASK_CACHE_TS_NORM=0 可关闭归一（回滚开关）', fetchCount === beforeOff + 2,
+    `before=${beforeOff} now=${fetchCount}`);
 
 out(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);
