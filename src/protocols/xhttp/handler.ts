@@ -201,6 +201,9 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
             }
             touch();
             try {
+                // 这里必须拷贝：WS 入站的下行缓冲是「交出后隔一代复用」的池缓冲，
+                // 而 enqueue 进响应流的数据要等到 HTTP body 真正被消费者读走才失效 ——
+                // 等待时间不受控（可能几十帧之后），一代的复用间隔不足以保证安全。
                 controllerRef.enqueue(data.slice());
             } catch {
                 terminate();

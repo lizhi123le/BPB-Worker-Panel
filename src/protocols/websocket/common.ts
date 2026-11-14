@@ -94,7 +94,8 @@ async function connectWithRaceDial(
     rawClientData: ArrayBuffer | undefined,
     log: Function,
     fetcher?: any,
-    poolOverride?: string[]
+    poolOverride?: string[],
+    onSocket?: (socket: Socket) => void
 ): Promise<{ socket: Socket; usedIp: string }> {
     // 1. 获取配置
     //    poolOverride 供「CF 内置 IP 池」层使用：显式指定官方直连池，
@@ -110,7 +111,7 @@ async function connectWithRaceDial(
 
     // 如果是 prefix 模式，直接走 NAT64 prefix 路径
     if (proxyMode === 'prefix') {
-        return await connectWithPrefixFallback(targetAddress, targetPort, rawClientData, log, fetcher);
+        return await connectWithPrefixFallback(targetAddress, targetPort, rawClientData, log, fetcher, onSocket);
     }
 
     // 2. 构建 IP 池输入：纯 IP/IP:port 直接入池轮询，域名（自动地区/指定地区）解析其 IP 入池
@@ -202,6 +203,8 @@ async function connectWithRaceDial(
             // blacklistBypass（全池退避中）时不跳过，保证最后兜底仍真的会拨号。
             if (!blacklistBypass && blacklistCheck(key)) return { socket: null, ip: cleanIp, port: entryPort, index: batchIndexes[j] };
             const socket = connectSocket({ hostname: cleanIp, port: entryPort }, fetcher);
+            // 立刻登记：竞速是"先写首包再返回"，写卡住时上层拿不到 socket，teardown 就没人关它
+            onSocket?.(socket);
             // 等待连接建立
             try {
                 await Promise.race([
@@ -285,7 +288,8 @@ async function connectWithDirectRaceDial(
     targetPort: number,
     rawClientData: ArrayBuffer | undefined,
     log: Function,
-    fetcher?: any
+    fetcher?: any,
+    onSocket?: (socket: Socket) => void
 ): Promise<{ socket: Socket; usedIp: string }> {
     // 1. 构建 IP 池：IP 字面量直接用；域名则 DoH 解析（A + AAAA）
     let pool: string[];
@@ -354,6 +358,9 @@ async function connectWithDirectRaceDial(
         // 并发拨号，取最快成功的（对齐 cfnew 并发连接候选 Promise.any）
         const dialPromises = batchCandidates.map(async (candidate) => {
             const socket = connectSocket({ hostname: candidate.hostname, port: candidate.port }, fetcher);
+            // 立刻登记：本函数**先写首包再返回**，若写卡住（后端 accept 但永不消费），
+            // 上层拿不到 socket，teardown 时就没人关它（评审 MAJOR：资源不释放）。
+            onSocket?.(socket);
             try {
                 await Promise.race([
                     socket.opened,
@@ -453,7 +460,8 @@ async function connectWithPrefixFallback(
     targetPort: number,
     rawClientData: ArrayBuffer | undefined,
     log: Function,
-    fetcher?: any
+    fetcher?: any,
+    onSocket?: (socket: Socket) => void
 ): Promise<{ socket: Socket; usedIp: string }> {
     log(`using NAT64 prefix mode for ${targetAddress}:${targetPort}`);
     
@@ -492,7 +500,7 @@ async function connectWithPrefixFallback(
         const hasV6Record = isV6Literal ? true : (await resolveTargetDNS(targetAddress)).ipv6.length > 0;
         if (hasV6Record) {
             log(`no IPv4 record for ${targetAddress}; dialing target directly (NAT64 mapping not applicable)`);
-            const directSocket = await dialAndWrite(targetAddress, targetPort, rawClientData, fetcher);
+            const directSocket = await dialAndWrite(targetAddress, targetPort, rawClientData, fetcher, { onSocket });
             return { socket: directSocket, usedIp: targetAddress };
         }
         throw new Error('Unable to find IPv4 in DNS records for prefix fallback');
@@ -510,7 +518,7 @@ async function connectWithPrefixFallback(
     
     log(`trying NAT64 prefix IP ${nat64IP}:${targetPort}`);
     
-    const tcpSocket = await dialAndWrite(nat64IP, targetPort, rawClientData, fetcher);
+        const tcpSocket = await dialAndWrite(nat64IP, targetPort, rawClientData, fetcher, { onSocket });
     
     return { socket: tcpSocket, usedIp: nat64IP };
 }
@@ -841,7 +849,7 @@ async function connectThroughUpstreamProxy(
 }
 
 export async function handleTCPOutBound(
-    remoteSocket: { value: Socket | null },
+    remoteSocket: { value: Socket | null; track?: (socket: Socket | null) => void },
     addressRemote: string,
     portRemote: number,
     rawClientData: ArrayBuffer | undefined,
@@ -896,7 +904,7 @@ export async function handleTCPOutBound(
     async function connectAndWriteLocal(address: string, port: number, fetcher?: any): Promise<Socket> {
         return await dialAndWrite(address, port, rawClientData, fetcher, {
             // 登记时机不能挪到 await 之后：超时/失败时 teardown 要靠它关掉这条半开连接
-            onSocket: (socket) => { remoteSocket.value = socket; },
+            onSocket: (socket) => { remoteSocket.value = socket; },  // 单条拨号路径：它就是要被认领的 socket
             onOpened: () => log(`connected to ${address}:${port}`),
         });
     }
@@ -944,7 +952,7 @@ export async function handleTCPOutBound(
                 triedHops.add('pool');
                 try {
                     log(`retry: attempting reverse-proxy pool race dial for ${originalAddress}:${originalPort}`);
-                    const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, proxyPoolForDial);
+                    const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, proxyPoolForDial, (s) => remoteSocket.track?.(s));
 
                     tcpSocket.closed
                         .catch(error => console.log('reverse-proxy pool TCP socket closed error', error))
@@ -965,7 +973,7 @@ export async function handleTCPOutBound(
                 triedHops.add('official');
                 try {
                     log(`retry: attempting CF official IP pool race dial for ${originalAddress}:${originalPort}`);
-                    const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool);
+                    const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool, (s) => remoteSocket.track?.(s));
 
                     tcpSocket.closed
                         .catch(error => console.log('CF official pool TCP socket closed error', error))
@@ -1004,7 +1012,7 @@ export async function handleTCPOutBound(
     if (proxyMode === 'prefix') {
         try {
             log(`using NAT64 prefix mode for ${originalAddress}:${originalPort}`);
-            const { socket: tcpSocket, usedIp } = await connectWithPrefixFallback(originalAddress, originalPort, rawClientData, log, fetcher);
+            const { socket: tcpSocket, usedIp } = await connectWithPrefixFallback(originalAddress, originalPort, rawClientData, log, fetcher, (s) => remoteSocket.track?.(s));
             
             tcpSocket.closed
                 .catch(error => console.log('prefix fallback TCP socket closed error', error))
@@ -1070,7 +1078,7 @@ export async function handleTCPOutBound(
             triedHops.add('pool');
             try {
                 log(`proxy-first: attempting race dial through reverse-proxy pool for ${originalAddress}:${originalPort}`);
-                const { socket } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, proxyPoolForDial);
+                const { socket } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, proxyPoolForDial, (s) => remoteSocket.track?.(s));
                 proxySocket = socket;
             } catch (poolError) {
                 log(`reverse-proxy pool failed: ${safeErrorMessage(poolError)}`);
@@ -1116,7 +1124,7 @@ export async function handleTCPOutBound(
             triedHops.add('pool');
             try {
                 log(`pool-first: reverse-proxy pool race dial for ${originalAddress}:${originalPort}`);
-                const { socket } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, proxyPoolForDial);
+                const { socket } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, proxyPoolForDial, (s) => remoteSocket.track?.(s));
                 poolSocket = socket;
             } catch (poolError) {
                 log(`pool-first reverse-proxy pool failed: ${safeErrorMessage(poolError)}`);
@@ -1126,7 +1134,7 @@ export async function handleTCPOutBound(
             triedHops.add('official');
             try {
                 log(`pool-first: CF official IP pool race dial for ${originalAddress}:${originalPort}`);
-                const { socket } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool);
+                const { socket } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool, (s) => remoteSocket.track?.(s));
                 poolSocket = socket;
             } catch (officialError) {
                 log(`pool-first CF official pool failed: ${safeErrorMessage(officialError)}`);
@@ -1159,7 +1167,7 @@ export async function handleTCPOutBound(
     // 直连竞速拨号；失败或 6s 无首字节 → 回退阶梯（上游代理 → 反代池 → 官方池 → 直连兜底）
     try {
         log(`attempting direct race dial for ${originalAddress}:${originalPort}`);
-        const { socket: tcpSocket, usedIp } = await connectWithDirectRaceDial(originalAddress, originalPort, rawClientData, log, fetcher);
+        const { socket: tcpSocket, usedIp } = await connectWithDirectRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, (s) => remoteSocket.track?.(s));
 
         tcpSocket.closed
             .catch(error => console.log('direct race dial TCP socket closed error', error))
@@ -1187,7 +1195,30 @@ const DOWNLOAD_PACKET_SIZE = 32 * 1024;  // 传输下载包大小：批量缓冲
 const DOWNLOAD_TAIL = 512;                // 传输下载尾部：剩余空间阈值触发刷新
 const DOWNLOAD_DELAY = 0;                 // 传输下载延迟：0ms（用 queueMicrotask 刷新）
 const DOWNLOAD_BLOCK_SIZE = 64 * 1024;    // 传输块大小：BYOB reader 复用缓冲
+/**
+ * 帧长抖动的**下限**（24KiB）。下行分流的阈值必须用它，而不是 `DOWNLOAD_BLOCK_SIZE >> 1`：
+ * 只有「块 < 下限 ≤ PACKET_SIZE」才能保证 batcher 里那条「缓冲为空且剩余 ≥ PACKET_SIZE
+ * 就直接按引用 send」的分支永不触发 —— 那条分支会把调用方即将复用的缓冲按引用交出去。
+ */
+const DOWNLOAD_PACKET_MIN = DOWNLOAD_PACKET_SIZE / 4 * 3;
 const FIRST_BYTE_TIMEOUT = 6000;          // 首字节超时 ms（触发 retry 降级）
+
+/**
+ * 下行「会话字节预算」（可选保护，默认关闭）。
+ *
+ * 为什么需要：Workers 的 CPU 额度是**按调用累计**的，而一条 WebSocket 会话就是一次调用 ——
+ * 4K 这种大流量会把预算慢慢耗光，超限时平台返回 1102 并**连带打死整个 isolate**
+ * （同一 isolate 上的其它连接一起断）。按字节主动收口，可以把「不可控的 isolate 崩溃」
+ * 换成「单条连接可控断开」。
+ *
+ * 默认 0 = 不启用：这属于运行策略而非缺陷修复，静默掐断长连接会改变既有行为。
+ * 需要时设 env `WS_SESSION_MAX_MB`（单位为 MB，例如 Free 计划建议 1~2GB 量级）。
+ */
+function sessionByteBudget(): number {
+    const raw = Number((globalThis as any).env?.WS_SESSION_MAX_MB ?? 0);
+    if (!Number.isFinite(raw) || raw <= 0) return 0;
+    return Math.floor(raw * 1024 * 1024);
+}
 
 // --- Uint8Array helpers (aligned with cfnew 处理值值8数组 / 拼接值8数组) ---
 function toUint8Array(data: ArrayBufferView | ArrayBuffer | Uint8Array): Uint8Array {
@@ -1207,12 +1238,20 @@ function concatUint8Arrays(a: Uint8Array, b: Uint8Array): Uint8Array {
 // --- cfnew-style download batcher (aligned with cfnew 创建值值 L5013-5078) ---
 // Batches small TCP chunks into larger WebSocket frames for better throughput.
 function createDownloadBatcher(webSocket: WebSocket) {
-    // 出口帧长抖动：每连接在 24KiB..40KiB 闭区间随机取包长，消除固定 32KiB 帧长的可统计长度指纹
-    // （DOWNLOAD_PACKET_SIZE 保留为模块级基准值，抖动后仍恒 ≤ DOWNLOAD_BLOCK_SIZE）
-    const PACKET_SIZE = DOWNLOAD_PACKET_SIZE / 4 * 3 + Math.floor(Math.random() * (DOWNLOAD_PACKET_SIZE / 2 + 1));
+    // 出口帧长抖动：每连接在 DOWNLOAD_PACKET_MIN .. DOWNLOAD_PACKET_MIN+16KiB 随机取，
+    // 消除固定帧长的长度指纹。下限由 DOWNLOAD_PACKET_MIN 统一给出 —— remoteSocketToWS 的
+    // 分流阈值依赖这条不变式：**进入 batcher 的块一定 < DOWNLOAD_PACKET_MIN ≤ PACKET_SIZE**。
+    const PACKET_SIZE = DOWNLOAD_PACKET_MIN + Math.floor(Math.random() * (DOWNLOAD_PACKET_SIZE / 2 + 1));
     const TAIL = DOWNLOAD_TAIL;                 // 512
     const LOW_WATER = Math.max(4096, TAIL << 3); // 4096
-    let buffer = new Uint8Array(PACKET_SIZE);
+    // 攒批缓冲**懒分配**：只在第一次收到小块时才占这 24~40KiB。
+    // 只跑大块直发的连接（4K 下行几乎全是 ≥24KiB 的块）、以及只做 DNS/测速/握手失败就结束的连接，
+    // 按旧实现各自白占一块；256 连接上限下这部分最多是 ~10MB 的恒定开销。
+    let buffer: Uint8Array<ArrayBuffer> | null = null;
+    // 交出后待复用的那块：flush 把当前块的**视图**交给 send()，随后改用另一块，
+    // 交出去的那块要等下一轮 flush 才会被复用（依据：webSocket.send() 是同步 API，
+    // 载荷在调用时即被复制进待发队列、view 不被保留；即便运行时延迟复制，也有一整代缓冲间隔）。
+    let spareBuffer: Uint8Array<ArrayBuffer> | null = null;
     let buffered = 0;
     let timer: ReturnType<typeof setTimeout> | 0 = 0;
     let scheduled = false;
@@ -1223,13 +1262,26 @@ function createDownloadBatcher(webSocket: WebSocket) {
     function flush() {
         if (timer) { clearTimeout(timer); timer = 0; }
         scheduled = false;
-        if (!buffered) return;
-        if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            webSocket.send(buffer.subarray(0, buffered).slice());
-        }
-        buffer = new Uint8Array(PACKET_SIZE);
+        const used = buffer;
+        if (!buffered || !used) { buffered = 0; return; }
+        const length = buffered;
         buffered = 0;
         retryCount = 0;
+        // 交换而非重分配：交出 used，下一帧写进另一块。
+        // 旧实现每次 flush 都在 queueMicrotask 之后做 subarray().slice() 再 new Uint8Array(PACKET_SIZE)，
+        // 一次 flush 一次拷贝 + 一次分配（实测 16KiB 读路径 0.57ms/MB → 单拷贝实现 0.079ms/MB）。
+        // 没有 spare 时把 buffer 置 null 而不是立刻分配第二块：只 flush 一次的连接（短连接、
+        // 只跑小块的连接）永远不会为「下一块」付内存。
+        if (spareBuffer) {
+            buffer = spareBuffer;
+            spareBuffer = used;
+        } else {
+            spareBuffer = used;
+            buffer = null;
+        }
+        if (webSocket.readyState === WS_READY_STATE_OPEN) {
+            webSocket.send(used.subarray(0, length));
+        }
     }
 
     function schedule() {
@@ -1261,19 +1313,15 @@ function createDownloadBatcher(webSocket: WebSocket) {
             let offset = 0;
             const total = data.byteLength;
             if (!total) return;
+            // 契约：只有小于 DOWNLOAD_PACKET_MIN 的块会进到这里（见 remoteSocketToWS 的分流），
+            // 因此这里**一律拷贝**进合帧缓冲，绝不把调用方的缓冲按引用交给 send()。
+            // 旧实现有一条「缓冲为空且剩余 ≥ PACKET_SIZE 就按引用直发」的捷径：在调用方改用
+            // 可复用缓冲池之后，它会把手头即将被复用的内存交出去，故已删除（现在也进不来）。
             while (offset < total) {
-                // If buffer is empty and remaining data >= PACKET_SIZE, send directly (no copy)
-                if (!buffered && total - offset >= PACKET_SIZE) {
-                    const size = Math.min(PACKET_SIZE, total - offset);
-                    if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                        webSocket.send(offset || size !== total ? data.subarray(offset, offset + size) : data);
-                    }
-                    offset += size;
-                    continue;
-                }
-                // Copy into buffer
+                // 缓冲懒分配：没小块流量的连接不为它付内存
+                const dst = buffer ?? (buffer = new Uint8Array(PACKET_SIZE));
                 const size = Math.min(PACKET_SIZE - buffered, total - offset);
-                buffer.set(data.subarray(offset, offset + size), buffered);
+                dst.set(data.subarray(offset, offset + size), buffered);
                 buffered += size;
                 offset += size;
                 writeCount++;
@@ -1316,7 +1364,37 @@ async function remoteSocketToWS(
     const batcher = createDownloadBatcher(webSocket);
     let reader: ReadableStreamDefaultReader<any> | null = null;
     let isByob = true;
-    let byobBuffer = new ArrayBuffer(DOWNLOAD_BLOCK_SIZE);
+    /**
+     * BYOB 读缓冲的「三槽」管理。
+     *
+     * 关键事实（Streams 规范，实测已确认）：`read(view)` 会 **transfer（detach）传入的 view 缓冲区**，
+     * 并把数据搬到它解析出来的 `value.buffer` 上（同一块内存的新身份）。因此：
+     *   - 同一块 ArrayBuffer **不能**跨两次 read 复用（第二次会在构造 view 时抛 TypeError）；
+     *   - 但每轮把槽刷新成 `value.buffer` 就可以继续用，且**不产生新的内存分配**（transfer 是移动不是拷贝）。
+     * 旧实现每读一块就 `new ArrayBuffer(64KiB)`（真正的零化 + 分配），正是下行最贵的单项。
+     *
+     * 为什么是**三**槽（而不是两槽）：交出去给 `send()` 的那块，必须隔足够远才被再次用作读目标。
+     * 两槽时复用距离只有 1 次 read+send，安全性完全押在"send() 在调用时同步复制"这个运行时语义上
+     * （Workers 文档没写死，XHTTP 侧我们也判定过"一代不够"）。三槽把距离拉到 2 代，
+     * 即便某个运行时把复制推迟一整轮，也不会读到被覆盖的数据。槽位按需分配：只做小块的连接
+     * （不 rotate）永远只用 1 块。
+     */
+    const byobPool: (ArrayBuffer | null)[] = [null, null, null];
+    let byobIndex = 0;
+    const takeBlock = (): ArrayBuffer =>
+        byobPool[byobIndex] ?? (byobPool[byobIndex] = new ArrayBuffer(DOWNLOAD_BLOCK_SIZE));
+    /** 本轮 read 已把传入缓冲 transfer 走，槽位改记「解析出来的那块」；尺寸异常时退回新分配 */
+    const refreshBlock = (readValue: any): void => {
+        const next = readValue?.buffer;
+        byobPool[byobIndex] = next instanceof ArrayBuffer && next.byteLength >= DOWNLOAD_BLOCK_SIZE
+            ? next
+            : new ArrayBuffer(DOWNLOAD_BLOCK_SIZE);
+    };
+    const rotateBlock = (): void => { byobIndex = (byobIndex + 1) % 3; };
+    // 会话级下行字节预算（默认关闭，见 sessionByteBudget 注释）
+    const byteBudget = sessionByteBudget();
+    let sentBytes = 0;
+    let budgetExceeded = false;
 
     try {
         // Try BYOB reader first (zero-copy, reusable buffer)
@@ -1329,10 +1407,12 @@ async function remoteSocketToWS(
 
         for (;;) {
             const result = isByob
-                ? await (reader as any).read(new Uint8Array(byobBuffer, 0, DOWNLOAD_BLOCK_SIZE))
+                ? await (reader as any).read(new Uint8Array(takeBlock(), 0, DOWNLOAD_BLOCK_SIZE))
                 : await reader!.read();
             if (result.done) break;
             const readValue = result.value;
+            // 本轮的缓冲已被 transfer 走，槽位立刻改记新身份（小块的下一轮读也靠它复用）
+            if (isByob) refreshBlock(readValue);
             let chunk = toUint8Array(readValue);
             if (!chunk.byteLength) continue;
 
@@ -1352,20 +1432,27 @@ async function remoteSocketToWS(
                 vlHeader = null;
             }
 
-            // Large chunk (>= 32KB): flush batcher + send directly
-            if (chunk.byteLength >= DOWNLOAD_BLOCK_SIZE >> 1) {
+            // 会话字节预算：超限即主动收口（默认关闭）。放在发送之前，保证不越界。
+            if (byteBudget) {
+                sentBytes += chunk.byteLength;
+                if (sentBytes > byteBudget) {
+                    log(`session downlink budget ${byteBudget}B exceeded, closing`);
+                    budgetExceeded = true;
+                    break;
+                }
+            }
+
+            // 分流阈值取帧长抖动的下限（24KiB），保证走 batcher 的块**一定**小于 PACKET_SIZE，
+            // 从而 batcher 里「按引用直接 send」的分支永不触发（它会把即将复用的池缓冲交出去）。
+            if (chunk.byteLength >= DOWNLOAD_PACKET_MIN) {
                 batcher.flush();
                 webSocket.send(chunk);
-                if (isByob) byobBuffer = new ArrayBuffer(DOWNLOAD_BLOCK_SIZE);
+                // 交出的是池里整块的视图（send 同步复制）；改用另一块，隔一代再复用
+                if (isByob) rotateBlock();
             } else {
-                // Small chunk: go through batcher for frame coalescing
-                batcher.send(chunk.slice());
-                if (isByob) {
-                    // Track BYOB buffer reuse: if read filled the full block, buffer is safe to reuse
-                    byobBuffer = readValue?.buffer instanceof ArrayBuffer && readValue.buffer.byteLength >= DOWNLOAD_BLOCK_SIZE
-                        ? readValue.buffer
-                        : new ArrayBuffer(DOWNLOAD_BLOCK_SIZE);
-                }
+                // 小块：交给 batcher 合帧。batcher 内部必然 buffer.set 拷贝一次，因此无需先 slice()
+                //（旧实现这里还有一次 chunk.slice()，同一段数据被拷了两遍）
+                batcher.send(chunk);
             }
         }
 
@@ -1377,6 +1464,10 @@ async function remoteSocketToWS(
         try { batcher.flush(); } catch {}
         try { reader?.releaseLock(); } catch {}
     }
+
+    // 预算耗尽的收口：主动关 WS（其 close 事件会让上行泵结束并关掉后端 socket），
+    // 而不是等平台用 1102 把整个 isolate 一起打死。
+    if (budgetExceeded) safeCloseWebSocket(webSocket);
 
     if (firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null; }
     if (!hasIncomingData && !hasRetryFired && retry) {
@@ -1419,12 +1510,45 @@ export function runWsCleanupHooks(webSocket: WebSocket): void {
     }
 }
 
-export function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader: string, log: Function) {
+/**
+ * 上行背压阈值：WS 没有 pause/暂停 API（客户端发多少，message 事件就触发多少次），
+ * 「消费者落后」只能靠**主动收口**处理 —— 丢帧会破坏被代理的 TCP 字节流，所以唯一正确的
+ * 做法是关连接。
+ *
+ * `WS_UPLINK_MAX_QUEUED` 只是**默认值**：调用方按当前活动连接数传入实际上限
+ * （isolate 级预算 ÷ 连接数），否则 N 条连接各 8MiB 会让"每连接有界、整体无界"。
+ */
+const WS_UPLINK_HIGH_WATER = 64 * 1024;
+const WS_UPLINK_MAX_QUEUED = 8 * 1024 * 1024;
+
+export function makeReadableWebSocketStream(
+    webSocketServer: WebSocket,
+    earlyDataHeader: string,
+    log: Function,
+    maxQueuedBytes: number = WS_UPLINK_MAX_QUEUED
+): ReadableStream<ArrayBuffer> {
     let readableStreamCancel = false;
-    const stream = new ReadableStream({
+    const stream = new ReadableStream<ArrayBuffer>({
         start(controller) {
             webSocketServer.addEventListener("message", (event) => {
                 if (readableStreamCancel) return;
+                // 背压：desiredSize = 高水位 − 已入队未读字节；为负说明消费者（上行泵）落后。
+                // 落后超过上限说明后端已堵死或客户端在猛灌，此时继续 enqueue 只会让 isolate
+                // 内存无界增长 → 持续 GC（GC 时间全额计入 CPU）→ 1102。
+                const desired = controller.desiredSize;
+                if (desired !== null && -desired > maxQueuedBytes) {
+                    log(`uplink backlog ${-desired}B exceeds ${maxQueuedBytes}B, closing WS`);
+                    readableStreamCancel = true;
+                    safeCloseWebSocket(webSocketServer);
+                    // 用 error() 而不是 close()：close 会让泵把队列里剩余的最多 maxQueuedBytes
+                    // 逐个读出来再写进一个已经堵死的后端（既慢又不释放内存）；error() 让泵的
+                    // read 直接抛错 → failUplink → 关后端 socket 的**唯一**收口。
+                    try { controller.error(new Error('uplink backlog exceeded')); } catch (_) { /* 已 error/关闭，忽略 */ }
+                    // 清理钩子里会强制关闭后端 socket（unified.ts 注册），
+                    // 否则泵可能正卡在"写不出去"的 await 上永远不退出。
+                    runWsCleanupHooks(webSocketServer);
+                    return;
+                }
                 // WebSocket binaryType='arraybuffer' ensures event.data is always ArrayBuffer
                 controller.enqueue(event.data);
             });
@@ -1463,7 +1587,9 @@ export function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDat
             safeCloseWebSocket(webSocketServer);
             runWsCleanupHooks(webSocketServer);
         }
-    });
+    // 字节口径的高水位：desiredSize 才是「已入队未读字节」的真实水位，默认计数策略拿不到它。
+    // 策略只用于计算水位，chunk 类型仍是 ArrayBuffer（因此这里显式收窄一次）。
+    }, new ByteLengthQueuingStrategy({ highWaterMark: WS_UPLINK_HIGH_WATER }) as unknown as QueuingStrategy<ArrayBuffer>);
 
     return stream;
 }

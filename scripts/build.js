@@ -357,6 +357,9 @@ async function obfuscateWithGates() {
     const toolsGates = [
         { script: 'tools/panel-layout.test.mjs', label: '面板 Subscriptions 布局：表格/行铺满容器、操作按钮列钉在右边缘（CSS 契约）' },
         { script: 'tools/ws-firstpacket.test.mjs', label: 'WS 首包判定（VLESS/Trojan 识别与非法首包收口）' },
+    { script: 'tools/ws-uplink-batch.test.mjs', label: 'WS 上行两阶段：首包单帧 / 32KiB 合批 / 2ms 定时器 / 大帧直写 / 字节总账' },
+    { script: 'tools/ws-downlink-frame.test.mjs', label: 'WS 下行成帧：大块成帧 / batcher 合帧 / 缓冲轮换不复用 / 上行积压收口' },
+    { script: 'tools/camouflage-cpu.test.mjs', label: '伪装反代形态适配：黑名单豁免 / 体积预算改写 / 字节预算缓存 / 图片壳页与子请求 503-304 / 熔断分桶 / 缓存键时间戳归一 / 两个回滚开关' },
         { script: 'tools/random-path.test.mjs', label: '节点随机路径开关（开启=1-3 段随机路径 / 关闭=固定根路径 / ed 无放回不变）' },
         { script: 'tools/xhttp-node.test.mjs', label: 'XHTTP 节点生成：raw/xray 两种订阅的 xhttp 与 ws 形态、app=sing-box 不含 xhttp' },
         { script: 'tools/xhttp-inbound.test.mjs', label: 'XHTTP 入站：开关/路径白名单/UUID 校验/填充剥离/跨 chunk 首包/UDP DNS' },

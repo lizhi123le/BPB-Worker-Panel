@@ -34,16 +34,23 @@ import {
 const { out, check, failures } = makeReporter();
 
 // ── 桩：connect 返回可记录写入的假 socket
+// writeDelayMs：让第 N 次写晚一点 resolve，用于构造「两笔在途写」的乱序完成场景
 const tcpWrites = [];
+let writeDelayMs = 0;
+let writeCount = 0;
 function makeFakeSocket() {
     return {
         opened: Promise.resolve(),
         closed: new Promise(() => {}),   // 永不关闭：下行没有数据，也不需要触发 client-closed
         readable: new ReadableStream({ start() { /* 保持打开 */ } }),
         writable: new WritableStream({
-            write(chunk) {
+            async write(chunk) {
+                // 先快照再等：真实 sink 拿到 chunk 后也可能异步消费，字节必须当场固定
                 const view = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-                tcpWrites.push(view.slice());
+                const snapshot = view.slice();
+                writeCount++;
+                if (writeDelayMs > 0) await new Promise((r) => setTimeout(r, writeDelayMs));
+                tcpWrites.push(snapshot);
             }
         }),
         close() { /* no-op：测试不关心关闭 */ }
@@ -146,6 +153,24 @@ const expectedAll = concatBytes([firstPayload, ...frames, lateFrame, bigFrame]);
 check('总账：后端收到的字节 == 首包载荷 + 所有帧（不丢不重不乱序）',
     sameBytes(concatBytes(tcpWrites), expectedAll),
     `got=${concatBytes(tcpWrites).byteLength}B expect=${expectedAll.byteLength}B`);
+
+// ── 断言 6：两笔在途写（定时器路径 + 主循环路径）交错完成时互不污染
+// 背景：flushBatch 把整块缓冲「交出 + 写完成后回收」。若某一笔写还没完成就发生了第二次 flush，
+// 第二次必须拿**另一块**缓冲，否则第一笔会读到被覆盖的数据。这里让每次写延迟 60ms，
+// 并在两次 flush 之间继续灌帧，制造"两笔同时在途"的窗口。
+writeDelayMs = 60;
+const beforeOverlap = tcpWrites.length;
+const overlapA = new Uint8Array(3000).fill(0xA1);
+const overlapB = new Uint8Array(3000).fill(0xB2);
+sendFrame(serverWs, overlapA);
+await sleep(20);            // 让 2ms 定时器先把 A 刷出去（在途）
+sendFrame(serverWs, overlapB);
+await sleep(200);           // 两笔都完成
+const overlapWrites = tcpWrites.slice(beforeOverlap);
+check('在途写交错：两批字节各自完整、互不覆盖',
+    sameBytes(concatBytes(overlapWrites), concatBytes([overlapA, overlapB])),
+    `writes=${overlapWrites.length} sizes=[${overlapWrites.map((w) => w.byteLength).join(',')}]`);
+writeDelayMs = 0;
 
 restore();
 out(failures() === 0 ? '\nws-uplink-batch: OK' : `\nws-uplink-batch: ${failures()} 项失败`);

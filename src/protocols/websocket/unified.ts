@@ -104,10 +104,14 @@ export { getXPaddingIdentifier } from '@utils';
  * 每 isolate 的活动 WS 连接上限。
  *
  * 为什么按「连接数」而不是「请求数」限量：一条 WS 连接是长连接，可以承载几个 GB，
- * 用请求数计量对它没有意义。真正的约束是 isolate 的内存 —— 每条连接固定占
- * 下载 BYOB 缓冲 64KiB + 下载合批缓冲 24~40KiB + 上行合批缓冲 32KiB ≈ 130KiB，
- * 256 条满载 ≈ 33MiB，相对 128MiB 上限留出约 1/4 的余量给伪装缓存、面板资源与 GC 峰值。
- * （512 条时 ≈ 66MiB，属于「贴着上限走」，因此下调回 256。）
+ * 用请求数计量对它没有意义。真正的约束是 isolate 的内存 —— 每条连接的**稳态**缓冲是：
+ *   下行 BYOB 池 1~3 × 64KiB（按需分配；只做小块的连接只用 1 块，4K 这类大块流会用满 3 槽 = 192KiB）
+ * + 下行合批缓冲 1~2 × 24~40KiB（首次 flush 才分配第二块）
+ * + 上行合批缓冲 1~2 × 32KiB
+ * 典型 ≈ 136KiB，最坏 ≈ 336KiB（三条都吃满）；256 条即 34MiB ~ 86MiB。
+ * 上行积压另有 isolate 级预算（WS_UPLINK_ISOLATE_CAP = 32MiB，按连接数折算），
+ * 因此"每连接有界、整体无界"这个漏洞已经堵住；剩下的是缓冲本身，需要时把下面这个上限调低
+ * （例如伪装缓存也吃满 12MB 时，建议 128）。
  *
  * 这个值是**可调上界**而非安全值：如果你的部署确实需要更多并发，
  * 可以继续调高，但请同步观察 Memory 指标（Workers 的 exceededMemory 不会提前告警）。
@@ -119,6 +123,19 @@ export { getXPaddingIdentifier } from '@utils';
  * 那条路径已经覆盖全部退出方式，不需要再挂 close 监听。
  */
 const WS_MAX_CONNECTIONS = 256;
+/**
+ * isolate 级上行积压总预算（按活动连接数折算成每连接上限）。
+ * env `WS_UPLINK_ISOLATE_MB` 可覆盖（单位 MB）：运维可据此在"内存紧"和"允许更慢的后端"之间取舍，
+ * 测试也用它把阈值压到可触发的小值。非法值回退默认，绝不放行成无上限。
+ */
+const WS_UPLINK_ISOLATE_CAP = 32 * 1024 * 1024;
+const WS_UPLINK_PER_CONN_FLOOR = 256 * 1024;
+
+function uplinkIsolateCap(): number {
+    const raw = Number((globalThis as any).env?.WS_UPLINK_ISOLATE_MB);
+    if (!Number.isFinite(raw) || raw <= 0) return WS_UPLINK_ISOLATE_CAP;
+    return Math.max(WS_UPLINK_PER_CONN_FLOOR, Math.floor(raw * 1024 * 1024));
+}
 let activeWsConnections = 0;
 
 export async function UnifiedWSHandler(request: Request): Promise<Response> {
@@ -157,9 +174,44 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
     };
 
     const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
-    const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
+    // 上行积压上限按 isolate 预算折算：N 条连接各 8MiB 会让"每连接有界、整体无界"
+    const perConnUplinkCap = Math.max(
+        WS_UPLINK_PER_CONN_FLOOR,
+        Math.floor(uplinkIsolateCap() / Math.max(1, activeWsConnections))
+    );
+    const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log, perConnUplinkCap);
 
-    let remoteSocketWrapper: { value: Socket | null } = { value: null };
+    // 后端 socket 的纳管容器：**赋值即注册关闭钩子**。
+    //
+    // 为什么不用「在 teardown 里读 remoteSocketWrapper.value 再关」：common.ts 里有 9 处
+    // `remoteSocket.value = ...`，而直连竞速那条路径是**先写完首包、返回后才赋值**的 ——
+    // 一旦在此之前发生 teardown，钩子读到 null 就漏关了。用 setter 挂上去，
+    // 任何赋值路径都自动获得"连接结束时关掉自己"的保证，且不依赖赋值时机。
+    //
+    // 主路径仍然是 controller.error() → 上行泵 read() 抛错 → failUplink 里关 socket；
+    // 这里兜的是「泵正卡在 await write() 上、failUplink 永远跑不到」那种情况
+    //（积压只可能在写不出去时累积，所以那时 socket 一定已经赋值过）。
+    let remoteSocketValue: Socket | null = null;
+    /**
+     * 后端 socket 的纳管容器。
+     *
+     *  - `value`：当前**代表本连接**的 socket（回退阶梯会换掉它）。赋值时自动登记关闭钩子。
+     *  - `track(socket)`：只登记、不认领。给竞速拨号用 —— 竞速会并发建多条候选 socket，
+     *    它们都需要在 teardown 时被关掉（否则写卡住时泄漏），但**只有胜者**才是 `value`。
+     *    早期版本让候选直接赋值 `value`，语义上把"当前 socket"指向了可能落败的候选，
+     *    是一处会随代码演进变成真 bug 的隐患。
+     */
+    const trackBackendSocket = (socket: Socket | null): void => {
+        if (socket) registerWsCleanup(webSocket, () => safeCloseTcpSocket(socket));
+    };
+    const remoteSocketWrapper: { value: Socket | null; track: (socket: Socket | null) => void } = {
+        get value() { return remoteSocketValue; },
+        set value(socket: Socket | null) {
+            remoteSocketValue = socket;
+            trackBackendSocket(socket);
+        },
+        track: trackBackendSocket
+    };
     let remoteWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
     let remoteWriterSocket: Socket | null = null; // remoteWriter 绑定的 socket，回退换 socket 后据此重建
     let paddingStripped = false; // 每连接一次：0xED7F 隐私填充只在首包上判定/剥离一次，判定完成即转直通
@@ -477,7 +529,9 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
     const uplinkReader = readableWebSocketStream.getReader();
     const uplinkWriter = writableStream.getWriter();
 
-    let batchBuffer: Uint8Array | null = null;
+    let batchBuffer: Uint8Array<ArrayBuffer> | null = null;
+    // 写完成后回收的缓冲：flush 交出整块，下一批优先复用它（避免每批一次分配）
+    let spareBuffer: Uint8Array<ArrayBuffer> | null = null;
     let batchOffset = 0;
     let batchTimer: ReturnType<typeof setTimeout> | null = null;
     let activeFlush: Promise<void> | null = null;
@@ -498,18 +552,29 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
         safeCloseTcpSocket(remoteSocketWrapper.value);
     };
 
-    // 刷批前先拷贝：batchBuffer 立即复用，不会被在途写读到半截数据。
+    /**
+     * 刷批：把当前缓冲**整块交出**给后端写，后续帧改用另一块。
+     *
+     * 旧实现是 `subarray(0, length).slice()` —— 每 32KiB 多一次 memcpy 加一次新分配，
+     * 只为「缓冲可以立即复用」。现在改成「交出 + 写完成后回收」：在途写持有的是
+     * 上一轮那块缓冲，本轮之后新分配的/回收的那块不会被它读到半截数据，
+     * 因此拷贝可以完全省掉（安全前提与 batcher 一致：交出后不再写入同一块）。
+     */
     const flushBatch = (): Promise<void> => {
         clearBatchTimer();
         if (!batchOffset || !batchBuffer) return activeFlush ?? Promise.resolve();
         const length = batchOffset;
+        const used = batchBuffer;
         batchOffset = 0;
-        const chunk = batchBuffer.subarray(0, length).slice();
-        const pending = writeRemote(chunk);
+        batchBuffer = null;
+        const pending = writeRemote(used.subarray(0, length));
         activeFlush = pending;
-        // 成功即清空；失败保留 activeFlush，让主循环拿到同一个 rejection 走 failUplink 统一收口。
+        // 成功即清空并回收这块缓冲；失败保留 activeFlush，让主循环拿到同一个 rejection 走 failUplink 统一收口。
         pending.then(
-            () => { if (activeFlush === pending) activeFlush = null; },
+            () => {
+                if (activeFlush === pending) activeFlush = null;
+                if (!spareBuffer) spareBuffer = used;
+            },
             () => { /* 保留 activeFlush，异常由定时器或主循环收口 */ }
         );
         return pending;
@@ -533,8 +598,14 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
             return;
         }
         if (batchOffset + chunk.byteLength > UPLINK_BATCH_SIZE) await flushBatch();
-        // 缓冲按需分配：只走阶段 1 的连接（DNS / 本地测速 / 握手失败）不占这 32KiB。
-        const buffer = batchBuffer ?? (batchBuffer = new Uint8Array(UPLINK_BATCH_SIZE));
+        // 缓冲按需分配：优先复用上一次写完成后回收的那块；只走阶段 1 的连接
+        //（DNS / 本地测速 / 握手失败）不占这 32KiB。
+        let buffer = batchBuffer;
+        if (!buffer) {
+            buffer = spareBuffer ?? new Uint8Array(UPLINK_BATCH_SIZE);
+            spareBuffer = null;
+            batchBuffer = buffer;
+        }
         buffer.set(chunk, batchOffset);
         batchOffset += chunk.byteLength;
         if (batchOffset >= UPLINK_BATCH_SIZE) await flushBatch();
