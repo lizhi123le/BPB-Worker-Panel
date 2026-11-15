@@ -124,7 +124,7 @@ export { getXPaddingIdentifier } from '@utils';
  * 反过来，正常自用场景几条到几十条足够，128 已经是相当宽松的余量。
  *
  * 超限时直接 429，不 accept 服务端 socket、不分配任何缓冲 —— 成本几乎为零。
- * 批量开 WS 是常见探测手法，上限把它的内存占用钉死（对齐 XHTTP 的 XHTTP_MAX_CONNECTIONS 思路）。
+ * 批量开 WS 是常见探测手法，上限把它的内存占用钉死（对齐 XHTTP 的 XP_MAX_CONNECTIONS 思路）。
  * 名额在 close / error / 流 cancel 三条路径上释放：复用 registerWsCleanup 的清理钩子，
  * 那条路径已经覆盖全部退出方式，不需要再挂 close 监听。
  *

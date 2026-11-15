@@ -44,7 +44,7 @@ const XHTTP_HEADER_LIMIT = 8 * 1024;
 const XHTTP_HEADER_TIMEOUT_MS = 30_000;
 /**
  * 空闲超时默认值（秒）：两个方向都无数据即主动断开（对齐参考实现 30s）。
- * env `XHTTP_IDLE_TIMEOUT_S` 可覆盖，**显式 0 = 关闭空闲断流**（长暂停/长缓冲的播放器需要）。
+ * env `XP_IDLE_TIMEOUT_S` 可覆盖，**显式 0 = 关闭空闲断流**（长暂停/长缓冲的播放器需要）。
  */
 const XHTTP_IDLE_TIMEOUT_S_DEFAULT = 30;
 /** 看门狗轮询间隔上限：短超时按 timeout/2 自适应，避免"设 2s 却 5s 才检测" */
@@ -52,14 +52,14 @@ const XHTTP_IDLE_CHECK_INTERVAL_MS = 5_000;
 /**
  * 下行排队上限默认值（MB）：send() 是同步的，没法把背压反传给 remoteSocketToWS；
  * 超过这个积压量就收口，宁可断一个慢客户端也不让 isolate 内存被拖爆。
- * env `XHTTP_MAX_QUEUED_MB` 可覆盖，**显式 0 = 关闭该保护**。
+ * env `XP_MAX_QUEUED_MB` 可覆盖，**显式 0 = 关闭该保护**。
  */
 const XHTTP_MAX_QUEUED_MB_DEFAULT = 8;
 /**
  * 积压容忍窗口默认值（秒）：**先限速、后断流**。
  * 下行已经过 WS 侧同一个令牌桶（WS_DOWNLINK_BPS）限速，所以"客户端比上限慢"时队列仍会涨。
  * 旧行为是一越过上限立刻 terminate（短时抖动也断）；现在要求**持续超限**超过这个窗口才断，
- * 短暂尖峰（seek、切集、GC 抖动）能被吸收。env `XHTTP_QUEUE_GRACE_S` 覆盖，0 = 立即断（旧行为）。
+ * 短暂尖峰（seek、切集、GC 抖动）能被吸收。env `XP_QUEUE_GRACE_S` 覆盖，0 = 立即断（旧行为）。
  */
 const XHTTP_QUEUE_GRACE_S_DEFAULT = 15;
 /** 下行流的排队策略上限：desiredSize 按字节计，send() 用它判断积压 */
@@ -130,17 +130,23 @@ function badRequest(): Response {
     return new Response('Bad Request', { status: 400 });
 }
 
-/** 每请求解析一次的生效阈值（env 可调；非法值回退默认，显式 0 按各自语义处理） */
+/**
+ * 每请求解析一次的生效阈值（env 可调；非法值回退默认，显式 0 按各自语义处理）。
+ *
+ * 注意 env **前缀是 `XP_`** 而不是 `XHTTP_`：环境变量名会原样出现在面板/部署文档上，
+ * 不该把传输名写进部署面。内部常量仍叫 `XHTTP_*_DEFAULT`（代码标识符会被混淆器改名，
+ * 不需要跟着改）。**不要"顺手改回" XHTTP_ 前缀 —— 对外约定的名字一旦发布就不能再变。**
+ */
 function xhttpLimits(): {
     maxConnections: number;
     idleTimeoutMs: number;
     maxQueuedBytes: number;
     graceMs: number;
 } {
-    const { value: maxConnections } = envConnectionLimit('XHTTP_MAX_CONNECTIONS', XHTTP_MAX_CONNECTIONS_DEFAULT);
-    const idleTimeoutSec = envNumber('XHTTP_IDLE_TIMEOUT_S', XHTTP_IDLE_TIMEOUT_S_DEFAULT, true);
-    const queuedMb = envNumber('XHTTP_MAX_QUEUED_MB', XHTTP_MAX_QUEUED_MB_DEFAULT, true);
-    const graceSec = envNumber('XHTTP_QUEUE_GRACE_S', XHTTP_QUEUE_GRACE_S_DEFAULT, true);
+    const { value: maxConnections } = envConnectionLimit('XP_MAX_CONNECTIONS', XHTTP_MAX_CONNECTIONS_DEFAULT);
+    const idleTimeoutSec = envNumber('XP_IDLE_TIMEOUT_S', XHTTP_IDLE_TIMEOUT_S_DEFAULT, true);
+    const queuedMb = envNumber('XP_MAX_QUEUED_MB', XHTTP_MAX_QUEUED_MB_DEFAULT, true);
+    const graceSec = envNumber('XP_QUEUE_GRACE_S', XHTTP_QUEUE_GRACE_S_DEFAULT, true);
     return {
         maxConnections,
         idleTimeoutMs: idleTimeoutSec > 0 ? Math.floor(idleTimeoutSec * 1000) : 0,
@@ -430,7 +436,7 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
     return new Response(readable, { headers: XHTTP_RESPONSE_HEADERS });
 
     /** 空闲看门狗：两个方向（上行 chunk / 下行 send）都算活动，静默超时才断开。
-     *  `XHTTP_IDLE_TIMEOUT_S=0` 时完全不装看门狗（长暂停/长缓冲的播放器需要）。 */
+     *  `XP_IDLE_TIMEOUT_S=0` 时完全不装看门狗（长暂停/长缓冲的播放器需要）。 */
     function startWatchdog(): void {
         lastActivityAt = Date.now();
         if (limits.idleTimeoutMs <= 0) return;

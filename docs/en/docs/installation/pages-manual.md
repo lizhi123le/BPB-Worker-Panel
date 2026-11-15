@@ -140,10 +140,10 @@ These environment variables control the reverse-proxy used to disguise the panel
 | `WS_DOWNLINK_BPS` | `20000000` | Downlink rate cap in **bytes per second** (20 MB/s ≈ 160 Mbps) — the only downlink flow control that exists, since the Workers `WebSocket` has no `bufferedAmount` and `send()` returns `void`. 3×+ headroom over 4K; raise it for >160 Mbps links, or set `0` to disable. |
 | `WS_SESSION_MAX_MB` | `900` | Per-connection downlink byte budget; reaching it closes the connection cleanly so the client reconnects, instead of the platform killing the isolate. Set `0` to disable. |
 | `WS_DOWNLINK_STATS` | `0` | Set to `1` to emit the per-second `downlink …` throughput line without setting the whole panel to Log Level = debug. |
-| `XHTTP_MAX_CONNECTIONS` | `32` | Concurrent XHTTP tunnels per isolate (clamped 1–1024). |
-| `XHTTP_IDLE_TIMEOUT_S` | `30` | Close an XHTTP tunnel after this many seconds with no traffic in either direction; `0` disables (needed for long pauses/buffering on 4K). |
-| `XHTTP_MAX_QUEUED_MB` | `8` | Downlink queue limit per XHTTP tunnel; `0` disables. |
-| `XHTTP_QUEUE_GRACE_S` | `15` | Grace before closing a tunnel whose queue stays above the limit (rate-limiting already applies); `0` = close immediately. |
+| `XP_MAX_CONNECTIONS` | `32` | Concurrent XHTTP tunnels per isolate (clamped 1–1024). |
+| `XP_IDLE_TIMEOUT_S` | `30` | Close an XHTTP tunnel after this many seconds with no traffic in either direction; `0` disables (needed for long pauses/buffering on 4K). |
+| `XP_MAX_QUEUED_MB` | `8` | Downlink queue limit per XHTTP tunnel; `0` disables. |
+| `XP_QUEUE_GRACE_S` | `15` | Grace before closing a tunnel whose queue stays above the limit (rate-limiting already applies); `0` = close immediately. |
 
 ## Updating the Panel
 

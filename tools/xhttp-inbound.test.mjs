@@ -22,7 +22,7 @@
  *   5. 首包拆成两个 chunk：跨 chunk 累积后仍被识别；
  *   6. POST /login/authenticate：开关打开也不被 XHTTP 吞掉（面板路由不变）；
  *   7. cmd=2/port=53（UDP DNS）：被识别并拨号；
- *   8. env 旋钮：XHTTP_MAX_CONNECTIONS / XHTTP_IDLE_TIMEOUT_S 的生效值与日志口径。
+ *   8. env 旋钮：XP_MAX_CONNECTIONS / XP_IDLE_TIMEOUT_S 的生效值与日志口径。
  *
  * 前提：先构建过（npm run build，或快速版 NODE_ENV=mangle node scripts/build.js），
  * 本测试直接加载 .build/worker.reference.js（混淆前产物，行为等价且可读）。
@@ -233,7 +233,7 @@ check('UDP/53 首包：被识别（发生拨号）', r.connectCalls > 0,
 check('UDP/53 首包：DNS socket 建连失败按 500 收口（已进入 UDP 分支）', r.status === 500,
     `status=${r.status} text=${String(r.text).slice(0, 80)}`);
 
-// ── 8) env 旋钮：XHTTP_MAX_CONNECTIONS / XHTTP_IDLE_TIMEOUT_S
+// ── 8) env 旋钮：XP_MAX_CONNECTIONS / XP_IDLE_TIMEOUT_S
 // 需要一个「占着名额但不结束」的连接。注意：handleXhttp 会 **await 拨号完成**才返回 Response，
 // 所以「connect 永不 settle」会把请求本身挂住（第一版就这么写，结果 top-level await 永不回来、
 // 后续断言全没跑、退出码却是 0）。正确做法：拨号**成功**，但下行流永不产出/永不关闭 ——
@@ -246,7 +246,7 @@ globalThis.connect = () => ({
     close() {}
 });
 logs.length = 0;
-const knobEnv = envFor(true, { XHTTP_MAX_CONNECTIONS: '1', XHTTP_IDLE_TIMEOUT_S: '1' });
+const knobEnv = envFor(true, { XP_MAX_CONNECTIONS: '1', XP_IDLE_TIMEOUT_S: '1' });
 // 关键：request body 必须**永不结束**。给一次性 body 时上行泵读完即 done → finally 里 terminate()，
 // 名额会被立刻释放（第二版就是这么错的：第二条请求拿到了 200 而不是 429）。
 const heldBody = new ReadableStream({
@@ -268,13 +268,13 @@ const second = await handler.fetch(
     knobEnv,
     ctx
 );
-check('env：XHTTP_MAX_CONNECTIONS=1 时第二条连接被拒（429）', second.status === 429, `status=${second.status}`);
+check('env：XP_MAX_CONNECTIONS=1 时第二条连接被拒（429）', second.status === 429, `status=${second.status}`);
 check('env：拒绝日志里是生效值 1（不是默认 32）',
     logs.some((l) => l.includes('已达并发上限 1 条')), `logs=${logs.slice(-3).join(' | ')}`);
 
 // 空闲看门狗：1s 静默后应主动收口（轮询间隔按 timeout/2 自适应，最多 ~1.2s 内检测到）
 await new Promise((resolve) => setTimeout(resolve, 1600));
-check('env：XHTTP_IDLE_TIMEOUT_S=1 生效（静默 1s 后主动收口）',
+check('env：XP_IDLE_TIMEOUT_S=1 生效（静默 1s 后主动收口）',
     logs.some((l) => l.includes('idle for 1000ms')), `logs=${logs.slice(-3).join(' | ')}`);
 
 // 恢复抛错桩，保持与文件开头一致的桩语义
