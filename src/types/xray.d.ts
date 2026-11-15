@@ -182,7 +182,7 @@ export interface GrpcSettings {
  * 与 WsSettings 不同，这里没有 early-data 概念：ed 只对 ws 传输生效，
  * 因此字段集合刻意保持最小，避免生成「看起来能用、实际被内核忽略」的参数。
  */
-export interface XhttpSettings {
+export interface XpSettings {
     host?: string;
     path?: string;
     mode?: string;
@@ -195,7 +195,7 @@ export type Transport =
     | WsSettings
     | HttpupgradeSettings
     | GrpcSettings
-    | XhttpSettings;
+    | XpSettings;
 
 export interface HappyEyeballs {
     tryDelayMs: number;
@@ -243,7 +243,7 @@ export interface StreamSettings {
     wsSettings?: WsSettings;
     httpupgradeSettings?: HttpupgradeSettings;
     grpcSettings?: GrpcSettings;
-    xhttpSettings?: XhttpSettings;
+    xhttpSettings?: XpSettings;
     sockopt?: Sockopt;
     finalmask?: {
         tcp?: TCPMask[];

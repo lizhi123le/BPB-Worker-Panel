@@ -1,10 +1,10 @@
 /**
- * tools/xhttp-inbound.test.mjs
+ * tools/xp-inbound.test.mjs
  *
- * XHTTP 入站（HTTP POST / stream-one）的行为测试。运行：node tools/xhttp-inbound.test.mjs
+ * XHTTP 入站（HTTP POST / stream-one）的行为测试。运行：node tools/xp-inbound.test.mjs
  *
  * 为什么需要它：XHTTP 入站是「把 WS 的双向连接换成一次 HTTP POST」，它复用 WS 的出站/下行管道，
- * 但入口判定是全新的：POST 方法 + settings.xhttpConfigs 开关 + 路径白名单，三者同时成立才接管。
+ * 但入口判定是全新的：POST 方法 + settings.xpConfigs 开关 + 路径白名单，三者同时成立才接管。
  * 这条判定最容易出的两类事故在 smoke 里都看不见：
  *   · 吞掉既有 POST 路由（/login/authenticate、/panel/...）——面板直接不可用；
  *   · 首包处理细节丢失（UUID 校验、0xED7F 填充剥离、跨 chunk 累积、UDP DNS 分支）——客户端连不上。
@@ -15,8 +15,8 @@
  *   · globalThis.fetch 返回一段固定 HTML —— 关闭开关时 POST / 会落到伪装反代，据此区分「伪装页」与「被接管」。
  *
  * 覆盖：
- *   1. xhttpConfigs=false：同样的 POST 不进入 XHTTP（伪装页 + 未拨号）；
- *   2. xhttpConfigs=true + 合法 VLESS 首包：接管并拨号，响应不是伪装页；
+ *   1. xpConfigs=false：同样的 POST 不进入 XHTTP（伪装页 + 未拨号）；
+ *   2. xpConfigs=true + 合法 VLESS 首包：接管并拨号，响应不是伪装页；
  *   3. 非法 UUID：400 且未拨号；
  *   4. 0xED7F 隐私填充首包：剥离后仍被识别；
  *   5. 首包拆成两个 chunk：跨 chunk 累积后仍被识别；
@@ -33,7 +33,7 @@ import { pathToFileURL } from 'node:url';
 const BUNDLE = '.build/worker.reference.js';
 const UUID = '11111111-2222-4333-8444-555555555555';
 const TR_PASS = 'trojan-secret';
-const SUB_PATH = 'xhttp-inbound-sub';
+const SUB_PATH = 'xp-inbound-sub';
 const ORIGIN = 'https://panel.example.com';
 
 let failures = 0;
@@ -99,7 +99,7 @@ for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
 const handler = (await import(pathToFileURL(BUNDLE).href)).default;
 const ctx = { waitUntil() {}, passThroughOnException() {} };
 
-/** seed 一次：让 worker 把完整出厂设置写进 KV，后续每个用例只覆盖 xhttpConfigs。 */
+/** seed 一次：让 worker 把完整出厂设置写进 KV，后续每个用例只覆盖 xpConfigs。 */
 const seedKv = makeKv();
 const seedEnv = { UUID, TR_PASS, SUB_PATH, DOH_URL: 'https://cloudflare-dns.com/dns-query', FALLBACK: 'www.hcaptcha.com', kv: seedKv };
 await handler.fetch(
@@ -108,7 +108,7 @@ await handler.fetch(
     ctx
 );
 const baseSettings = JSON.parse(seedKv.store.get('proxySettings'));
-check('出厂默认 xhttpConfigs=false（入站开关的默认态）', baseSettings.xhttpConfigs === false, `xhttpConfigs=${baseSettings.xhttpConfigs}`);
+check('出厂默认 xpConfigs=false（入站开关的默认态）', baseSettings.xpConfigs === false, `xpConfigs=${baseSettings.xpConfigs}`);
 
 function makeEnv(settings) {
     return {
@@ -122,26 +122,26 @@ function makeEnv(settings) {
 }
 
 /**
- * 统一的 env 构造（runXhttp 与 env 旋钮用例共用）。
+ * 统一的 env 构造（runXp 与 env 旋钮用例共用）。
  * worker 的 kv-cache 是 isolate 级 5 分钟 TTL（globalThis.__kvCache）：本测试在同一进程里
  * 反复换 KV 内容，不清理就会一直命中第一次 seed 时的缓存，后续用例永远读不到
- * xhttpConfigs=true，全部静默落回伪装页。删掉它等价于「换一个新 isolate」——
+ * xpConfigs=true，全部静默落回伪装页。删掉它等价于「换一个新 isolate」——
  * 也正是 random-path.test.mjs 用「父进程 spawn 子进程」绕开的那个缓存。
  */
-function envFor(xhttpConfigs, extra = {}) {
+function envFor(xpConfigs, extra = {}) {
     delete globalThis.__kvCache;
-    return { ...makeEnv({ ...baseSettings, xhttpConfigs }), ...extra };
+    return { ...makeEnv({ ...baseSettings, xpConfigs }), ...extra };
 }
 
 /**
  * 发一次 POST 并收集观测值。
  * body 可以是 Uint8Array（单块）或 Uint8Array[]（多 chunk 的 ReadableStream）。
  */
-async function runXhttp({ packet, chunks = null, path = '/', xhttpConfigs, method = 'POST' }) {
+async function runXp({ packet, chunks = null, path = '/', xpConfigs, method = 'POST' }) {
     connectCalls = 0;
     logs.length = 0;
 
-    const env = envFor(xhttpConfigs);
+    const env = envFor(xpConfigs);
     const init = { method, headers: { Host: 'panel.example.com' } };
     if (chunks) {
         init.body = new ReadableStream({
@@ -181,30 +181,30 @@ async function runXhttp({ packet, chunks = null, path = '/', xhttpConfigs, metho
     };
 }
 
-// ── 1) xhttpConfigs=false：同样的 POST 不进入 XHTTP 处理，落到伪装反代
-let r = await runXhttp({ packet: vlessPacket(), xhttpConfigs: false });
-check('xhttpConfigs=false：POST / 落到伪装页（未被 XHTTP 接管）',
+// ── 1) xpConfigs=false：同样的 POST 不进入 XHTTP 处理，落到伪装反代
+let r = await runXp({ packet: vlessPacket(), xpConfigs: false });
+check('xpConfigs=false：POST / 落到伪装页（未被 XHTTP 接管）',
     r.status === 200 && /text\/html/.test(r.contentType) && r.text.includes('stub camouflage page'),
     `status=${r.status} ct=${r.contentType} text=${String(r.text).slice(0, 80)} readError=${r.readError}`);
-check('xhttpConfigs=false：未发生任何拨号', r.connectCalls === 0, `connectCalls=${r.connectCalls}`);
-check('xhttpConfigs=false：响应不是 XHTTP 的 400 Bad Request',
+check('xpConfigs=false：未发生任何拨号', r.connectCalls === 0, `connectCalls=${r.connectCalls}`);
+check('xpConfigs=false：响应不是 XHTTP 的 400 Bad Request',
     !(r.status === 400 && r.text.includes('Bad Request')),
     `status=${r.status} text=${String(r.text).slice(0, 80)}`);
 
-// ── 2) xhttpConfigs=true + 合法 VLESS 首包：接管并拨号，响应不是伪装页
-r = await runXhttp({ packet: vlessPacket(), xhttpConfigs: true });
-check('xhttpConfigs=true：合法 VLESS 首包被识别（发生拨号）', r.connectCalls > 0,
+// ── 2) xpConfigs=true + 合法 VLESS 首包：接管并拨号，响应不是伪装页
+r = await runXp({ packet: vlessPacket(), xpConfigs: true });
+check('xpConfigs=true：合法 VLESS 首包被识别（发生拨号）', r.connectCalls > 0,
     `connectCalls=${r.connectCalls} status=${r.status} logs=${r.logs.join(' | ')}`);
-check('xhttpConfigs=true：处理被接管，出站全失败按网关错误收口（502 Bad Gateway）',
+check('xpConfigs=true：处理被接管，出站全失败按网关错误收口（502 Bad Gateway）',
     r.status === 502, `status=${r.status} ct=${r.contentType} text=${String(r.text).slice(0, 80)} readError=${r.readError}`);
 
 // ── 3) 非法 UUID：400 且未拨号
-r = await runXhttp({ packet: vlessPacket({ uuid: '99999999-2222-4333-8444-555555555555' }), xhttpConfigs: true });
+r = await runXp({ packet: vlessPacket({ uuid: '99999999-2222-4333-8444-555555555555' }), xpConfigs: true });
 check('非法 UUID：400 Bad Request', r.status === 400, `status=${r.status} text=${String(r.text).slice(0, 80)}`);
 check('非法 UUID：未发生拨号', r.connectCalls === 0, `connectCalls=${r.connectCalls}`);
 
 // ── 4) 0xED7F 隐私填充首包：剥离后仍被识别
-r = await runXhttp({ packet: withPrivacyPadding(vlessPacket()), xhttpConfigs: true });
+r = await runXp({ packet: withPrivacyPadding(vlessPacket()), xpConfigs: true });
 check('0xED7F 填充首包：剥离后仍被识别（发生拨号）', r.connectCalls > 0,
     `connectCalls=${r.connectCalls} status=${r.status} logs=${r.logs.join(' | ')}`);
 check('0xED7F 填充首包：按已识别处理（502，而非 400）', r.status === 502,
@@ -212,14 +212,14 @@ check('0xED7F 填充首包：按已识别处理（502，而非 400）', r.status
 
 // ── 5) 首包被拆成两个 chunk：跨 chunk 累积后仍被识别
 const splitPacket = vlessPacket();
-r = await runXhttp({ chunks: [splitPacket.slice(0, 10), splitPacket.slice(10)], xhttpConfigs: true });
+r = await runXp({ chunks: [splitPacket.slice(0, 10), splitPacket.slice(10)], xpConfigs: true });
 check('首包拆成两个 chunk：跨 chunk 累积后仍被识别（发生拨号）', r.connectCalls > 0,
     `connectCalls=${r.connectCalls} status=${r.status} logs=${r.logs.join(' | ')}`);
 check('首包拆成两个 chunk：按已识别处理（502，而非 400）', r.status === 502,
     `status=${r.status} text=${String(r.text).slice(0, 80)}`);
 
 // ── 6) 既有 POST 路由不被吞：/login/authenticate 即使在开关打开时也走登录处理器
-r = await runXhttp({ packet: vlessPacket(), path: '/login/authenticate', xhttpConfigs: true });
+r = await runXp({ packet: vlessPacket(), path: '/login/authenticate', xpConfigs: true });
 check('POST /login/authenticate：未被 XHTTP 吞掉（未发生拨号）', r.connectCalls === 0,
     `connectCalls=${r.connectCalls} status=${r.status}`);
 check('POST /login/authenticate：仍走登录路由（401 Wrong password，而非 XHTTP 的 400）',
@@ -227,14 +227,14 @@ check('POST /login/authenticate：仍走登录路由（401 Wrong password，而�
     `status=${r.status} text=${String(r.text).slice(0, 120)}`);
 
 // ── 7) cmd=2 / port=53（UDP DNS）：被识别并拨号（DNS 走 8.8.4.4:53 的 TCP socket）
-r = await runXhttp({ packet: vlessPacket({ cmd: 2, port: 53, addr: [8, 8, 4, 4] }), xhttpConfigs: true });
+r = await runXp({ packet: vlessPacket({ cmd: 2, port: 53, addr: [8, 8, 4, 4] }), xpConfigs: true });
 check('UDP/53 首包：被识别（发生拨号）', r.connectCalls > 0,
     `connectCalls=${r.connectCalls} status=${r.status} logs=${r.logs.join(' | ')}`);
 check('UDP/53 首包：DNS socket 建连失败按 500 收口（已进入 UDP 分支）', r.status === 500,
     `status=${r.status} text=${String(r.text).slice(0, 80)}`);
 
 // ── 8) env 旋钮：XP_MAX_CONNECTIONS / XP_IDLE_TIMEOUT_S
-// 需要一个「占着名额但不结束」的连接。注意：handleXhttp 会 **await 拨号完成**才返回 Response，
+// 需要一个「占着名额但不结束」的连接。注意：handleXp 会 **await 拨号完成**才返回 Response，
 // 所以「connect 永不 settle」会把请求本身挂住（第一版就这么写，结果 top-level await 永不回来、
 // 后续断言全没跑、退出码却是 0）。正确做法：拨号**成功**，但下行流永不产出/永不关闭 ——
 // 连接因此一直 active，名额被占住，空闲看门狗也会在 1s 后自己收口。
@@ -286,5 +286,5 @@ globalThis.connect = () => {
 for (const level of ['log', 'info', 'warn', 'error', 'debug']) console[level] = originalConsole[level];
 
 out('');
-out(failures === 0 ? 'xhttp-inbound: OK' : `xhttp-inbound: ${failures} 项失败`);
+out(failures === 0 ? 'xp-inbound: OK' : `xp-inbound: ${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);

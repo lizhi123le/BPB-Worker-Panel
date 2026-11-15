@@ -49,7 +49,7 @@ export const DEFAULT_SETTINGS: Settings = {
     VLConfigs: true,
     TRConfigs: true,
     // XHTTP 默认关闭：需要客户端（Xray 系）支持 type=xhttp，且与 WS 节点是并列关系，不属于默认必开项
-    xhttpConfigs: false,
+    xpConfigs: false,
     ports: [443],
     fingerprint: "chrome",
     alpn: "",

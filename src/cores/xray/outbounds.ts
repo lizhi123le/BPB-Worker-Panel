@@ -11,7 +11,7 @@ import {
 
 // XHTTP 的路径 / xPadding 约定与 raw URI（@common/handlers）共用同一份实现，
 // 避免两种订阅输出对同一节点给出不同的 mode / extra。
-import { XHTTP_MODE, buildXhttpExtra } from '@cores/xhttp';
+import { XP_MODE, buildXpExtra } from '@cores/xp';
 
 import {
     Outbound,
@@ -25,7 +25,7 @@ import {
     WsSettings,
     HttpupgradeSettings,
     GrpcSettings,
-    XhttpSettings,
+    XpSettings,
     HttpSocksSettings,
     ShadowsocksSettings,
     VmessSettings,
@@ -203,9 +203,9 @@ export function buildWebsocketOutbound(
  * - 没有 early-data：`ed` 是 WebSocket 协议头的语义，XHTTP 下无意义，故不抽 usedEds；
  * - 没有 finalmask：TLS 分片只作用于「客户端到目标的 TLS 握手」，XHTTP 走的是 HTTP 层，
  *   两者叠加没有意义，分片订阅也不会生成 XHTTP 节点；
- * - 路径与填充参数来自 @cores/xhttp，与 raw URI 共用同一份约定。
+ * - 路径与填充参数来自 @cores/xp，与 raw URI 共用同一份约定。
  */
-export function buildXhttpOutbound(
+export function buildXpOutbound(
     tag: string,
     address: string,
     port: number,
@@ -226,10 +226,10 @@ export function buildXhttpOutbound(
         xhttpSettings: {
             host,
             path,
-            mode: XHTTP_MODE,
+            mode: XP_MODE,
             // 与 raw URI 的 extra 参数同源，保证两类客户端的填充头名 / 键名逐字一致
-            extra: buildXhttpExtra(userID)
-        } satisfies XhttpSettings,
+            extra: buildXpExtra(userID)
+        } satisfies XpSettings,
         security: isTLS ? "tls" : "none",
         tlsSettings,
         sockopt: buildSockopt(true, enableTFO, "UseIP")

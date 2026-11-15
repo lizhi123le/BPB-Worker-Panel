@@ -7,13 +7,13 @@ import {
     buildChainOutbound,
     buildCleanProxyOutbound,
     buildWebsocketOutbound,
-    buildXhttpOutbound,
+    buildXpOutbound,
     buildWarpOutbound,
     buildFreedomOutbound
 } from './outbounds';
 
 // XHTTP 节点路径与 raw URI 侧共用同一份实现（随机路径规则只允许有一个来源）
-import { buildXhttpNodePath } from '@cores/xhttp';
+import { buildXpNodePath } from '@cores/xp';
 
 import {
     buildEntryPortMap,
@@ -283,7 +283,7 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
         outProxy,
         ports,
         randomPath,
-        xhttpConfigs,
+        xpConfigs,
         upstreamParams: { upstreamServer, upstreamPort }
     } = globalThis.settings;
     const { _VL_ } = globalThis.dict;
@@ -369,7 +369,7 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     //   与 XHTTP 这一 HTTP 层传输无关，分片订阅里出现 XHTTP 节点没有意义；
     // - sing-box / mihomo 本轮不生成：sing-box 原生不支持 xhttp，mihomo 支持但版本门槛高，
     //   贸然下发只会给用户一份「导入后不可用」的配置。
-    if (xhttpConfigs === true && !isFragment) {
+    if (xpConfigs === true && !isFragment) {
         for (const item of items) {
             // 代理条目有自己的协议与出站，不派生 XHTTP 变体
             if (item.kind !== 'address') continue;
@@ -381,12 +381,12 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
                 // 与 WS 节点同一条上游代理排除规则，避免上游条目派生出重复的独立节点
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
 
-                const outbound = buildXhttpOutbound(
+                const outbound = buildXpOutbound(
                     "proxy",
                     host,
                     port,
                     // 与 WS 节点共用 usedPaths：同一次生成内两种传输的路径互不相同
-                    buildXhttpNodePath(randomPath, usedPaths)
+                    buildXpNodePath(randomPath, usedPaths)
                 );
                 // 备注加传输后缀：基准名优先复用同地址 VLESS 节点的备注（与 raw URI 侧
                 // `${wsRemark} XHTTP` 一致）；仅当 VLESS 被关掉、该键没有记录时才现取一次。

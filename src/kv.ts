@@ -68,12 +68,18 @@ export async function getDataset(
             (proxySettings as any).randomPath = DEFAULT_SETTINGS.randomPath;
         }
 
-        // 向后兼容：旧 KV 里没有「XHTTP 传输」开关（本次新增）时同样按出厂默认（false）补齐。
-        // 不补的后果不是「默认关闭」那么简单：面板 initiatePanel 用 `VL + TR + xhttp` 求和得到
-        // activeProtocols，undefined 会把结果变成 NaN —— 「至少选一个协议」的拦截随即可被绕过
-        // （`NaN === 0` 恒 false）。与 randomPath 一样只在内存里补，不写 KV。
-        if (proxySettings && typeof (proxySettings as any).xhttpConfigs !== 'boolean') {
-            (proxySettings as any).xhttpConfigs = DEFAULT_SETTINGS.xhttpConfigs;
+        // 向后兼容：该开关改过名（旧键 `xhttpConfigs` → 新键 `xpConfigs`，传输名不进部署面）。
+        // **必须读旧键**：已开启该传输的存量部署里 KV 存的还是旧名，不迁移就表现为
+        // 「升级后面板开关变灰、节点消失」，而且不报任何错。策略是只读旧名、只写新名 ——
+        // 下次用户在面板保存设置时自然落成新名，不需要额外迁移脚本。
+        // （全仓唯一保留 `xhttpConfigs` 字面量的地方，删掉它就等于丢掉老用户的配置。）
+        // 另外：没有该字段时必须补出厂默认，否则面板 initiatePanel 用 `VL + TR + xp` 求和会得到
+        // NaN，「至少选一个协议」的拦截随即可被绕过（`NaN === 0` 恒 false）。
+        if (proxySettings && typeof (proxySettings as any).xpConfigs !== 'boolean') {
+            const legacyXpConfigs = (proxySettings as any).xhttpConfigs;
+            (proxySettings as any).xpConfigs = typeof legacyXpConfigs === 'boolean'
+                ? legacyXpConfigs
+                : DEFAULT_SETTINGS.xpConfigs;
         }
 
         if (!warpAccounts) {
@@ -239,7 +245,7 @@ export async function updateDataset(request: Request, env: Env): Promise<Setting
             ["bestVLTRInterval"],
             ["VLConfigs"],
             ["TRConfigs"],
-            ["xhttpConfigs"],
+            ["xpConfigs"],
             ["ports"],
             ["fingerprint"],
             ["alpn"],

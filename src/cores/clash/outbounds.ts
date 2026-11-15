@@ -1,7 +1,7 @@
 import { isTlsPort, parseHostPort, pickEarlyData, pickRandomEch, selectSniHost, isBareIPv4, isBareIPv6, getXPaddingIdentifier, type CleanProxyEntry } from '@utils';
 
 // XHTTP 的路径 / 填充约定与 raw URI、Xray JSON 共用同一份实现（单一来源，避免三端漂移）
-import { XHTTP_MODE } from '@cores/xhttp';
+import { XP_MODE } from '@cores/xp';
 
 import {
     BaseOutbound,
@@ -14,7 +14,7 @@ import {
     WsOpts,
     GrpcOpts,
     HttpOpts,
-    XhttpOpts,
+    XpOpts,
     VmessOutbound,
     TLS,
     Transport,
@@ -142,11 +142,11 @@ export function buildWebsocketOutbound(
  * - 没有 early-data：`ed` 是 WebSocket 协议头的语义，XHTTP 下无意义，故不抽 usedEds；
  * - transport 用 `network: xhttp` + `xhttp-opts`（mihomo 自 v1.19.22 起支持）：
  *   更老版本的 mihomo 不认识该 network，会整份配置解析失败 —— 面板无法探测内核版本，
- *   因此本节点只在用户显式打开 `xhttpConfigs` 时才会出现；
- * - 填充参数与 raw URI / Xray JSON 同源（@utils#getXPaddingIdentifier + @cores/xhttp），
+ *   因此本节点只在用户显式打开 `xpConfigs` 时才会出现；
+ * - 填充参数与 raw URI / Xray JSON 同源（@utils#getXPaddingIdentifier + @cores/xp），
  *   三端填出的头名与键名逐字一致。
  */
-export function buildXhttpOutbound(
+export function buildXpOutbound(
     remark: string,
     address: string,
     port: number,
@@ -166,13 +166,13 @@ export function buildXhttpOutbound(
         "xhttp-opts": {
             "path": path,
             "host": host,
-            "mode": XHTTP_MODE,
+            "mode": XP_MODE,
             "x-padding-obfs-mode": true,
             "x-padding-method": "tokenish",
             "x-padding-placement": "queryInHeader",
             "x-padding-header": header,
             "x-padding-key": key
-        } satisfies XhttpOpts
+        } satisfies XpOpts
     }, {
         "uuid": userID,
         "packet-encoding": ""

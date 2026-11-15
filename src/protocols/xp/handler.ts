@@ -37,42 +37,42 @@ import {
  */
 
 /** 并发上限默认值：与参考实现一致。超出直接 429，避免单个 isolate 被大量长连接抽干 */
-const XHTTP_MAX_CONNECTIONS_DEFAULT = 32;
+const XP_MAX_CONNECTIONS_DEFAULT = 32;
 /** 首包（VLESS 头）安全上限：合法头最长约 1+16+1+255+1+2+1+255 ≈ 532 字节，8KB 只用来兜畸形/恶意包 */
-const XHTTP_HEADER_LIMIT = 8 * 1024;
+const XP_HEADER_LIMIT = 8 * 1024;
 /** 首包到达超时：客户端只建连接不发头时，不能让配额被无限占用（DoSing 本 isolate 的并发槽位，默认 32） */
-const XHTTP_HEADER_TIMEOUT_MS = 30_000;
+const XP_HEADER_TIMEOUT_MS = 30_000;
 /**
  * 空闲超时默认值（秒）：两个方向都无数据即主动断开（对齐参考实现 30s）。
  * env `XP_IDLE_TIMEOUT_S` 可覆盖，**显式 0 = 关闭空闲断流**（长暂停/长缓冲的播放器需要）。
  */
-const XHTTP_IDLE_TIMEOUT_S_DEFAULT = 30;
+const XP_IDLE_TIMEOUT_S_DEFAULT = 30;
 /** 看门狗轮询间隔上限：短超时按 timeout/2 自适应，避免"设 2s 却 5s 才检测" */
-const XHTTP_IDLE_CHECK_INTERVAL_MS = 5_000;
+const XP_IDLE_CHECK_INTERVAL_MS = 5_000;
 /**
  * 下行排队上限默认值（MB）：send() 是同步的，没法把背压反传给 remoteSocketToWS；
  * 超过这个积压量就收口，宁可断一个慢客户端也不让 isolate 内存被拖爆。
  * env `XP_MAX_QUEUED_MB` 可覆盖，**显式 0 = 关闭该保护**。
  */
-const XHTTP_MAX_QUEUED_MB_DEFAULT = 8;
+const XP_MAX_QUEUED_MB_DEFAULT = 8;
 /**
  * 积压容忍窗口默认值（秒）：**先限速、后断流**。
  * 下行已经过 WS 侧同一个令牌桶（WS_DOWNLINK_BPS）限速，所以"客户端比上限慢"时队列仍会涨。
  * 旧行为是一越过上限立刻 terminate（短时抖动也断）；现在要求**持续超限**超过这个窗口才断，
  * 短暂尖峰（seek、切集、GC 抖动）能被吸收。env `XP_QUEUE_GRACE_S` 覆盖，0 = 立即断（旧行为）。
  */
-const XHTTP_QUEUE_GRACE_S_DEFAULT = 15;
+const XP_QUEUE_GRACE_S_DEFAULT = 15;
 /** 下行流的排队策略上限：desiredSize 按字节计，send() 用它判断积压 */
-const XHTTP_STREAM_HIGH_WATER = 64 * 1024;
+const XP_STREAM_HIGH_WATER = 64 * 1024;
 
-const XHTTP_RESPONSE_HEADERS = {
+const XP_RESPONSE_HEADERS = {
     'X-Accel-Buffering': 'no',
     'Cache-Control': 'no-store',
     'Content-Type': 'application/octet-stream'
 };
 
 /** 模块级并发计数：与参考实现一样按 isolate 统计（不是全局配额，跨 isolate 无法共享） */
-let activeXhttpConnections = 0;
+let activeXpConnections = 0;
 
 /** VLESS 头解析成功后需要的字段（用于跨 chunk 累积判据，不重复实现一份协议解析） */
 interface ParsedVlessHeader {
@@ -133,20 +133,20 @@ function badRequest(): Response {
 /**
  * 每请求解析一次的生效阈值（env 可调；非法值回退默认，显式 0 按各自语义处理）。
  *
- * 注意 env **前缀是 `XP_`** 而不是 `XHTTP_`：环境变量名会原样出现在面板/部署文档上，
- * 不该把传输名写进部署面。内部常量仍叫 `XHTTP_*_DEFAULT`（代码标识符会被混淆器改名，
- * 不需要跟着改）。**不要"顺手改回" XHTTP_ 前缀 —— 对外约定的名字一旦发布就不能再变。**
+ * 注意 env **前缀是 `XP_`** 而不是 `XP_`：环境变量名会原样出现在面板/部署文档上，
+ * 不该把传输名写进部署面。内部常量仍叫 `XP_*_DEFAULT`（代码标识符会被混淆器改名，
+ * 不需要跟着改）。**不要"顺手改回" XP_ 前缀 —— 对外约定的名字一旦发布就不能再变。**
  */
-function xhttpLimits(): {
+function xpLimits(): {
     maxConnections: number;
     idleTimeoutMs: number;
     maxQueuedBytes: number;
     graceMs: number;
 } {
-    const { value: maxConnections } = envConnectionLimit('XP_MAX_CONNECTIONS', XHTTP_MAX_CONNECTIONS_DEFAULT);
-    const idleTimeoutSec = envNumber('XP_IDLE_TIMEOUT_S', XHTTP_IDLE_TIMEOUT_S_DEFAULT, true);
-    const queuedMb = envNumber('XP_MAX_QUEUED_MB', XHTTP_MAX_QUEUED_MB_DEFAULT, true);
-    const graceSec = envNumber('XP_QUEUE_GRACE_S', XHTTP_QUEUE_GRACE_S_DEFAULT, true);
+    const { value: maxConnections } = envConnectionLimit('XP_MAX_CONNECTIONS', XP_MAX_CONNECTIONS_DEFAULT);
+    const idleTimeoutSec = envNumber('XP_IDLE_TIMEOUT_S', XP_IDLE_TIMEOUT_S_DEFAULT, true);
+    const queuedMb = envNumber('XP_MAX_QUEUED_MB', XP_MAX_QUEUED_MB_DEFAULT, true);
+    const graceSec = envNumber('XP_QUEUE_GRACE_S', XP_QUEUE_GRACE_S_DEFAULT, true);
     return {
         maxConnections,
         idleTimeoutMs: idleTimeoutSec > 0 ? Math.floor(idleTimeoutSec * 1000) : 0,
@@ -162,24 +162,24 @@ function xhttpLimits(): {
  *   init() → initHttp() → 路径白名单 → initWs(env) → setSettings() → prepareWsRuntimeConfig()
  * 已执行，因此 globalThis.globalConfig / settings / wsConfig 都是本次请求的最新值。
  */
-export async function handleXhttp(request: Request, env: Env): Promise<Response> {
-    const limits = xhttpLimits();
-    if (activeXhttpConnections >= limits.maxConnections) {
-        console.log(`[xhttp] 已达并发上限 ${limits.maxConnections} 条，拒绝新连接`);
+export async function handleXp(request: Request, env: Env): Promise<Response> {
+    const limits = xpLimits();
+    if (activeXpConnections >= limits.maxConnections) {
+        console.log(`[xp] 已达并发上限 ${limits.maxConnections} 条，拒绝新连接`);
         return new Response('Too many connections', { status: 429 });
     }
 
-    activeXhttpConnections++;
+    activeXpConnections++;
     // 配额释放必须幂等：成功/失败/客户端断开/空闲超时都可能触发，重复释放会把别人的额度扣掉
     let released = false;
     const release = () => {
         if (released) return;
         released = true;
-        activeXhttpConnections = Math.max(0, activeXhttpConnections - 1);
+        activeXpConnections = Math.max(0, activeXpConnections - 1);
     };
 
     const log = (info: string, event?: string) => {
-        console.log(`[xhttp] ${info}`, event || '');
+        console.log(`[xp] ${info}`, event || '');
     };
 
     let terminated = false;
@@ -275,7 +275,7 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
             // 客户端中途取消（断流/关页面）：下行流 cancel 是唯一能观测到的信号
             terminate();
         }
-    }, new ByteLengthQueuingStrategy({ highWaterMark: XHTTP_STREAM_HIGH_WATER }));
+    }, new ByteLengthQueuingStrategy({ highWaterMark: XP_STREAM_HIGH_WATER }));
 
     const fetcher = (request as any).fetcher;
     const userID = globalThis.globalConfig?.userID || '';
@@ -289,9 +289,9 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
 
     // 首包阶段单独设一次性超时：连接建立后客户端迟迟不发 VLESS 头时，配额不能被空占
     const headerTimer = setTimeout(() => {
-        log(`no VLESS header within ${XHTTP_HEADER_TIMEOUT_MS}ms, aborting`);
+        log(`no VLESS header within ${XP_HEADER_TIMEOUT_MS}ms, aborting`);
         try { void reader.cancel().catch(() => { /* ignore */ }); } catch { /* ignore */ }
-    }, XHTTP_HEADER_TIMEOUT_MS);
+    }, XP_HEADER_TIMEOUT_MS);
 
     let headerBytes = new Uint8Array(0);
     let vlHeader: ParsedVlessHeader | null = null;
@@ -316,8 +316,8 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
             if (!chunk.byteLength) continue;
 
             headerBytes = concatBytes(headerBytes, new Uint8Array(chunk));
-            if (headerBytes.byteLength > XHTTP_HEADER_LIMIT) {
-                log(`VLESS header exceeds ${XHTTP_HEADER_LIMIT} bytes`);
+            if (headerBytes.byteLength > XP_HEADER_LIMIT) {
+                log(`VLESS header exceeds ${XP_HEADER_LIMIT} bytes`);
                 clearTimeout(headerTimer);
                 terminate();
                 return badRequest();
@@ -380,7 +380,7 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
             if (rawClientData.byteLength) await write(rawClientData);
             void pumpUdpUplink(reader, write);
             startWatchdog();
-            return new Response(readable, { headers: XHTTP_RESPONSE_HEADERS });
+            return new Response(readable, { headers: XP_RESPONSE_HEADERS });
         } catch (error) {
             log(`UDP DNS setup failed: ${safeErrorMessage(error)}`);
             terminate();
@@ -399,7 +399,7 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
         const body = buildWsLocal204Response(vlResponseHeader) as Uint8Array<ArrayBuffer>;
         return new Response(body, {
             status: 200,
-            headers: XHTTP_RESPONSE_HEADERS
+            headers: XP_RESPONSE_HEADERS
         });
     }
 
@@ -433,7 +433,7 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
 
     void pumpTcpUplink(reader, remoteSocketRef);
     startWatchdog();
-    return new Response(readable, { headers: XHTTP_RESPONSE_HEADERS });
+    return new Response(readable, { headers: XP_RESPONSE_HEADERS });
 
     /** 空闲看门狗：两个方向（上行 chunk / 下行 send）都算活动，静默超时才断开。
      *  `XP_IDLE_TIMEOUT_S=0` 时完全不装看门狗（长暂停/长缓冲的播放器需要）。 */
@@ -441,7 +441,7 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
         lastActivityAt = Date.now();
         if (limits.idleTimeoutMs <= 0) return;
         // 轮询间隔跟随超时自适应：设 2s 却 5s 才检测是没意义的
-        const interval = Math.max(200, Math.min(XHTTP_IDLE_CHECK_INTERVAL_MS, Math.floor(limits.idleTimeoutMs / 2)));
+        const interval = Math.max(200, Math.min(XP_IDLE_CHECK_INTERVAL_MS, Math.floor(limits.idleTimeoutMs / 2)));
         watchdog = setInterval(() => {
             if (Date.now() - lastActivityAt > limits.idleTimeoutMs) {
                 log(`idle for ${limits.idleTimeoutMs}ms, closing`);

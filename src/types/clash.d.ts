@@ -89,10 +89,10 @@ export interface GrpcOpts {
 /**
  * mihomo 的 XHTTP 选项块（自 v1.19.22 起支持 network: xhttp）。
  * 字段是 Xray SplitHTTP 字段的 kebab-case 版本，语义与本项目 raw URI 的 `extra` 一一对应：
- * x-padding-* 五项必须与 @cores/xhttp 的约定保持同源，否则同一订阅在 mihomo 与 Xray 系客户端上
+ * x-padding-* 五项必须与 @cores/xp 的约定保持同源，否则同一订阅在 mihomo 与 Xray 系客户端上
  * 会填出不同的填充头名 / 键名。
  */
-export interface XhttpOpts {
+export interface XpOpts {
     "path"?: string;
     "host"?: string;
     "mode"?: string;
@@ -148,7 +148,7 @@ export type Transport = {
     "ws-opts"?: WsOpts;
     "http-opts"?: HttpOpts;
     "grpc-opts"?: GrpcOpts;
-    "xhttp-opts"?: XhttpOpts;
+    "xhttp-opts"?: XpOpts;
 }
 
 export interface HttpOutbound extends BaseOutbound {

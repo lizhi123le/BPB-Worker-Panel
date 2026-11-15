@@ -1,7 +1,7 @@
 /**
- * tools/xhttp-node.test.mjs
+ * tools/xp-node.test.mjs
  *
- * XHTTP 节点生成契约的行为测试。运行：node tools/xhttp-node.test.mjs
+ * XHTTP 节点生成契约的行为测试。运行：node tools/xp-node.test.mjs
  *
  * 为什么需要它：XHTTP 是「WS 之外的第二种传输」，它有两份输出、必须逐字对应：
  *   · /sub/raw/<sub>?app=xray    —— VLESS-XHTTP 的分享链接（type=xhttp&mode=stream-one&extra=…）；
@@ -10,7 +10,7 @@
  * 就会填出不同的请求特征，而「看着有节点、实际连不上」的问题在 smoke 里完全发现不了。
  *
  * 另外三件事必须钉住：
- *   · 出厂默认 xhttpConfigs=false —— 关闭时 raw 订阅的节点形态与改动前完全一致（回归钉）；
+ *   · 出厂默认 xpConfigs=false —— 关闭时 raw 订阅的节点形态与改动前完全一致（回归钉）；
  *   · ?app=sing-box 的 raw 订阅不含 xhttp 节点（sing-box 原生没有该传输，混进去只会丢节点）；
  *   · /sub/normal 的 sing-box 订阅按 cfnew-panel 约定沿用 WS 传输接入同一 Worker（tag 带 ` XHTTP` 后缀），
  *     绝不能下发 type:"xhttp"（sing-box 解析失败会让整份配置不可用）；
@@ -28,12 +28,12 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const BUNDLE = '.build/worker.reference.js';
-const SEED_FILE = '.build/xhttp-node.settings.json';
-const OBS_PREFIX = '.build/xhttp-node';
+const SEED_FILE = '.build/xp-node.settings.json';
+const OBS_PREFIX = '.build/xp-node';
 const SELF = fileURLToPath(import.meta.url);
 const UUID = '11111111-2222-4333-8444-555555555555';
 const TR_PASS = 'trojan-secret';
-const SUB_PATH = 'xhttp-node-sub';
+const SUB_PATH = 'xp-node-sub';
 const ORIGIN = 'https://panel.example.com';
 
 /** 冻结的 WARP 账号：形状合法 → 跳过 fetchWarpAccounts（那里会用到真正的随机密钥生成与联网）。 */
@@ -171,7 +171,7 @@ function summarizeClashConfig(config) {
         port: proxy.port ?? null,
         network: proxy.network || '',
         servername: proxy.servername ?? proxy.sni ?? '',
-        xhttpOpts: proxy['xhttp-opts'] ?? null,
+        xpOpts: proxy['xhttp-opts'] ?? null,
         wsOpts: proxy['ws-opts'] ?? null
     }));
     const groups = (config['proxy-groups'] || []).map((group) => ({
@@ -278,24 +278,29 @@ const baseSettings = JSON.parse(seedKv.store.get('proxySettings'));
 baseSettings.cleanIPs = ['104.16.0.1'];
 writeFileSync(SEED_FILE, JSON.stringify(baseSettings));
 
-check('出厂默认 xhttpConfigs=false（新部署写入 KV 的设置里该字段为 false）',
-    baseSettings.xhttpConfigs === false, `xhttpConfigs=${baseSettings.xhttpConfigs}`);
+check('出厂默认 xpConfigs=false（新部署写入 KV 的设置里该字段为 false）',
+    baseSettings.xpConfigs === false, `xpConfigs=${baseSettings.xpConfigs}`);
 check('出厂默认 randomPath=true（对照 XHTTP 路径规则的前提）',
     baseSettings.randomPath === true, `randomPath=${baseSettings.randomPath}`);
 
 const settings = baseSettings;
 const phases = [
-    ['raw-on', { ...settings, xhttpConfigs: true, randomPath: true }],
-    ['raw-off', { ...settings, xhttpConfigs: false, randomPath: true }],
-    ['raw-fixed', { ...settings, xhttpConfigs: true, randomPath: false }],
-    ['raw-singbox', { ...settings, xhttpConfigs: true, randomPath: true }],
-    ['json-on', { ...settings, xhttpConfigs: true, randomPath: true }],
-    ['clash-on', { ...settings, xhttpConfigs: true, randomPath: true }],
-    ['clash-off', { ...settings, xhttpConfigs: false, randomPath: true }],
-    ['sb-on', { ...settings, xhttpConfigs: true, randomPath: true }],
-    ['sb-off', { ...settings, xhttpConfigs: false, randomPath: true }],
-    ['sb-fixed', { ...settings, xhttpConfigs: true, randomPath: false }]
+    ['raw-on', { ...settings, xpConfigs: true, randomPath: true }],
+    ['raw-off', { ...settings, xpConfigs: false, randomPath: true }],
+    ['raw-fixed', { ...settings, xpConfigs: true, randomPath: false }],
+    ['raw-singbox', { ...settings, xpConfigs: true, randomPath: true }],
+    ['json-on', { ...settings, xpConfigs: true, randomPath: true }],
+    ['clash-on', { ...settings, xpConfigs: true, randomPath: true }],
+    ['clash-off', { ...settings, xpConfigs: false, randomPath: true }],
+    ['sb-on', { ...settings, xpConfigs: true, randomPath: true }],
+    ['sb-off', { ...settings, xpConfigs: false, randomPath: true }],
+    ['sb-fixed', { ...settings, xpConfigs: true, randomPath: false }]
 ];
+// 旧 KV 字段名迁移（xhttpConfigs → xpConfigs）：用「只有旧键、没有新键」的设置再采一遍。
+// 存量部署的 KV 存的就是旧键，不迁移会表现为「升级后节点消失」且不报错 —— 必须有回归钉。
+const legacySettings = { ...settings, randomPath: true, xhttpConfigs: true };
+delete legacySettings.xpConfigs;
+phases.push(['raw-legacy', legacySettings]);
 let allOk = true;
 for (const [phase, phaseSettings] of phases) allOk = runPhase(phase, phaseSettings) && allOk;
 
@@ -303,7 +308,7 @@ if (!allOk) {
     check('所有采集 phase 正常退出', false, '子进程失败，后续断言跳过');
 } else {
     const load = (phase) => JSON.parse(readFileSync(`${OBS_PREFIX}.${phase}.json`, 'utf8'));
-    const isXhttp = (node) => node.transport === 'xhttp';
+    const isXp = (node) => node.transport === 'xhttp';
     const wsVlessOf = (nodes) => nodes.filter((node) => node.protocol === 'vless' && node.transport === 'ws');
     const nodeKey = (node) => `${node.host}:${node.port}`;
     const stripEd = (path) => path.replace(/\?ed=\d+$/, '');
@@ -311,20 +316,20 @@ if (!allOk) {
     // ── (a) 关闭开关：raw 输出与 xhttp 无关（回归钉）
     const off = load('raw-off');
     const on = load('raw-on');
-    const onX = on.nodes.filter(isXhttp);
-    const offX = off.nodes.filter(isXhttp);
+    const onX = on.nodes.filter(isXp);
+    const offX = off.nodes.filter(isXp);
 
-    check('关闭 xhttpConfigs：raw 订阅不含任何 type=xhttp 节点', offX.length === 0,
+    check('关闭 xpConfigs：raw 订阅不含任何 type=xhttp 节点', offX.length === 0,
         `xhttp 节点=${offX.length}`);
-    check('关闭 xhttpConfigs：仍生成 WS VLESS 节点（对照组有效）', wsVlessOf(off.nodes).length > 0,
+    check('关闭 xpConfigs：仍生成 WS VLESS 节点（对照组有效）', wsVlessOf(off.nodes).length > 0,
         `nodes=${off.nodes.length}`);
     check('关闭开关的节点总数 = 开启时总数 - XHTTP 节点数（开关只增不减）',
         off.nodes.length === on.nodes.length - onX.length,
         `off=${off.nodes.length} on=${on.nodes.length} xhttp=${onX.length}`);
     check('关闭开关时非 XHTTP 节点备注与开启时逐字一致（XHTTP 不消耗 remark 编号）',
         JSON.stringify(off.nodes.map((n) => n.remark).sort()) ===
-            JSON.stringify(on.nodes.filter((n) => !isXhttp(n)).map((n) => n.remark).sort()),
-        `off=${JSON.stringify(off.nodes.map((n) => n.remark))} on=${JSON.stringify(on.nodes.filter((n) => !isXhttp(n)).map((n) => n.remark))}`);
+            JSON.stringify(on.nodes.filter((n) => !isXp(n)).map((n) => n.remark).sort()),
+        `off=${JSON.stringify(off.nodes.map((n) => n.remark))} on=${JSON.stringify(on.nodes.filter((n) => !isXp(n)).map((n) => n.remark))}`);
 
     // ── (b) 开启开关：raw 订阅的 XHTTP 节点契约
     const onVlWs = wsVlessOf(on.nodes);
@@ -332,7 +337,7 @@ if (!allOk) {
     for (const node of onVlWs) if (!wsByKey.has(nodeKey(node))) wsByKey.set(nodeKey(node), node);
     const pairs = onX.map((node) => ({ node, ws: wsByKey.get(nodeKey(node)) }));
 
-    check('开启 xhttpConfigs：raw 订阅出现 XHTTP 节点', onX.length > 0, `xhttp 节点=${onX.length}`);
+    check('开启 xpConfigs：raw 订阅出现 XHTTP 节点', onX.length > 0, `xhttp 节点=${onX.length}`);
     check('XHTTP 节点全部是 VLESS（worker 只承载 VLESS，不生成 Trojan-XHTTP）',
         onX.length > 0 && onX.every((node) => node.protocol === 'vless'),
         JSON.stringify(onX.map((n) => n.protocol)));
@@ -370,7 +375,7 @@ if (!allOk) {
 
     // ── (b2) randomPath=false：路径收敛到根路径
     const fixed = load('raw-fixed');
-    const fixedX = fixed.nodes.filter(isXhttp);
+    const fixedX = fixed.nodes.filter(isXp);
     const fixedWs = wsVlessOf(fixed.nodes);
     check('randomPath=false 且开启 XHTTP：仍生成 XHTTP 节点', fixedX.length > 0, `xhttp=${fixedX.length}`);
     check('randomPath=false：XHTTP 路径固定为根路径 /（且不带 ed 参数）',
@@ -380,13 +385,21 @@ if (!allOk) {
         fixedWs.length > 0 && fixedWs.every((node) => stripEd(node.path) === '/'),
         JSON.stringify(fixedWs.map((n) => n.path)));
 
-    // ── (c) ?app=sing-box：不混入 xhttp 节点
+    // ── (b2) 旧 KV 字段名迁移：xhttpConfigs → xpConfigs ──
+const legacyX = load('raw-legacy').nodes.filter(isXp);
+check('旧 KV 字段名迁移：只有旧键 xhttpConfigs=true 时仍生成 XP 节点', legacyX.length > 0,
+    `xp=${legacyX.length} nodes=${load('raw-legacy').nodes.length}`);
+check('旧 KV 字段名迁移：节点数与新键开启时逐字一致',
+    legacyX.length === onX.length && legacyX.every((n, i) => n.remark === onX[i].remark),
+    `legacy=${legacyX.length} on=${onX.length}`);
+
+// ── (c) ?app=sing-box：不混入 xhttp 节点
     const sing = load('raw-singbox');
     check('app=sing-box 且开启 XHTTP：raw 订阅仍生成节点（对照组有效）',
         sing.nodes.length > 0, `nodes=${sing.nodes.length}`);
     check('app=sing-box：raw 订阅不含任何 type=xhttp 节点',
-        sing.nodes.every((node) => !isXhttp(node)),
-        JSON.stringify(sing.nodes.filter(isXhttp).map((n) => n.remark)));
+        sing.nodes.every((node) => !isXp(node)),
+        JSON.stringify(sing.nodes.filter(isXp).map((n) => n.remark)));
 
     // ── (d) /sub/normal?app=xray：JSON 里的 xhttp outbound
     const json = load('json-on');
@@ -435,22 +448,22 @@ if (!allOk) {
     const cXhttpNames = new Set(cOnX.map((proxy) => proxy.name));
     const cUrlTestGroups = clashOn.groups.filter((group) => group.type === 'url-test');
 
-    check('Clash：xhttpConfigs=false 时没有任何 network=xhttp 的 proxy', cOffX.length === 0,
+    check('Clash：xpConfigs=false 时没有任何 network=xhttp 的 proxy', cOffX.length === 0,
         JSON.stringify(cOffX.map((p) => p.name)));
-    check('Clash：xhttpConfigs=true 时出现 network=xhttp 的 proxy', cOnX.length > 0,
+    check('Clash：xpConfigs=true 时出现 network=xhttp 的 proxy', cOnX.length > 0,
         `xhttp=${cOnX.length}`);
     check('Clash：XHTTP proxy 是 VLESS 且 xhttp-opts 带 path/host/mode=stream-one',
-        cOnX.length > 0 && cOnX.every((p) => p.type === 'vless' && p.xhttpOpts &&
-            p.xhttpOpts.path && p.xhttpOpts.host && p.xhttpOpts.mode === 'stream-one'),
-        JSON.stringify(cOnX.map((p) => ({ type: p.type, opts: p.xhttpOpts }))));
+        cOnX.length > 0 && cOnX.every((p) => p.type === 'vless' && p.xpOpts &&
+            p.xpOpts.path && p.xpOpts.host && p.xpOpts.mode === 'stream-one'),
+        JSON.stringify(cOnX.map((p) => ({ type: p.type, opts: p.xpOpts }))));
     check('Clash：xhttp-opts 的 x-padding-* 与 UUID 派生一致（与 raw/xray 同源）',
-        cOnX.length > 0 && cOnX.every((p) => p.xhttpOpts &&
-            p.xhttpOpts['x-padding-obfs-mode'] === EXPECTED_XPADDING.xPaddingObfsMode &&
-            p.xhttpOpts['x-padding-method'] === EXPECTED_XPADDING.xPaddingMethod &&
-            p.xhttpOpts['x-padding-placement'] === EXPECTED_XPADDING.xPaddingPlacement &&
-            p.xhttpOpts['x-padding-header'] === EXPECTED_XPADDING.xPaddingHeader &&
-            p.xhttpOpts['x-padding-key'] === EXPECTED_XPADDING.xPaddingKey),
-        JSON.stringify(cOnX.map((p) => p.xhttpOpts)));
+        cOnX.length > 0 && cOnX.every((p) => p.xpOpts &&
+            p.xpOpts['x-padding-obfs-mode'] === EXPECTED_XPADDING.xPaddingObfsMode &&
+            p.xpOpts['x-padding-method'] === EXPECTED_XPADDING.xPaddingMethod &&
+            p.xpOpts['x-padding-placement'] === EXPECTED_XPADDING.xPaddingPlacement &&
+            p.xpOpts['x-padding-header'] === EXPECTED_XPADDING.xPaddingHeader &&
+            p.xpOpts['x-padding-key'] === EXPECTED_XPADDING.xPaddingKey),
+        JSON.stringify(cOnX.map((p) => p.xpOpts)));
     check('Clash：XHTTP 备注 =「同地址 WS VLESS 备注 + XHTTP」',
         cPairs.length > 0 && cPairs.every(({ proxy, ws }) => ws && proxy.name === `${ws.name} XHTTP`),
         JSON.stringify(cPairs.map(({ proxy, ws }) => ({ x: proxy.name, ws: ws ? `${ws.name} XHTTP` : null }))));
@@ -472,10 +485,10 @@ if (!allOk) {
     const sbOn = load('sb-on').singbox;
     const sbOff = load('sb-off').singbox;
     const sbFixed = load('sb-fixed').singbox;
-    const isSbXhttp = (node) => node.tag.endsWith(' XHTTP');
-    const sbWsVless = (cfg) => cfg.outbounds.filter((o) => o.type === 'vless' && o.transportType === 'ws' && !isSbXhttp(o));
-    const sbOnX = sbOn.outbounds.filter(isSbXhttp);
-    const sbOffX = sbOff.outbounds.filter(isSbXhttp);
+    const isSbXp = (node) => node.tag.endsWith(' XHTTP');
+    const sbWsVless = (cfg) => cfg.outbounds.filter((o) => o.type === 'vless' && o.transportType === 'ws' && !isSbXp(o));
+    const sbOnX = sbOn.outbounds.filter(isSbXp);
+    const sbOffX = sbOff.outbounds.filter(isSbXp);
     const sbWsByKey = new Map();
     for (const node of sbWsVless(sbOn)) sbWsByKey.set(`${node.server}:${node.serverPort}`, node);
     const sbPairs = sbOnX.map((node) => ({ node, ws: sbWsByKey.get(`${node.server}:${node.serverPort}`) }));
@@ -483,14 +496,14 @@ if (!allOk) {
     const sbUrlTests = sbOn.outbounds.filter((node) => node.type === 'urltest');
     const sbSelector = sbOn.outbounds.find((node) => node.type === 'selector' && node.tag === '✅ Selector');
 
-    check('sing-box：xhttpConfigs=false 时没有任何 tag 以「 XHTTP」结尾的出站', sbOffX.length === 0,
+    check('sing-box：xpConfigs=false 时没有任何 tag 以「 XHTTP」结尾的出站', sbOffX.length === 0,
         JSON.stringify(sbOffX.map((n) => n.tag)));
     check('sing-box：关闭开关时 WS VLESS 出站数与 tag 集合与开启后逐字一致（回归钉）',
         sbWsVless(sbOff).length > 0 && sbWsVless(sbOff).length === sbWsVless(sbOn).length &&
             JSON.stringify(sbWsVless(sbOff).map((n) => n.tag).sort()) ===
                 JSON.stringify(sbWsVless(sbOn).map((n) => n.tag).sort()),
         `off=${JSON.stringify(sbWsVless(sbOff).map((n) => n.tag))} on=${JSON.stringify(sbWsVless(sbOn).map((n) => n.tag))}`);
-    check('sing-box：xhttpConfigs=true 时出现「<WS VLESS tag> XHTTP」的 VLESS 出站',
+    check('sing-box：xpConfigs=true 时出现「<WS VLESS tag> XHTTP」的 VLESS 出站',
         sbOnX.length > 0 && sbOnX.every((node) => node.type === 'vless'),
         JSON.stringify(sbOnX.map((n) => ({ tag: n.tag, type: n.type }))));
     check('sing-box：XHTTP 沿用 WS 传输（transport.type=ws）且 path 符合随机路径规则',
@@ -521,11 +534,11 @@ if (!allOk) {
         sbUrlTests.length > 0 && sbUrlTests.every((group) => !group.memberTags.some((tag) => sbXhttpTags.has(tag))),
         JSON.stringify(sbUrlTests.map((g) => ({ tag: g.tag, hit: g.memberTags.filter((t) => sbXhttpTags.has(t)) }))));
     check('sing-box：randomPath=false 时 XHTTP 的 transport.path 固定为 /',
-        sbFixed.outbounds.filter(isSbXhttp).length > 0 &&
-            sbFixed.outbounds.filter(isSbXhttp).every((node) => node.transportPath === '/'),
-        JSON.stringify(sbFixed.outbounds.filter(isSbXhttp).map((n) => n.transportPath)));
+        sbFixed.outbounds.filter(isSbXp).length > 0 &&
+            sbFixed.outbounds.filter(isSbXp).every((node) => node.transportPath === '/'),
+        JSON.stringify(sbFixed.outbounds.filter(isSbXp).map((n) => n.transportPath)));
 }
 
 out('');
-out(failures === 0 ? 'xhttp-node: OK' : `xhttp-node: ${failures} 项失败`);
+out(failures === 0 ? 'xp-node: OK' : `xp-node: ${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);

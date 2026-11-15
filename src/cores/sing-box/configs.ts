@@ -5,7 +5,7 @@ import { buildChainOutbound, buildCleanProxyOutbound, buildUrlTest, buildWarpOut
 import { Outbound, WireguardEndpoint, Config } from '#types/sing-box';
 import { buildEntryPortMap, getConfigItems, cleanProxyEntries, generateRemark, generateWsPath, isHttps, getProtocols, pickEarlyData, resetRemarkCounter, prependUpstreamItem, portsForHost, appendCleanProxyNodes } from '@utils';
 // XHTTP 节点路径与 raw URI / Xray / Clash 侧共用同一份实现（随机路径规则只允许有一个来源）
-import { buildXhttpNodePath } from '@cores/xhttp';
+import { buildXpNodePath } from '@cores/xp';
 import { buildMixedInbound, tun } from './inbounds';
 import { buildAclSingbox, ACL_BUILTIN_GROUP_TAGS, loadAclTemplateWithFallback } from '../acl-template';
 import { configJsonResponse } from '@common';
@@ -98,7 +98,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
         outProxy,
         ports,
         randomPath,
-        xhttpConfigs,
+        xpConfigs,
         upstreamParams: { upstreamServer, upstreamPort }
     } = globalThis.settings;
     const { _VL_ } = globalThis.dict;
@@ -124,7 +124,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
     const chainTags: string[] = [];
     const outbounds: Outbound[] = [];
     // XHTTP 节点单独记账：进 ✅ Selector 与 ACL 模板分组，但**不进** proxyTags（不参与 urltest）
-    const xhttpTags: string[] = [];
+    const xpTags: string[] = [];
     // 每个 (地址, 端口) 的 VLESS 备注：XHTTP 节点复用同一个基准名，不额外消耗 generateRemark 的编号
     const vlRemarks = new Map<string, string>();
     const remarkKey = (host: string, port: number) => `${host}\u0000${port}`;
@@ -193,7 +193,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
     // - 不进 urlTestTags（proxyTags），即不参与「最佳延迟」urltest：两种传输混进同一个延迟采样组
     //   会改变既有 WS 节点组的切换行为；但会进 ✅ Selector 与 ACL 模板分组，否则 ACL 接管后不可选；
     // - 分片订阅（isFragment=true）不生成。
-    if (xhttpConfigs === true && !isFragment) {
+    if (xpConfigs === true && !isFragment) {
         for (const item of items) {
             if (item.kind !== 'address') continue;
 
@@ -212,11 +212,11 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                     tag,
                     host,
                     port,
-                    buildXhttpNodePath(randomPath, usedPaths),
+                    buildXpNodePath(randomPath, usedPaths),
                     false,
                     pickEarlyData(usedEds)
                 ));
-                xhttpTags.push(tag);
+                xpTags.push(tag);
                 selectorTags.push(tag);
             }
         }
@@ -245,7 +245,7 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                 aclUrl,
                 // XHTTP 节点同样交给模板分组：它们不在 proxyTags 里（不参与内置 urltest），
                 // 但必须出现在模板生成的节点分组中，否则 ACL 接管后这些节点在 UI 上不可选。
-                [...proxyTags, ...xhttpTags],
+                [...proxyTags, ...xpTags],
                 buildAclSingbox,
                 result => result.outboundGroups.length === 0 && result.rules.length === 0
             );

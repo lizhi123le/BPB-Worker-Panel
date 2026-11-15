@@ -16,10 +16,10 @@ import { guardNonBuiltinPath } from './common/firstCheck';
 import { isBuiltinRouteWord, isPathInDictionary, PUBLIC_PATH_POOL } from './common/ratelimit';
 import { camouflageProxy, cf1101RateLimitedResponse } from './common/camouflage';
 import { prepareWsRuntimeConfig } from './common/ws-runtime';
-import { handleXhttp } from '@protocols/xhttp/handler';
+import { handleXp } from '@protocols/xp/handler';
 
 /** 伪装路径池（字典剔除内置路由词后的结果）转成 Set：XHTTP 判定在热路径上，逐段 includes 太慢 */
-const XHTTP_CAMOUFLAGE_PATH_POOL: ReadonlySet<string> = new Set(PUBLIC_PATH_POOL);
+const XP_CAMOUFLAGE_PATH_POOL: ReadonlySet<string> = new Set(PUBLIC_PATH_POOL);
 
 /**
  * XHTTP 入站的路径白名单。
@@ -37,7 +37,7 @@ const XHTTP_CAMOUFLAGE_PATH_POOL: ReadonlySet<string> = new Set(PUBLIC_PATH_POOL
  *     用池而不是 PUBLIC_PATH_DICTIONARY，语义上就是「只接受订阅可能生成的路径」。
  * 另外把连续斜杠归一后再判，避免 `//panel` 之类的变体绕过首段比较。
  */
-function isXhttpPathAllowed(pathSegments: string[], adminPath: string, userID: string): boolean {
+function isXpPathAllowed(pathSegments: string[], adminPath: string, userID: string): boolean {
 	const segments = pathSegments.flatMap(segment => segment.split('/')).filter(Boolean);
 
 	// 根路径没有首段，必须放在内置词判定之前（空段数组交给它会把 `/` 判错）
@@ -47,7 +47,7 @@ function isXhttpPathAllowed(pathSegments: string[], adminPath: string, userID: s
 	if (isBuiltinRouteWord(first)) return false;
 	if (adminPath && first === adminPath) return true;
 	if (userID && first === userID.slice(0, 8).toLowerCase()) return true;
-	return segments.every(segment => XHTTP_CAMOUFLAGE_PATH_POOL.has(segment));
+	return segments.every(segment => XP_CAMOUFLAGE_PATH_POOL.has(segment));
 }
 
 export default {
@@ -108,22 +108,22 @@ export default {
 				// /panel、/login、/sub 等既有 POST 路由与伪装逻辑完全不受影响。
 				//
 				// 判定顺序（与任务书给的顺序有一处必要的调整）：先做零成本的白名单，
-				// 再 initWs + setSettings 读 KV，最后才看 xhttpConfigs 开关。
-				// 原因是冷 isolate 的 globalThis.settings 还是出厂默认（xhttpConfigs=false），
+				// 再 initWs + setSettings 读 KV，最后才看 xpConfigs 开关。
+				// 原因是冷 isolate 的 globalThis.settings 还是出厂默认（xpConfigs=false），
 				// 若先读开关，isolate 的第一个 XHTTP 请求必然落回伪装页，表现为「XHTTP 时好时坏」。
 				if (request.method === 'POST') {
-					const xhttpSegments = pathName.split('/').filter(Boolean);
-					const xhttpAdminPath = String((env as any).SUB_PATH || globalThis.globalConfig.userID || '')
+					const xpSegments = pathName.split('/').filter(Boolean);
+					const xpAdminPath = String((env as any).SUB_PATH || globalThis.globalConfig.userID || '')
 						.toLowerCase()
 						.replace(/^\//, '');
-					if (isXhttpPathAllowed(xhttpSegments, xhttpAdminPath, globalThis.globalConfig.userID || '')) {
+					if (isXpPathAllowed(xpSegments, xpAdminPath, globalThis.globalConfig.userID || '')) {
 						initWs(env);
 						await setSettings(request, env);
-						if (globalThis.settings?.xhttpConfigs === true) {
+						if (globalThis.settings?.xpConfigs === true) {
 							// 出站策略与 WS 共用同一份推导（反代池 / 官方池 / 地区 / 出站模式），
 							// 两条入站必须看到同一份 wsConfig，否则出口行为会不一致。
 							await prepareWsRuntimeConfig(request, env);
-							return await handleXhttp(request, env);
+							return await handleXp(request, env);
 						}
 					}
 				}

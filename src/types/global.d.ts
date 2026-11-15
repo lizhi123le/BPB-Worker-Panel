@@ -121,7 +121,7 @@ declare global {
         TRConfigs: boolean;
         // XHTTP 传输（HTTP POST / stream-one）：开启后订阅额外生成 VLESS-XHTTP 节点，
         // Worker 侧同时接受 XHTTP 入站（POST + 路径白名单）。默认关闭 —— 客户端需支持 type=xhttp。
-        xhttpConfigs: boolean;
+        xpConfigs: boolean;
         ports: number[];
         fingerprint: Fingerprint;
         alpn: string;

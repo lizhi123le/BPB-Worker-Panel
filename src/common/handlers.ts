@@ -7,7 +7,7 @@ import { getSbCustomConfig, getSbWarpConfig } from "@sing-box/configs";
 import { getXrCustomConfigs, getXrWarpConfigs } from "@xray/configs";
 import { fetchWarpAccounts } from "@warp";
 import { UnifiedWSHandler } from "@unified";
-import { XHTTP_MODE, buildXhttpExtra, buildXhttpNodePath } from "@cores/xhttp";
+import { XP_MODE, buildXpExtra, buildXpNodePath } from "@cores/xp";
 import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, htmlResponse, HttpStatus, isKvBound, respond, safeErrorMessage } from "@common";
 import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, generateRemark, generateWsPath, getConfigItems, isTlsPort, parseHostPort, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectSniHost } from "@utils";
 import JSZip from "jszip";
@@ -676,7 +676,7 @@ export async function getURLConfigs() {
             alpn,
             VLConfigs,
             TRConfigs,
-            xhttpConfigs,
+            xpConfigs,
             enableECH,
             echServerName,
             hostSniList,
@@ -705,15 +705,15 @@ export async function getURLConfigs() {
         const isTLS = isTlsPort(port, addr, entryPortMap);
         const security = isTLS ? 'tls' : 'none';
         const config = new URL(`${protocol}://config`);
-        const isXhttp = transport === 'xhttp';
+        const isXp = transport === 'xhttp';
 
         if (protocol === _VL_) {
             config.username = userID;
             config.searchParams.append('encryption', 'none');
             // 对齐 cfnew 52143dccb：xPadding 抗指纹 —— 订阅链接带 extra 约定。
-            // 对象内容由 @cores/xhttp 统一维护：raw URI 与 xray JSON 的 extra 必须逐字一致，
+            // 对象内容由 @cores/xp 统一维护：raw URI 与 xray JSON 的 extra 必须逐字一致，
             // 否则同一份订阅里两种客户端的填充头名/键名会漂移。
-            config.searchParams.append('extra', JSON.stringify(buildXhttpExtra(userID)));
+            config.searchParams.append('extra', JSON.stringify(buildXpExtra(userID)));
         } else {
             config.username = TrPass;
         }
@@ -727,11 +727,11 @@ export async function getURLConfigs() {
         // 在节点备注上显式告警；不改动生成语义（是否使用由用户决定）。
         config.hash = isTLS ? remark : `${remark} ⚠️明文(无TLS)`;
 
-        if (isXhttp) {
+        if (isXp) {
             // XHTTP 没有 WS 的 early-data 语义：ed 只对 ws 传输有效，写进 xhttp 节点是无意义参数，
             // 因此这里不抽 ed（也就不占用 usedEds 池，WS 节点的 ed 分配与镜像行为保持不变）。
-            config.searchParams.append('path', buildXhttpNodePath(globalThis.settings.randomPath, usedPaths));
-            config.searchParams.append('mode', XHTTP_MODE);
+            config.searchParams.append('path', buildXpNodePath(globalThis.settings.randomPath, usedPaths));
+            config.searchParams.append('mode', XP_MODE);
         } else {
             // 对齐 cfnew：ed 从共享的 usedEds 池无放回抽取（2048..2560 闭区间，513 个取值），
             // 保证同一份订阅内任意两个节点的 ed 两两不同（独立随机会有明显重复率），同时仍消除固定长度指纹。
@@ -803,10 +803,10 @@ export async function getURLConfigs() {
             //     把 type=xhttp 塞进 ?app=sing-box 的 raw 订阅只会让它在导入时丢节点。
             //     注意这是「raw 链接」的取舍 —— sing-box 的 normal 订阅里 XHTTP 节点照样存在，
             //     只是以等价的 ws 传输下发（sing-box/configs.ts 的映射，对齐 cfnew-panel 的做法）。
-            if (xhttpConfigs && isXrayFamilyClient) {
+            if (xpConfigs && isXrayFamilyClient) {
                 const base = remarkBase ?? generateRemark(port, addr, _VL_, false, false);
-                const xhttpConfig = buildConfig(atob('dmxlc3M='), addr, port, host, sni, `${base} XHTTP`, allowInsecure, 'xhttp');
-                nodeConfs += `${xhttpConfig}\n`;
+                const xpConfig = buildConfig(atob('dmxlc3M='), addr, port, host, sni, `${base} XHTTP`, allowInsecure, 'xhttp');
+                nodeConfs += `${xpConfig}\n`;
             }
         }
     }

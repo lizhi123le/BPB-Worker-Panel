@@ -7,7 +7,7 @@ import { generateWsPath, getXPaddingIdentifier } from '@utils';
  * 支持度最广、语义最简单的一档。`packet-up` / `stream-up` 需要额外的流映射与多请求拼装，
  * worker 侧的 XHTTP 入站也没有实现这些分支，写进订阅会得到连不上的节点，因此不做可配置。
  */
-export const XHTTP_MODE = 'stream-one';
+export const XP_MODE = 'stream-one';
 
 /**
  * 订阅侧 XHTTP 节点的路径。
@@ -26,7 +26,7 @@ export const XHTTP_MODE = 'stream-one';
  * @param randomPath 面板「节点随机路径」开关（settings.randomPath）的当前值
  * @param usedPaths  同一次生成中的已占用路径集合，与 WS 节点共享；开启随机路径时才写入
  */
-export function buildXhttpNodePath(randomPath: boolean, usedPaths?: Set<string>): string {
+export function buildXpNodePath(randomPath: boolean, usedPaths?: Set<string>): string {
     // 关闭随机路径：统一根路径，且不占用 usedPaths（与 generateWsPath 关闭态语义一致，
     // 否则会把 '/' 也标记为已占用，虽然无实际影响但语义上不该参与去重）。
     if (!randomPath) return '/';
@@ -46,7 +46,7 @@ export function buildXhttpNodePath(randomPath: boolean, usedPaths?: Set<string>)
  * 头名 / 键名不写死、按 UUID 派生：固定字符串是最容易被指纹化的常量，
  * 而派生规则两端共享，既做到每个部署不同，又不引入额外配置项。
  */
-export function buildXhttpExtra(userID: string): {
+export function buildXpExtra(userID: string): {
     xPaddingObfsMode: true;
     xPaddingMethod: 'tokenish';
     xPaddingPlacement: 'queryInHeader';
