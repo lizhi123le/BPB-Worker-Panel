@@ -153,8 +153,57 @@ export async function fetchWithTimeout(
     return await withTimeout(fetch(url, init), ms, 'fetch');
 }
 
-/** Build optional HSTS header object based on the HSTS_ENABLE flag (cfnew semantics). */
-export function hstsHeaders(env: Record<string, string | undefined> | undefined): Record<string, string> {
+/**
+ * 跨请求安全单飞（同键去重）。**不共享 Promise** —— 这是平台约束，不是风格问题。
+ *
+ * workerd 的 `handle_cross_request_promise_resolution` 规定：请求 A 里创建的 Promise 只能由
+ * A 自己 settle；A 结束后它「永远无法达成」，B 去 await 会拿到
+ * “This promise was created by a request that has since ended, so it can never settle.”
+ * 而 `Map<key, Promise>` 这种经典单飞表恰好是这么写的 —— 本项目三处都踩过
+ * （伪装图片取图、KV 配置加载、反代池解析），客户端中途 abort（浏览器取消 <img>、
+ * 用户跳走）时 A 先结束，单飞表里留下的就是一个永远不会 settle 的 Promise。
+ *
+ * 这里改成只共享「谁正在取」这一**事实**（Set），不共享任何 Promise：
+ *   - 生产者在拿到结果、写进缓存后清标记（含失败/异常路径）；
+ *   - 等待方用**本请求内创建的定时器**轮询 `read()`，读到即返回；标记消失就自己取；
+ *   - 有界等待（默认 40 × 25ms = 1s），绝不无限等。
+ *
+ * `read()` 必须是同步、幂等、只读已落地结果的函数（拿不到就返回 null）。
+ */
+export async function crossRequestSingleFlight<T>(
+    markers: Set<string>,
+    key: string,
+    read: () => T | null,
+    produce: () => Promise<T | null>,
+    options: { tries?: number; delayMs?: number } = {}
+): Promise<T | null> {
+    const ready = read();
+    if (ready !== null) return ready;
+
+    if (markers.has(key)) {
+        const tries = options.tries ?? 40;
+        const delayMs = options.delayMs ?? 25;
+        for (let i = 0; i < tries; i++) {
+            if (!markers.has(key)) break;
+            await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+            const waited = read();
+            if (waited !== null) return waited;
+        }
+        const afterWait = read();
+        if (afterWait !== null) return afterWait;
+        // 标记还在（或刚消失）却始终读不到结果：生产者拿到的是不可缓存结果（如流式响应）
+        // 或它已卡住 —— 此时自己去取一次，绝不继续等别人的 Promise。
+    }
+
+    markers.add(key);
+    try {
+        return await produce();
+    } finally {
+        markers.delete(key);
+    }
+}
+
+/** Build optional HSTS header object based on the HSTS_ENABLE flag (cfnew semantics). */export function hstsHeaders(env: Record<string, string | undefined> | undefined): Record<string, string> {
     if (env && (env.HSTS_ENABLE === '1' || env.HSTS_ENABLE === 'true')) {
         return { 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload' };
     }

@@ -5,7 +5,8 @@ import {
     hstsHeaders,
     randomUserAgent,
     randomAcceptLanguage,
-    copySafeOutboundHeaders
+    copySafeOutboundHeaders,
+    crossRequestSingleFlight
 } from "@common";
 
 /**
@@ -783,62 +784,63 @@ type ImageLoad =
     | { kind: 'bytes'; body: ArrayBuffer; status: number; contentType: string; etag: string }
     | { kind: 'stream'; resp: Response; contentType: string };
 
-/** 冷取图单飞表：N 个并发 `<img>` 只打一次上游（并发冷启动否则会瞬间烧光额度） */
-const maskImageInflight = new Map<string, Promise<ImageLoad | null>>();
+/**
+ * 冷取图单飞去重：**只存「谁正在取」的标记，不存 Promise**。
+ *
+ * 旧实现是 `Map<url, Promise>`（N 个并发 `<img>` 只打一次上游）。那在 Workers 上是错的：
+ * 浏览器中途 abort 掉一个 `<img>` 请求时，创建 Promise 的那个请求先结束，表里留下的是
+ * 一个「永远无法达成」的 Promise —— 后来者 await 它会直接拿到
+ * “This promise was created by a request that has since ended”。
+ * 详见 common.ts 的 crossRequestSingleFlight 注释。
+ */
+const maskImageLoading = new Set<string>();
 
 /** 取图（缓存优先、并发合并）；返回 null 表示「不是图片/失败」→ 调用方降级普通反代 */
-async function fetchImageLoad(maskURL: URL, allowShared = true): Promise<ImageLoad | null> {
+async function fetchImageLoad(maskURL: URL): Promise<ImageLoad | null> {
     const url = maskURL.href;
-    const cached = peekImageBytes(maskURL);
-    if (cached) {
-        return { kind: 'bytes', body: cached.body, status: cached.status, contentType: cached.contentType, etag: cached.etag };
-    }
-
-    const inflight = maskImageInflight.get(url);
-    if (allowShared && inflight) {
-        const shared = await inflight;
-        // 流式结果的 `resp.body` 只能被消费一次：并发调用者不能复用同一个 Response，
-        // 否则第二个 `new Response(load.resp.body)` 会抛 "body already used"（评审 BLOCKER）。
-        // 这条分支本来只服务于「冷启动时 N 个并发只打一次上游」，代价可接受。
-        if (shared && shared.kind === 'stream') return fetchImageLoad(maskURL, false);
-        return shared;
-    }
-
-    const task = (async (): Promise<ImageLoad | null> => {
-        const headers = buildMaskedHeaders(new Headers(), maskURL);
-        headers.set('Referer', maskURL.origin + '/');
-        headers.set('Accept', 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8');
-        try {
-            const resp = await fetchWithTimeout(url, { method: 'GET', headers, cf: {} }, 10000);
-            const contentType = resp.headers.get('content-type') || 'image/jpeg';
-            // 假阳性保护：服务器返回 HTML 说明不是图片，降级普通伪装反代
-            if (contentType.startsWith('text/html')) return null;
-            const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
-            if (contentLength > 0 && contentLength < MASK_IMAGE_MAX_BUFFER) {
-                const body = await withTimeout(resp.arrayBuffer(), 5000, '图片代理响应体读取');
-                const etag = imageContentEtag(body);
-                if (body.byteLength <= MASK_IMAGE_MAX_BUFFER) {
-                    cacheImageEntry(url, {
-                        body,
-                        status: resp.status,
-                        contentType,
-                        time: Date.now(),
-                        bytes: body.byteLength,
-                        etag
-                    });
+    return await crossRequestSingleFlight<ImageLoad>(
+        maskImageLoading,
+        url,
+        // 只把**已入缓存**的字节当作"就绪"：流式结果不可缓存，等待方应该自己取一份
+        () => {
+            const cached = peekImageBytes(maskURL);
+            return cached
+                ? { kind: 'bytes', body: cached.body, status: cached.status, contentType: cached.contentType, etag: cached.etag }
+                : null;
+        },
+        async () => {
+            const headers = buildMaskedHeaders(new Headers(), maskURL);
+            headers.set('Referer', maskURL.origin + '/');
+            headers.set('Accept', 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8');
+            try {
+                const resp = await fetchWithTimeout(url, { method: 'GET', headers, cf: {} }, 10000);
+                const contentType = resp.headers.get('content-type') || 'image/jpeg';
+                // 假阳性保护：服务器返回 HTML 说明不是图片，降级普通伪装反代
+                if (contentType.startsWith('text/html')) return null;
+                const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
+                if (contentLength > 0 && contentLength < MASK_IMAGE_MAX_BUFFER) {
+                    const body = await withTimeout(resp.arrayBuffer(), 5000, '图片代理响应体读取');
+                    const etag = imageContentEtag(body);
+                    if (body.byteLength <= MASK_IMAGE_MAX_BUFFER) {
+                        cacheImageEntry(url, {
+                            body,
+                            status: resp.status,
+                            contentType,
+                            time: Date.now(),
+                            bytes: body.byteLength,
+                            etag
+                        });
+                    }
+                    return { kind: 'bytes', body, status: resp.status, contentType, etag };
                 }
-                return { kind: 'bytes', body, status: resp.status, contentType, etag };
+                // 未知长度 / ≥2MB：不缓冲、不缓存，直接流式
+                return { kind: 'stream', resp, contentType };
+            } catch (e) {
+                console.error('伪装图片代理失败:', (e as Error)?.message ?? String(e));
+                return null;
             }
-            // 未知长度 / ≥2MB：不缓冲、不缓存，直接流式
-            return { kind: 'stream', resp, contentType };
-        } catch (e) {
-            console.error('伪装图片代理失败:', (e as Error)?.message ?? String(e));
-            return null;
         }
-    })().finally(() => { maskImageInflight.delete(url); });
-
-    maskImageInflight.set(url, task);
-    return task;
+    );
 }
 
 /**

@@ -1,4 +1,4 @@
-import { evictOldest, safeErrorMessage } from "@common";
+import { evictOldest, safeErrorMessage, crossRequestSingleFlight } from "@common";
 import { PUBLIC_PATH_POOL } from "../common/ratelimit";
 
 // ── H6：跨部署硬编码常量的 env 覆盖入口 ──
@@ -1431,8 +1431,17 @@ function poolCacheLog(message: string): void {
 /** 模块级缓存：isolate 生命周期内有效（键 = proxyIP|targetDomain|uuid），命中时校验 TTL，超限时按 LRU 淘汰 */
 const _proxyPoolCache = new Map<string, { result: [string, number][]; time: number }>();
 
-/** 单飞表：键 → 进行中的解析 promise。并发同键只解析一次；结束（成功或失败）立即移除。 */
-const _proxyPoolInflight = new Map<string, Promise<[string, number][]>>();
+/**
+ * 单飞标记：键 → 「谁正在进行中的解析」。**只存标记，不存 Promise**。
+ *
+ * 旧实现是 `Map<key, Promise>` 并让并发调用者 await 它。那在 Workers 上会踩
+ * `handle_cross_request_promise_resolution`：创建 Promise 的请求先结束（客户端 abort /
+ * 连接被关）时它永远无法 settle，后来者 await 直接抛
+ * “This promise was created by a request that has since ended”。
+ * 现在等待方轮询一级缓存（解析结束时由 resolveProxyPoolUncached 写入），见
+ * common.ts 的 crossRequestSingleFlight。
+ */
+const _proxyPoolLoading = new Set<string>();
 
 /** 代理池缓存键：proxyIP 归一化（trim + 小写）与 targetDomain/uuid 一起参与，避免跨目标域名串味 */
 function proxyPoolCacheKey(proxyIP: string, targetDomain: string, uuid: string): string {
@@ -1528,6 +1537,15 @@ async function writeProxyPoolCacheApi(cacheKey: string, result: [string, number]
  * 同一键的并发调用走单飞，只解析一次。
  * Aligns with edgetunnel `解析地址端口` (9895-10016).
  */
+/**
+ * 一级缓存条目的新鲜判据。**单一来源**：主路径的「L1 hit/stale」判定与单飞轮询的
+ * 「结果是否已落地」判定共用它，避免两处 TTL 比较漂移（一处改了另一处忘改，会出现
+ * "主路径认为过期、轮询却认为新鲜"这种难查的分叉）。
+ */
+function isFreshPoolEntry(entry: { time: number }): boolean {
+    return Date.now() - entry.time < PROXY_POOL_CACHE_TTL;
+}
+
 export async function resolveProxyIPPool(
     proxyIP: string,
     targetDomain: string,
@@ -1535,7 +1553,7 @@ export async function resolveProxyIPPool(
 ): Promise<[string, number][]> {
     const cacheKey = proxyPoolCacheKey(proxyIP, targetDomain, uuid);
     const cachedPool = _proxyPoolCache.get(cacheKey);
-    if (cachedPool && Date.now() - cachedPool.time < PROXY_POOL_CACHE_TTL) {
+    if (cachedPool && isFreshPoolEntry(cachedPool)) {
         // 命中即刷新 LRU 顺序，保证淘汰的是最久未用的键
         _proxyPoolCache.delete(cacheKey);
         _proxyPoolCache.set(cacheKey, cachedPool);
@@ -1550,22 +1568,21 @@ export async function resolveProxyIPPool(
     // ── 单飞（in-flight 去重）──
     // 一级缓存要等解析结束才写入，而同一个键在同一秒里可能有多条连接同时到达
     // （浏览器开一个页面就是几十条并发 WS，且每条连接还可能两次进池）。中间这段窗口里
-    // N 条连接会各自发起一遍 DoH。这里把「进行中的同键解析」共享出去：只有第一条真正解析，
-    // 其余直接 await 它的结果；解析结束（成功或失败）立刻移除，绝不把失败固化进单飞表。
-    const pending = _proxyPoolInflight.get(cacheKey);
-    if (pending) {
-        poolCacheLog(`inflight join target=${targetDomain}`);
-        return await pending;
-    }
-
-    const task = resolveProxyPoolUncached(cacheKey, proxyIP, targetDomain, uuid);
-    _proxyPoolInflight.set(cacheKey, task);
-    try {
-        return await task;
-    } finally {
-        // 单飞期间同一个键只有这里写入，直接删掉即可
-        _proxyPoolInflight.delete(cacheKey);
-    }
+    // N 条连接会各自发起一遍 DoH。这里只共享「谁正在解析」这个事实：
+    // 等待方轮询一级缓存（解析结束即写入），读不到就自己取 —— **绝不 await 别人的 Promise**。
+    const pool = await crossRequestSingleFlight<[string, number][]>(
+        _proxyPoolLoading,
+        cacheKey,
+        () => {
+            const hit = _proxyPoolCache.get(cacheKey);
+            return hit && isFreshPoolEntry(hit) ? hit.result : null;
+        },
+        () => resolveProxyPoolUncached(cacheKey, proxyIP, targetDomain, uuid),
+        { tries: 40, delayMs: 25 }
+    );
+    // produce() 恒返回数组；null 只可能出现在"等待上界后仍读不到且已退出标记"的理论分支，
+    // 这里兜底自己解析一次，避免把空池交给拨号
+    return pool ?? await resolveProxyPoolUncached(cacheKey, proxyIP, targetDomain, uuid);
 }
 
 /**
