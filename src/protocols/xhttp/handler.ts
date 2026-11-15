@@ -1,5 +1,7 @@
 import { safeErrorMessage } from '@common';
 import {
+    envConnectionLimit,
+    envNumber,
     handleTCPOutBound,
     runWsCleanupHooks,
     safeCloseTcpSocket,
@@ -34,18 +36,32 @@ import {
  *  - Content-Type 用 application/octet-stream，不用参考压缩版里的 application/grpc（历史值）。
  */
 
-/** 并发上限：与参考实现一致。超出直接 429，避免单个 isolate 被大量长连接抽干 */
-const XHTTP_MAX_CONNECTIONS = 32;
+/** 并发上限默认值：与参考实现一致。超出直接 429，避免单个 isolate 被大量长连接抽干 */
+const XHTTP_MAX_CONNECTIONS_DEFAULT = 32;
 /** 首包（VLESS 头）安全上限：合法头最长约 1+16+1+255+1+2+1+255 ≈ 532 字节，8KB 只用来兜畸形/恶意包 */
 const XHTTP_HEADER_LIMIT = 8 * 1024;
-/** 首包到达超时：客户端只建连接不发头时，不能让配额被无限占用（DoSing 本 isolate 的 32 个槽位） */
+/** 首包到达超时：客户端只建连接不发头时，不能让配额被无限占用（DoSing 本 isolate 的并发槽位，默认 32） */
 const XHTTP_HEADER_TIMEOUT_MS = 30_000;
-/** 空闲超时：两个方向都无数据即主动断开（对齐参考实现 30s） */
-const XHTTP_IDLE_TIMEOUT_MS = 30_000;
+/**
+ * 空闲超时默认值（秒）：两个方向都无数据即主动断开（对齐参考实现 30s）。
+ * env `XHTTP_IDLE_TIMEOUT_S` 可覆盖，**显式 0 = 关闭空闲断流**（长暂停/长缓冲的播放器需要）。
+ */
+const XHTTP_IDLE_TIMEOUT_S_DEFAULT = 30;
+/** 看门狗轮询间隔上限：短超时按 timeout/2 自适应，避免"设 2s 却 5s 才检测" */
 const XHTTP_IDLE_CHECK_INTERVAL_MS = 5_000;
-/** 下行排队上限：send() 是同步的，没法把背压反传给 remoteSocketToWS；
- *  超过这个积压量就主动断开，宁可断一个慢客户端也不让 isolate 内存被拖爆 */
-const XHTTP_MAX_QUEUED_BYTES = 8 * 1024 * 1024;
+/**
+ * 下行排队上限默认值（MB）：send() 是同步的，没法把背压反传给 remoteSocketToWS；
+ * 超过这个积压量就收口，宁可断一个慢客户端也不让 isolate 内存被拖爆。
+ * env `XHTTP_MAX_QUEUED_MB` 可覆盖，**显式 0 = 关闭该保护**。
+ */
+const XHTTP_MAX_QUEUED_MB_DEFAULT = 8;
+/**
+ * 积压容忍窗口默认值（秒）：**先限速、后断流**。
+ * 下行已经过 WS 侧同一个令牌桶（WS_DOWNLINK_BPS）限速，所以"客户端比上限慢"时队列仍会涨。
+ * 旧行为是一越过上限立刻 terminate（短时抖动也断）；现在要求**持续超限**超过这个窗口才断，
+ * 短暂尖峰（seek、切集、GC 抖动）能被吸收。env `XHTTP_QUEUE_GRACE_S` 覆盖，0 = 立即断（旧行为）。
+ */
+const XHTTP_QUEUE_GRACE_S_DEFAULT = 15;
 /** 下行流的排队策略上限：desiredSize 按字节计，send() 用它判断积压 */
 const XHTTP_STREAM_HIGH_WATER = 64 * 1024;
 
@@ -114,6 +130,25 @@ function badRequest(): Response {
     return new Response('Bad Request', { status: 400 });
 }
 
+/** 每请求解析一次的生效阈值（env 可调；非法值回退默认，显式 0 按各自语义处理） */
+function xhttpLimits(): {
+    maxConnections: number;
+    idleTimeoutMs: number;
+    maxQueuedBytes: number;
+    graceMs: number;
+} {
+    const { value: maxConnections } = envConnectionLimit('XHTTP_MAX_CONNECTIONS', XHTTP_MAX_CONNECTIONS_DEFAULT);
+    const idleTimeoutSec = envNumber('XHTTP_IDLE_TIMEOUT_S', XHTTP_IDLE_TIMEOUT_S_DEFAULT, true);
+    const queuedMb = envNumber('XHTTP_MAX_QUEUED_MB', XHTTP_MAX_QUEUED_MB_DEFAULT, true);
+    const graceSec = envNumber('XHTTP_QUEUE_GRACE_S', XHTTP_QUEUE_GRACE_S_DEFAULT, true);
+    return {
+        maxConnections,
+        idleTimeoutMs: idleTimeoutSec > 0 ? Math.floor(idleTimeoutSec * 1000) : 0,
+        maxQueuedBytes: queuedMb > 0 ? Math.floor(queuedMb * 1024 * 1024) : 0,
+        graceMs: Math.floor(graceSec * 1000)
+    };
+}
+
 /**
  * XHTTP 入站唯一入口。
  *
@@ -122,7 +157,9 @@ function badRequest(): Response {
  * 已执行，因此 globalThis.globalConfig / settings / wsConfig 都是本次请求的最新值。
  */
 export async function handleXhttp(request: Request, env: Env): Promise<Response> {
-    if (activeXhttpConnections >= XHTTP_MAX_CONNECTIONS) {
+    const limits = xhttpLimits();
+    if (activeXhttpConnections >= limits.maxConnections) {
+        console.log(`[xhttp] 已达并发上限 ${limits.maxConnections} 条，拒绝新连接`);
         return new Response('Too many connections', { status: 429 });
     }
 
@@ -148,6 +185,8 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
     const remoteSocketRef: { value: Socket | null } = { value: null };
     let lastActivityAt = Date.now();
     let readyState: number = WS_READY_STATE_OPEN;
+    /** 下行积压首次越过上限的时刻（0 = 当前未超限）；配合 graceMs 实现"持续超限才断" */
+    let overflowSince = 0;
 
     const touch = () => { lastActivityAt = Date.now(); };
 
@@ -192,12 +231,19 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
             if (terminated || readyState !== WS_READY_STATE_OPEN || !controllerRef) return;
             const data = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
             if (!data.byteLength) return;
-            // 积压过深说明客户端读得太慢；这里只能主动断开（send 同步，无法在此 await 背压）
+            // 积压过深说明客户端读得太慢。send 是同步的，没法在此 await 背压 ——
+            // 所以策略是「先限速（WS 侧令牌桶已在压）+ 容忍短暂尖峰，持续超限才断」：
+            // 只要队列在 graceMs 内回到水位以下就继续跑，避免 seek / 切集 / GC 抖动直接断流。
             const desired = controllerRef.desiredSize;
-            if (desired !== null && desired < -XHTTP_MAX_QUEUED_BYTES) {
-                log(`downlink backlog exceeded ${XHTTP_MAX_QUEUED_BYTES} bytes, closing`);
-                terminate();
-                return;
+            if (limits.maxQueuedBytes > 0 && desired !== null && desired < -limits.maxQueuedBytes) {
+                if (!overflowSince) overflowSince = Date.now();
+                if (Date.now() - overflowSince >= limits.graceMs) {
+                    log(`downlink backlog exceeded ${limits.maxQueuedBytes} bytes for ${limits.graceMs}ms, closing`);
+                    terminate();
+                    return;
+                }
+            } else if (overflowSince) {
+                overflowSince = 0;   // 已回到水位以下：重新计时
             }
             touch();
             try {
@@ -383,15 +429,19 @@ export async function handleXhttp(request: Request, env: Env): Promise<Response>
     startWatchdog();
     return new Response(readable, { headers: XHTTP_RESPONSE_HEADERS });
 
-    /** 空闲看门狗：两个方向（上行 chunk / 下行 send）都算活动，30s 全静默才断开 */
+    /** 空闲看门狗：两个方向（上行 chunk / 下行 send）都算活动，静默超时才断开。
+     *  `XHTTP_IDLE_TIMEOUT_S=0` 时完全不装看门狗（长暂停/长缓冲的播放器需要）。 */
     function startWatchdog(): void {
         lastActivityAt = Date.now();
+        if (limits.idleTimeoutMs <= 0) return;
+        // 轮询间隔跟随超时自适应：设 2s 却 5s 才检测是没意义的
+        const interval = Math.max(200, Math.min(XHTTP_IDLE_CHECK_INTERVAL_MS, Math.floor(limits.idleTimeoutMs / 2)));
         watchdog = setInterval(() => {
-            if (Date.now() - lastActivityAt > XHTTP_IDLE_TIMEOUT_MS) {
-                log(`idle for ${XHTTP_IDLE_TIMEOUT_MS}ms, closing`);
+            if (Date.now() - lastActivityAt > limits.idleTimeoutMs) {
+                log(`idle for ${limits.idleTimeoutMs}ms, closing`);
                 terminate();
             }
-        }, XHTTP_IDLE_CHECK_INTERVAL_MS);
+        }, interval);
     }
 
     /** 上行泵（TCP）：把 request body 的后续 chunk 写进当前出站 socket。

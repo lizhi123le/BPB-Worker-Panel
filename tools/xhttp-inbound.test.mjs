@@ -21,7 +21,8 @@
  *   4. 0xED7F 隐私填充首包：剥离后仍被识别；
  *   5. 首包拆成两个 chunk：跨 chunk 累积后仍被识别；
  *   6. POST /login/authenticate：开关打开也不被 XHTTP 吞掉（面板路由不变）；
- *   7. cmd=2/port=53（UDP DNS）：被识别并拨号。
+ *   7. cmd=2/port=53（UDP DNS）：被识别并拨号；
+ *   8. env 旋钮：XHTTP_MAX_CONNECTIONS / XHTTP_IDLE_TIMEOUT_S 的生效值与日志口径。
  *
  * 前提：先构建过（npm run build，或快速版 NODE_ENV=mangle node scripts/build.js），
  * 本测试直接加载 .build/worker.reference.js（混淆前产物，行为等价且可读）。
@@ -121,6 +122,18 @@ function makeEnv(settings) {
 }
 
 /**
+ * 统一的 env 构造（runXhttp 与 env 旋钮用例共用）。
+ * worker 的 kv-cache 是 isolate 级 5 分钟 TTL（globalThis.__kvCache）：本测试在同一进程里
+ * 反复换 KV 内容，不清理就会一直命中第一次 seed 时的缓存，后续用例永远读不到
+ * xhttpConfigs=true，全部静默落回伪装页。删掉它等价于「换一个新 isolate」——
+ * 也正是 random-path.test.mjs 用「父进程 spawn 子进程」绕开的那个缓存。
+ */
+function envFor(xhttpConfigs, extra = {}) {
+    delete globalThis.__kvCache;
+    return { ...makeEnv({ ...baseSettings, xhttpConfigs }), ...extra };
+}
+
+/**
  * 发一次 POST 并收集观测值。
  * body 可以是 Uint8Array（单块）或 Uint8Array[]（多 chunk 的 ReadableStream）。
  */
@@ -128,13 +141,7 @@ async function runXhttp({ packet, chunks = null, path = '/', xhttpConfigs, metho
     connectCalls = 0;
     logs.length = 0;
 
-    // worker 的 kv-cache 是 isolate 级 5 分钟 TTL（globalThis.__kvCache）：本测试在同一进程里
-    // 反复换 KV 内容，不清理就会一直命中第一次 seed 时的缓存，后续用例永远读不到
-    // xhttpConfigs=true，全部静默落回伪装页。删掉它等价于「换一个新 isolate」——
-    // 也正是 random-path.test.mjs 用「父进程 spawn 子进程」绕开的那个缓存。
-    delete globalThis.__kvCache;
-
-    const env = makeEnv({ ...baseSettings, xhttpConfigs });
+    const env = envFor(xhttpConfigs);
     const init = { method, headers: { Host: 'panel.example.com' } };
     if (chunks) {
         init.body = new ReadableStream({
@@ -225,6 +232,56 @@ check('UDP/53 首包：被识别（发生拨号）', r.connectCalls > 0,
     `connectCalls=${r.connectCalls} status=${r.status} logs=${r.logs.join(' | ')}`);
 check('UDP/53 首包：DNS socket 建连失败按 500 收口（已进入 UDP 分支）', r.status === 500,
     `status=${r.status} text=${String(r.text).slice(0, 80)}`);
+
+// ── 8) env 旋钮：XHTTP_MAX_CONNECTIONS / XHTTP_IDLE_TIMEOUT_S
+// 需要一个「占着名额但不结束」的连接。注意：handleXhttp 会 **await 拨号完成**才返回 Response，
+// 所以「connect 永不 settle」会把请求本身挂住（第一版就这么写，结果 top-level await 永不回来、
+// 后续断言全没跑、退出码却是 0）。正确做法：拨号**成功**，但下行流永不产出/永不关闭 ——
+// 连接因此一直 active，名额被占住，空闲看门狗也会在 1s 后自己收口。
+globalThis.connect = () => ({
+    opened: Promise.resolve(),
+    closed: new Promise(() => {}),
+    readable: new ReadableStream({ start() { /* 一字节都不产出，也不 close */ } }),
+    writable: new WritableStream({ write() { return undefined; } }),
+    close() {}
+});
+logs.length = 0;
+const knobEnv = envFor(true, { XHTTP_MAX_CONNECTIONS: '1', XHTTP_IDLE_TIMEOUT_S: '1' });
+// 关键：request body 必须**永不结束**。给一次性 body 时上行泵读完即 done → finally 里 terminate()，
+// 名额会被立刻释放（第二版就是这么错的：第二条请求拿到了 200 而不是 429）。
+const heldBody = new ReadableStream({
+    start(controller) { controller.enqueue(vlessPacket()); /* 不 close：模拟真实隧道的常驻 POST body */ }
+});
+const heldResponse = await handler.fetch(
+    new Request(`${ORIGIN}/`, {
+        method: 'POST',
+        headers: { Host: 'panel.example.com' },
+        body: heldBody,
+        duplex: 'half'
+    }),
+    knobEnv,
+    ctx
+);
+check('env：挂住的连接已接管（返回 200 流式响应）', heldResponse.status === 200, `status=${heldResponse.status}`);
+const second = await handler.fetch(
+    new Request(`${ORIGIN}/`, { method: 'POST', headers: { Host: 'panel.example.com' }, body: vlessPacket() }),
+    knobEnv,
+    ctx
+);
+check('env：XHTTP_MAX_CONNECTIONS=1 时第二条连接被拒（429）', second.status === 429, `status=${second.status}`);
+check('env：拒绝日志里是生效值 1（不是默认 32）',
+    logs.some((l) => l.includes('已达并发上限 1 条')), `logs=${logs.slice(-3).join(' | ')}`);
+
+// 空闲看门狗：1s 静默后应主动收口（轮询间隔按 timeout/2 自适应，最多 ~1.2s 内检测到）
+await new Promise((resolve) => setTimeout(resolve, 1600));
+check('env：XHTTP_IDLE_TIMEOUT_S=1 生效（静默 1s 后主动收口）',
+    logs.some((l) => l.includes('idle for 1000ms')), `logs=${logs.slice(-3).join(' | ')}`);
+
+// 恢复抛错桩，保持与文件开头一致的桩语义
+globalThis.connect = () => {
+    connectCalls++;
+    throw new Error('connect() is not available in the test harness');
+};
 
 for (const level of ['log', 'info', 'warn', 'error', 'debug']) console[level] = originalConsole[level];
 

@@ -3,6 +3,10 @@ import {
     handleTCPOutBound,
     makeReadableWebSocketStream,
     registerWsCleanup,
+    sendAndWaitIfPossible,
+    envNumber,
+    envConnectionLimit,
+    CONNECTION_LIMIT_RANGE,
     WS_READY_STATE_OPEN,
     connectSocket
 } from './common';
@@ -108,32 +112,59 @@ export { getXPaddingIdentifier } from '@utils';
  *   下行 BYOB 池 1~3 × 64KiB（按需分配；只做小块的连接只用 1 块，4K 这类大块流会用满 3 槽 = 192KiB）
  * + 下行合批缓冲 1~2 × 24~40KiB（首次 flush 才分配第二块）
  * + 上行合批缓冲 1~2 × 32KiB
- * 典型 ≈ 136KiB，最坏 ≈ 336KiB（三条都吃满）；256 条即 34MiB ~ 86MiB。
- * 上行积压另有 isolate 级预算（WS_UPLINK_ISOLATE_CAP = 32MiB，按连接数折算），
- * 因此"每连接有界、整体无界"这个漏洞已经堵住；剩下的是缓冲本身，需要时把下面这个上限调低
- * （例如伪装缓存也吃满 12MB 时，建议 128）。
+ * 典型 ≈ 136KiB，最坏 ≈ 336KiB（三条都吃满）；128 条即 17MiB ~ 43MiB，256 条即 34MiB ~ 86MiB。
+ * 上行积压另有 isolate 级预算（WS_UPLINK_ISOLATE_MB = 32，按建连时的活动连接数折算），
+ * 因此"每连接有界、整体无界"这个漏洞已经堵住（注意：折算是**建连时一次性的**，
+ * 不是实时总账，见 uplinkIsolateCap 的说明）；剩下的是缓冲本身。
  *
- * 这个值是**可调上界**而非安全值：如果你的部署确实需要更多并发，
- * 可以继续调高，但请同步观察 Memory 指标（Workers 的 exceededMemory 不会提前告警）。
- * 反过来，正常自用场景几条到几十条足够，256 已经是相当宽松的余量。
+ * 这个值**可用 env `WS_MAX_CONNECTIONS` 调整**（默认 128，钳制到 1~1024）：
+ * 128 是"留足余量"的取值（伪装缓存也吃满 12MB 时仍安全）；自用可以再降到 32~64；
+ * 确实需要更多并发可以调高，但要同步观察 Memory 指标（Workers 的 exceededMemory 不会提前告警）。
+ * 高于默认值会打一条 warn（**只在 env 变化时打一次**），因为上限写错一个零就是把 isolate 打死。
+ * 反过来，正常自用场景几条到几十条足够，128 已经是相当宽松的余量。
  *
  * 超限时直接 429，不 accept 服务端 socket、不分配任何缓冲 —— 成本几乎为零。
  * 批量开 WS 是常见探测手法，上限把它的内存占用钉死（对齐 XHTTP 的 XHTTP_MAX_CONNECTIONS 思路）。
  * 名额在 close / error / 流 cancel 三条路径上释放：复用 registerWsCleanup 的清理钩子，
  * 那条路径已经覆盖全部退出方式，不需要再挂 close 监听。
+ *
+ * 注意口径：计数是**每 isolate** 的（同一 isolate 内共享，不同 isolate 各自记账），
+ * 所以它不是全局并发上限；env 设 `0` 或非法值都回退默认值（永不表示"禁止连接"）。
  */
-const WS_MAX_CONNECTIONS = 256;
+const WS_MAX_CONNECTIONS_DEFAULT = 128;
+let loggedConnLimitSignature = '';
+
+/** 生效的连接上限；env 越界时按边界钳制并 warn 一次（同一签名只打一条，不刷日志） */
+function wsMaxConnections(): number {
+    const { raw, value } = envConnectionLimit('WS_MAX_CONNECTIONS', WS_MAX_CONNECTIONS_DEFAULT);
+    const signature = `${raw}|${value}`;
+    if (signature !== loggedConnLimitSignature) {
+        loggedConnLimitSignature = signature;
+        if (value !== raw) {
+            console.warn(`[WS 连接上限] WS_MAX_CONNECTIONS=${raw} 超出 ${CONNECTION_LIMIT_RANGE} 安全范围，按 ${value} 处理`);
+        } else if (value > WS_MAX_CONNECTIONS_DEFAULT) {
+            // 建议的安全线就是默认值本身：高于它的部分要运维自己确认内存余量
+            console.warn(`[WS 连接上限] WS_MAX_CONNECTIONS=${value} 高于建议值 ${WS_MAX_CONNECTIONS_DEFAULT}：`
+                + '每连接稳态缓冲 ≈136KiB（最坏 336KiB），请自行确认 isolate 内存余量');
+        }
+    }
+    return value;
+}
 /**
- * isolate 级上行积压总预算（按活动连接数折算成每连接上限）。
- * env `WS_UPLINK_ISOLATE_MB` 可覆盖（单位 MB）：运维可据此在"内存紧"和"允许更慢的后端"之间取舍，
+ * isolate 级上行积压总预算（按活动连接数折算成每连接上限），单位 MB。
+ * env `WS_UPLINK_ISOLATE_MB` 可覆盖：运维可据此在"内存紧"和"允许更慢的后端"之间取舍，
  * 测试也用它把阈值压到可触发的小值。非法值回退默认，绝不放行成无上限。
+ *
+ * ⚠️ 已知近似（不是实时总账）：折算发生在**建连那一刻**，之后每个连接按自己的静态上限运行。
+ * 因此「32MiB 总预算」只在建连瞬间成立 —— 早建的连接保留较大额度，且每连接下限 256KiB
+ * 会让并发超过 128 条后总额度超出 32MiB（上限仍被 WS_MAX_CONNECTIONS × 256KiB 钉死）。
+ * 要真正做成 isolate 总账，得改成按帧共享计数器计费/退还。
  */
-const WS_UPLINK_ISOLATE_CAP = 32 * 1024 * 1024;
+const WS_UPLINK_ISOLATE_MB = 32;
 const WS_UPLINK_PER_CONN_FLOOR = 256 * 1024;
 
 function uplinkIsolateCap(): number {
-    const raw = Number((globalThis as any).env?.WS_UPLINK_ISOLATE_MB);
-    if (!Number.isFinite(raw) || raw <= 0) return WS_UPLINK_ISOLATE_CAP;
+    const raw = envNumber('WS_UPLINK_ISOLATE_MB', WS_UPLINK_ISOLATE_MB);
     return Math.max(WS_UPLINK_PER_CONN_FLOOR, Math.floor(raw * 1024 * 1024));
 }
 let activeWsConnections = 0;
@@ -145,8 +176,9 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
     const [client, webSocket] = Object.values(webSocketPair);
 
     // 先抢名额再 accept：超限时连 socket 都不接，直接回 429（与 XHTTP 的同名响应保持一致）
-    if (activeWsConnections >= WS_MAX_CONNECTIONS) {
-        console.warn(`[WS 连接上限] 已达 ${WS_MAX_CONNECTIONS} 条，拒绝新连接`);
+    const maxConnections = wsMaxConnections();
+    if (activeWsConnections >= maxConnections) {
+        console.warn(`[WS 连接上限] 已达 ${maxConnections} 条，拒绝新连接`);
         return new Response('Too many connections', { status: 429 });
     }
     activeWsConnections++;
@@ -241,7 +273,7 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
         if (!wsLocalSpeedTestSocket) return;
         const respHeader = wsLocalSpeedTestFirstHeader;
         wsLocalSpeedTestFirstHeader = null;
-        await webSocketSendAndWait(wsLocalSpeedTestSocket, buildWsLocal204Response(respHeader));
+        await sendAndWaitIfPossible(wsLocalSpeedTestSocket, buildWsLocal204Response(respHeader));
     };
 
     const processWsLocalSpeedTestData = async (data: ArrayBuffer): Promise<void> => {
@@ -1026,11 +1058,6 @@ export function buildWsLocal204Response(respHeader: Uint8Array | null): Uint8Arr
     response.set(respHeader, 0);
     response.set(wsLocal204, respHeader.byteLength);
     return response;
-}
-
-async function webSocketSendAndWait(webSocket: WebSocket, payload: Uint8Array) {
-    const sendResult: unknown = webSocket.send(payload);
-    if (sendResult && typeof (sendResult as { then?: unknown }).then === 'function') await sendResult;
 }
 
 function parseDNSQueryInfo(packet: Uint8Array): { domain: string; qtype: number; qclass: number } | null {

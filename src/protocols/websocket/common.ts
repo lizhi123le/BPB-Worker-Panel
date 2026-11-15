@@ -1204,20 +1204,160 @@ const DOWNLOAD_PACKET_MIN = DOWNLOAD_PACKET_SIZE / 4 * 3;
 const FIRST_BYTE_TIMEOUT = 6000;          // 首字节超时 ms（触发 retry 降级）
 
 /**
- * 下行「会话字节预算」（可选保护，默认关闭）。
- *
- * 为什么需要：Workers 的 CPU 额度是**按调用累计**的，而一条 WebSocket 会话就是一次调用 ——
- * 4K 这种大流量会把预算慢慢耗光，超限时平台返回 1102 并**连带打死整个 isolate**
- * （同一 isolate 上的其它连接一起断）。按字节主动收口，可以把「不可控的 isolate 崩溃」
- * 换成「单条连接可控断开」。
- *
- * 默认 0 = 不启用：这属于运行策略而非缺陷修复，静默掐断长连接会改变既有行为。
- * 需要时设 env `WS_SESSION_MAX_MB`（单位为 MB，例如 Free 计划建议 1~2GB 量级）。
+ * ⚠️ `DOWNLOAD_BLOCK_SIZE` / `DOWNLOAD_PACKET_SIZE` 是**实测选定的常量，刻意不做成 env 可调**
+ * （曾尝试过 `WS_DL_BLOCK_KIB` / `WS_DL_FRAME_KIB`，实测 4K 反而更卡，已回滚）。原因：
+ *   - 吞吐上限通常是「窗口/RTT」，那是平台侧属性，**放大读块不改变在途字节上限**；
+ *   - 帧长基准调大会把分流阈值一起抬高（阈值 = 3/4 基准），原本直发的中等块（24~48KiB）
+ *     被推回 batcher 的 1~3ms 定时器里排队，**延迟反而变差**；
+ *   - 三槽池 = 3 × 读块，128KiB 读块即 384KiB/连接，内存与 GC 压力一起上升。
+ * 换言之：卡顿的杠杆不在这里，在下行流控（`WS_DOWNLINK_BPS`）与线路本身。
+ * 若要重试，先看 debug 仪表里的 `maxBlock` 是否长期远小于 64KiB —— 那是唯一值得改的前提。
  */
+
+/**
+ * 下行「会话字节预算」的默认值（MB）：**默认开启**，用完即主动关连接让客户端重连。
+ *
+ * 为什么默认开启：Workers 的 CPU/内存额度是**按调用累计**的，而一条 WebSocket 会话就是
+ * 一次调用 —— 长会话迟早把额度耗光，超限时平台返回 1102 并**连带打死整个 isolate**
+ * （同 isolate 上的其它连接一起断）。按字节主动收口，把「不可控的 isolate 崩溃」换成
+ * 「单条连接可控断开 + 客户端自动重连」。
+ * 900MB 的量级：按 20MB/s 上限约 45 秒（客户端真能跑满时）；按 4K 真实码率（≈3.1MB/s）
+ * 约 5 分钟；1080p（≈0.8MB/s）约 19 分钟。断一次只是一次干净重连，不丢会话状态。
+ *
+ * env `WS_SESSION_MAX_MB` 可覆盖；**显式设为 0 表示关闭该保护**（回滚开关），
+ * 未设或非法值仍取本默认值。
+ */
+const WS_SESSION_MAX_MB_DEFAULT = 900;
+
+/**
+ * 下行速率上限的默认值（字节/秒，20MB/s ≈ 160Mbps）：**默认开启**。
+ * 依据见 downlinkByteRate 的注释（平台没有发送侧背压）。
+ *
+ * 20MB/s 对 4K（25~50Mbps）有 3 倍以上余量，正常播放不会咬到它；它的作用是**兜底**：
+ * 一旦客户端链路远低于这个值，无界排队就会被压成稳定速率，而不是一直涨到 isolate 被打死。
+ * 链路更快（>160Mbps）的部署在跑大文件下载时会被这个上限压住，需要时上调或设 `0` 关闭。
+ *
+ * ⚠️ 它是**全量下行**的上限，不分协议。
+ */
+const WS_DOWNLINK_BPS_DEFAULT = 20 * 1000 * 1000;
+
 function sessionByteBudget(): number {
-    const raw = Number((globalThis as any).env?.WS_SESSION_MAX_MB ?? 0);
-    if (!Number.isFinite(raw) || raw <= 0) return 0;
-    return Math.floor(raw * 1024 * 1024);
+    return Math.floor(envNumber('WS_SESSION_MAX_MB', WS_SESSION_MAX_MB_DEFAULT, true) * 1024 * 1024);
+}
+
+/**
+ * 下行速率上限（字节/秒）。**这是本项目下行唯一的流控点**。
+ *
+ * 为什么必须有它（不是调参，是接口缺陷）：`@cloudflare/workers-types` 的 `WebSocket`
+ * 接口**没有 `bufferedAmount`**，`send()` 返回 `void`（见 index.d.ts 的 WebSocket 接口）。
+ * 平台因此不提供任何「客户端还收得动吗」的信号，而 `remoteSocketToWS` 是
+ * 「read 一块 → send 一块 → 再 read」的紧循环：只要上游比客户端快，发不出去的帧就在
+ * 运行时里**无界堆积**。故障形态正是「越播越卡 → 最后断」：
+ *   - 堆积 = 排队延迟线性增长 → 播放器缓冲被排空 → 画面卡顿越来越重；
+ *   - 堆积 = isolate 堆持续增长 → GC 压力上升（GC 时间算 CPU）→ 最终 exceededMemory/1102 硬断。
+ * 这三个症状与「拷贝次数多」毫无关系，所以零拷贝/memcpy 优化对它们完全无效。
+ *
+ * 为什么在这个位置能形成**端到端**背压：await 令牌 → 本循环不再调用 `read()` →
+ * socket 接收缓冲填满 → TCP 窗口关闭 → 上游源站自然停顿。平台没有给我们发送侧信号，
+ * 但接收侧（不读就不收）是真实的。
+ *
+ * env `WS_DOWNLINK_BPS`（字节/秒）：未设取 `WS_DOWNLINK_BPS_DEFAULT`（20MB/s），
+ * **显式设 0 = 关闭**。取值建议略高于客户端实际下行能力，再用 debug 日志里的 `capWait`
+ * 校准：`capWait≈0` 说明上限没咬住（客户端比你设的更慢，应调低）；`capWait` 接近
+ * 窗口长度说明上限才是瓶颈（可调高）。
+ */
+function downlinkByteRate(): number {
+    return Math.floor(envNumber('WS_DOWNLINK_BPS', WS_DOWNLINK_BPS_DEFAULT, true));
+}
+
+/**
+ * 字节令牌桶。容量取 `max(速率, 4 × 读块)`：必须**大于单块上限**，否则「块大于桶」
+ * 会让 take() 永远等不满而死锁。等待一律让出事件循环（1~50ms 分片），不做忙等。
+ */
+function createByteGovernor(bytesPerSec: number) {
+    const capacity = Math.max(bytesPerSec, 4 * DOWNLOAD_BLOCK_SIZE);
+    let credit = capacity;
+    let last = Date.now();
+    let waitedMs = 0;
+    return {
+        async take(bytes: number): Promise<void> {
+            for (;;) {
+                const now = Date.now();
+                credit = Math.min(capacity, credit + ((now - last) / 1000) * bytesPerSec);
+                last = now;
+                if (bytes <= credit) {
+                    credit -= bytes;
+                    return;
+                }
+                const need = Math.ceil(((bytes - credit) / bytesPerSec) * 1000);
+                const wait = Math.max(1, Math.min(need, 50));
+                waitedMs += wait;
+                await new Promise<void>((resolve) => setTimeout(resolve, wait));
+            }
+        },
+        /**
+         * 取走「自上次调用以来」的累计节流等待毫秒，**读取即清零**。
+         * 必须清零：仪表的分母是「本报告窗口」的毫秒数，若这里返回累计值，
+         * 从第二个窗口起 capWait 会恒大于窗口长度（看起来像 100%+ 一直在咬），
+         * 校准方向就被带反了。
+         */
+        takeWaited(): number {
+            const value = waitedMs;
+            waitedMs = 0;
+            return value;
+        },
+    };
+}
+
+/**
+ * `send()` 若返回 thenable 就 await（＝真背压），返回 void 时等价于直接调用。
+ *
+ * workers-types 声明 `send(): void`，但运行时可能返回 Promise；这里统一探测一次，
+ * **有就等、没有就照旧**，因此对当前运行时的行为零变化，而在会返回 Promise 的运行时上
+ * 直接获得背压。**唯一实现**：unified.ts 的测速 204 响应路径也用它（此前那里有一份
+ * 逐字相同的副本，已合并）。
+ * 只用于直发路径：batcher 的 flush() 是同步函数，塞不进 await（见 flush 处注释）。
+ */
+export async function sendAndWaitIfPossible(webSocket: WebSocket, payload: Uint8Array): Promise<void> {
+    const result: unknown = (webSocket as any).send(payload);
+    if (result && typeof (result as { then?: unknown }).then === 'function') await result;
+}
+
+/**
+ * 连接数类 env 的统一钳制：**WS 与 XHTTP 共用这一份**（两边都曾有各自的 1 / 1024 常量）。
+ * 下界 1（0 会被错解成"全拒"，所以 0 走 fallback）；上界 1024（只作笔误护栏，不代表内存可行）。
+ */
+const CONNECTION_LIMIT_FLOOR = 1;
+const CONNECTION_LIMIT_CEILING = 1024;
+/** 钳制区间对外暴露（警告文案要打印它，测试也钉这句文案） */
+export const CONNECTION_LIMIT_RANGE = `${CONNECTION_LIMIT_FLOOR}~${CONNECTION_LIMIT_CEILING}`;
+
+/** 解析连接数 env：返回原始值（用于日志对比）与钳制后的生效值 */
+export function envConnectionLimit(name: string, fallback: number): { raw: number; value: number } {
+    const raw = envNumber(name, fallback);
+    const value = Math.min(CONNECTION_LIMIT_CEILING, Math.max(CONNECTION_LIMIT_FLOOR, Math.floor(raw)));
+    return { raw, value };
+}
+
+/**
+ * 从 env 读数值。语义（顺序即判据）：
+ *   - **未设 / 空串** → `fallback`；
+ *   - 非数字、负数 → `fallback`（fail-closed：设错了不能静默变成"无上限"或"全关"）；
+ *   - **显式 0** → `zeroMeansOff` 时返回 0（关闭），否则仍是 `fallback`；
+ *   - 正数 → 原值。
+ *
+ * 为什么必须区分「未设」与「显式 0」：默认值一旦不是 0（如 20MB/s、900MB），
+ * `?? 0` 的写法会把"没设"也当成 0 —— 默认值就永远不生效（本仓库踩过这个坑）。
+ * 同时保留显式 0 = 关闭，否则"改默认值"等于"永久失去回滚开关"。
+ * 三处（会话字节预算、下行速率、上行 isolate 预算）共用这一份实现。
+ */
+export function envNumber(name: string, fallback: number, zeroMeansOff = false): number {
+    const value = (globalThis as any).env?.[name];
+    if (value === undefined || value === null || value === '') return fallback;
+    const raw = Number(value);
+    if (!Number.isFinite(raw) || raw < 0) return fallback;
+    if (raw === 0) return zeroMeansOff ? 0 : fallback;
+    return raw;
 }
 
 // --- Uint8Array helpers (aligned with cfnew 处理值值8数组 / 拼接值8数组) ---
@@ -1238,9 +1378,9 @@ function concatUint8Arrays(a: Uint8Array, b: Uint8Array): Uint8Array {
 // --- cfnew-style download batcher (aligned with cfnew 创建值值 L5013-5078) ---
 // Batches small TCP chunks into larger WebSocket frames for better throughput.
 function createDownloadBatcher(webSocket: WebSocket) {
-    // 出口帧长抖动：每连接在 DOWNLOAD_PACKET_MIN .. DOWNLOAD_PACKET_MIN+16KiB 随机取，
-    // 消除固定帧长的长度指纹。下限由 DOWNLOAD_PACKET_MIN 统一给出 —— remoteSocketToWS 的
-    // 分流阈值依赖这条不变式：**进入 batcher 的块一定 < DOWNLOAD_PACKET_MIN ≤ PACKET_SIZE**。
+    // 出口帧长抖动：每连接在「3/4 基准 .. 5/4 基准」随机取（基准 32KiB → 24~40KiB），
+    // 消除固定帧长的长度指纹。抖动**下限**同时是 remoteSocketToWS 的分流阈值：
+    // 不变式 = **进入 batcher 的块一定 < 下限 ≤ PACKET_SIZE**（见 flush 里的说明）。
     const PACKET_SIZE = DOWNLOAD_PACKET_MIN + Math.floor(Math.random() * (DOWNLOAD_PACKET_SIZE / 2 + 1));
     const TAIL = DOWNLOAD_TAIL;                 // 512
     const LOW_WATER = Math.max(4096, TAIL << 3); // 4096
@@ -1395,6 +1535,32 @@ async function remoteSocketToWS(
     const byteBudget = sessionByteBudget();
     let sentBytes = 0;
     let budgetExceeded = false;
+    // 下行速率上限（默认关闭，见 downlinkByteRate 注释）：平台没有发送侧背压，这是唯一流控点
+    const downlinkRate = downlinkByteRate();
+    const governor = downlinkRate ? createByteGovernor(downlinkRate) : null;
+    // 1 秒粒度仪表：默认跟随面板 Log Level=debug；`WS_DOWNLINK_STATS=1` 可单独打开
+    // （运维只想快照一行吞吐、不想为此改面板设置；测试也用它，避免依赖 KV 里的 settings）
+    const statsOn = (globalThis as any).settings?.logLevel === 'debug'
+        || envNumber('WS_DOWNLINK_STATS', 0) > 0;
+    let statAt = Date.now();
+    let statBytes = 0;
+    let statFrames = 0;
+    let statMaxBlock = 0;
+    const reportStats = (): void => {
+        if (!statsOn) return;
+        const now = Date.now();
+        const elapsed = now - statAt;
+        if (elapsed < 1000) return;
+        const secs = elapsed / 1000;
+        log(`downlink ${(statBytes / secs / 1024).toFixed(0)}KiB/s frames=${statFrames}`
+            + ` maxBlock=${statMaxBlock}B total=${(sentBytes / 1048576).toFixed(1)}MiB`
+            + (governor ? ` cap=${downlinkRate}B/s capWait=${governor.takeWaited()}ms/${elapsed}ms` : ' cap=off')
+            + (byteBudget ? ` budget=${byteBudget}B` : ' budget=off'));
+        statAt = now;
+        statBytes = 0;
+        statFrames = 0;
+        statMaxBlock = 0;
+    };
 
     try {
         // Try BYOB reader first (zero-copy, reusable buffer)
@@ -1406,6 +1572,8 @@ async function remoteSocketToWS(
         }
 
         for (;;) {
+            // 节流必须在 read 之前：不读，socket 就不再收，TCP 窗口才会退给上游 —— 这才是端到端背压
+            reportStats();
             const result = isByob
                 ? await (reader as any).read(new Uint8Array(takeBlock(), 0, DOWNLOAD_BLOCK_SIZE))
                 : await reader!.read();
@@ -1433,20 +1601,28 @@ async function remoteSocketToWS(
             }
 
             // 会话字节预算：超限即主动收口（默认关闭）。放在发送之前，保证不越界。
-            if (byteBudget) {
-                sentBytes += chunk.byteLength;
-                if (sentBytes > byteBudget) {
-                    log(`session downlink budget ${byteBudget}B exceeded, closing`);
-                    budgetExceeded = true;
-                    break;
-                }
+            sentBytes += chunk.byteLength;
+            if (byteBudget && sentBytes > byteBudget) {
+                log(`session downlink budget ${(byteBudget / 1048576).toFixed(0)}MiB reached, closing (client reconnects)`);
+                budgetExceeded = true;
+                break;
+            }
+
+            // 速率上限：令牌不足就让出事件循环（默认关闭 → 零开销）
+            if (governor) await governor.take(chunk.byteLength);
+
+            if (statsOn) {
+                statBytes += chunk.byteLength;
+                statFrames++;
+                if (chunk.byteLength > statMaxBlock) statMaxBlock = chunk.byteLength;
             }
 
             // 分流阈值取帧长抖动的下限（24KiB），保证走 batcher 的块**一定**小于 PACKET_SIZE，
             // 从而 batcher 里「按引用直接 send」的分支永不触发（它会把即将复用的池缓冲交出去）。
             if (chunk.byteLength >= DOWNLOAD_PACKET_MIN) {
                 batcher.flush();
-                webSocket.send(chunk);
+                // 量的主体在这条路径（4K 下行几乎全是大块），所以背压也只做在这里
+                await sendAndWaitIfPossible(webSocket, chunk);
                 // 交出的是池里整块的视图（send 同步复制）；改用另一块，隔一代再复用
                 if (isByob) rotateBlock();
             } else {
@@ -1515,17 +1691,17 @@ export function runWsCleanupHooks(webSocket: WebSocket): void {
  * 「消费者落后」只能靠**主动收口**处理 —— 丢帧会破坏被代理的 TCP 字节流，所以唯一正确的
  * 做法是关连接。
  *
- * `WS_UPLINK_MAX_QUEUED` 只是**默认值**：调用方按当前活动连接数传入实际上限
- * （isolate 级预算 ÷ 连接数），否则 N 条连接各 8MiB 会让"每连接有界、整体无界"。
+ * `maxQueuedBytes` 由调用方按当前活动连接数折算后传入（isolate 级预算 ÷ 连接数）。
+ * 它是**必填参数**而不是带默认值的可选参数：唯一的调用方恒会传值，留一个 8MiB 的默认值
+ * 只会让人误以为"每连接默认 8MiB 有保护"，而 N 条连接各 8MiB 正是要消除的"整体无界"。
  */
 const WS_UPLINK_HIGH_WATER = 64 * 1024;
-const WS_UPLINK_MAX_QUEUED = 8 * 1024 * 1024;
 
 export function makeReadableWebSocketStream(
     webSocketServer: WebSocket,
     earlyDataHeader: string,
     log: Function,
-    maxQueuedBytes: number = WS_UPLINK_MAX_QUEUED
+    maxQueuedBytes: number
 ): ReadableStream<ArrayBuffer> {
     let readableStreamCancel = false;
     const stream = new ReadableStream<ArrayBuffer>({

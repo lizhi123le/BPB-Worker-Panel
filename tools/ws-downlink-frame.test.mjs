@@ -309,6 +309,149 @@ check('非 BYOB 回退：普通 reader 下仍能正确成帧',
     sameBytes(concatBytes(sixth.frames.map((f) => f.bytes)), concatBytes([Uint8Array.from([0, 0]), plainExpect])),
     `frames=${sixth.frames.length} sizes=[${sixth.frames.map((f) => f.bytes.byteLength).join(',')}]`);
 
+// =========================================================== 用例 7：下行速率上限（env 开启才生效）
+// 为什么必须钉这条：workers-types 的 WebSocket **没有 bufferedAmount**、send() 返回 void，
+// 平台没有任何发送侧背压。客户端慢于上游时未发完的帧只能在运行时里无界堆积，表现为
+// 「越播越卡 → 最后断」（延迟线性增长 + 堆顶到内存上限）。节流是唯一能形成端到端背压的点：
+// await 令牌 → 不 read() → socket 接收缓冲满 → TCP 窗口关闭 → 上游停顿。
+// 容量取 max(速率, 256KiB)：本用例 128KiB/s → 容量 256KiB，先放 256KiB，其余按 128KiB/s 排队。
+plan = { mode: 'stream', queue: [] };
+const seventh = await openConnection('case7', makeEnv({
+    SUB_PATH: 'ws-downlink-throttle',
+    WS_DOWNLINK_BPS: '131072'
+}));
+const throttleTotal = () => seventh.frames.reduce((n, f) => n + f.bytes.byteLength, 0);
+const throttleBlocks = [];
+for (let i = 0; i < 8; i++) {
+    const b = new Uint8Array(64 * 1024);
+    b.fill(i + 1);
+    throttleBlocks.push(b.slice());   // enqueue 会 detach，期望值必须先快照
+    streamCtrl.enqueue(b);
+}
+await sleep(150);
+const earlyBytes = throttleTotal();
+check('下行节流：容量内先放行（≤ 256KiB 容量 + 一个块）', earlyBytes <= 256 * 1024 + 64 * 1024,
+    `early=${earlyBytes}B`);
+await sleep(2200);
+// +2 是首帧前面的 VLESS 响应头（[version, 0]）
+check('下行节流：其余字节按上限排队后到齐（不丢）', throttleTotal() === 8 * 64 * 1024 + 2,
+    `later=${throttleTotal()}B expect=${8 * 64 * 1024 + 2}B`);
+check('下行节流：全量字节序正确（节流不改内容）',
+    sameBytes(concatBytes(seventh.frames.map((f) => f.bytes)),
+        concatBytes([Uint8Array.from([0, 0]), ...throttleBlocks])),
+    `frames=${seventh.frames.length}`);
+
+// =========================================================== 用例 8：send() 返回 thenable 时串行化
+// workers-types 声明 send(): void，但运行时若返回 Promise，await 它就是**真背压**。
+// 判据：任何时刻只有一笔 send 在飞（不允许「上一笔还没被收下就发下一块」）。
+plan = { mode: 'stream', queue: [] };
+const eighth = await openConnection('case8');
+let inFlight = 0;
+let maxInFlight = 0;
+eighth.serverWs.send = (payload) => {
+    const view = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+    inFlight++;
+    if (inFlight > maxInFlight) maxInFlight = inFlight;
+    eighth.frames.push({ bytes: view.slice(), bufferId: view.buffer });
+    return new Promise((resolve) => setTimeout(() => { inFlight--; resolve(); }, 30));
+};
+const backBlocks = [0x21, 0x22, 0x23, 0x24].map((v) => new Uint8Array(64 * 1024).fill(v));
+const backExpect = backBlocks.map((b) => b.slice());
+for (const b of backBlocks) {
+    streamCtrl.enqueue(b);
+    await sleep(5);
+}
+await sleep(300);
+check('send() 返回 thenable：任何时刻只有一笔在飞（真背压）', maxInFlight === 1, `maxInFlight=${maxInFlight}`);
+check('send() 返回 thenable：字节仍完整有序',
+    sameBytes(concatBytes(eighth.frames.map((f) => f.bytes)),
+        concatBytes([Uint8Array.from([0, 0]), ...backExpect])),
+    `frames=${eighth.frames.length}`);
+
+// 注：曾有过「读块/帧长可调」（WS_DL_BLOCK_KIB / WS_DL_FRAME_KIB）的用例，实测 4K 反而更卡
+// 已连同实现一起回滚 —— 帧长基准调大会把分流阈值抬高，原本直发的中等块被推回 batcher 的
+// 1~3ms 定时器里排队，延迟变差；读块放大的收益则被「窗口/RTT 是平台属性」这条否掉。
+// 因此尺寸是常量，这里不再保留开关用例。
+
+// =========================================================== 用例 9：默认值钉死 + 显式 0 可关闭
+// 这两个默认值现在是**默认开启**的（20MB/s 速率上限、900MB 会话字节预算），所以它们
+// 必须像 WS_MAX_CONNECTIONS 一样在测试里钉住：改默认值 = 改所有部署的行为，不能悄悄漂。
+// 判据用 debug 仪表那一行（它把生效值原样打出来），不靠读实现常量。
+// 用 WS_DOWNLINK_STATS=1 开仪表，而不是改 globalThis.settings —— 后者会被 KV 里的
+// settings 快照（getKvCache，5 分钟 TTL）覆盖回去，测试会变成偶发失败。
+const STATS_ENV = { WS_DOWNLINK_STATS: '1' };
+plan = { mode: 'stream', queue: [] };
+const logsBeforeDefaults = logs.length;
+await openConnection('case9', makeEnv({ SUB_PATH: 'ws-downlink-defaults', ...STATS_ENV }));
+// 仪表在每次 read 之前判定，所以要跨过 1 秒且持续有数据，才会打印
+for (let i = 0; i < 15; i++) {
+    streamCtrl.enqueue(new Uint8Array(8 * 1024).fill(0x51));
+    await sleep(100);
+}
+const defaultLines = logs.slice(logsBeforeDefaults).filter((l) => l.includes('downlink '));
+check('默认值：下行速率上限默认 20MB/s', defaultLines.some((l) => l.includes('cap=20000000B/s')),
+    `lines=${defaultLines.slice(-2).join(' | ')}`);
+check('默认值：会话字节预算默认 900MB', defaultLines.some((l) => l.includes('budget=943718400B')),
+    `lines=${defaultLines.slice(-2).join(' | ')}`);
+
+// 显式 0 = 关闭（默认值不再是 0 之后，这是唯一的回滚开关）
+plan = { mode: 'stream', queue: [] };
+const logsBeforeOff = logs.length;
+const tenth = await openConnection('case10', makeEnv({
+    SUB_PATH: 'ws-downlink-off',
+    ...STATS_ENV,
+    WS_DOWNLINK_BPS: '0',
+    WS_SESSION_MAX_MB: '0'
+}));
+for (let i = 0; i < 15; i++) {
+    streamCtrl.enqueue(new Uint8Array(8 * 1024).fill(0x52));
+    await sleep(100);
+}
+const offLines = logs.slice(logsBeforeOff).filter((l) => l.includes('downlink '));
+check('默认值：显式 0 可同时关闭速率上限与字节预算（回滚开关）',
+    offLines.some((l) => l.includes('cap=off') && l.includes('budget=off')),
+    `lines=${offLines.slice(-2).join(' | ')}`);
+await sleep(200);
+check('默认值用例：关闭后仍逐字节送达', sameBytes(concatBytes(tenth.frames.map((f) => f.bytes)),
+    concatBytes([Uint8Array.from([0, 0]), ...Array.from({ length: 15 }, () => new Uint8Array(8 * 1024).fill(0x52))])),
+    `frames=${tenth.frames.length}`);
+
+// =========================================================== 用例 10：小块持续喂入的吞吐与合批质量
+// 4K 的实际读侧形态可能不是 64KiB 整块，而是持续的小块（3~16KiB）。这条用例钉两件事：
+//   1) 饱和喂入下管线的吞吐不会被 batcher 的定时器拖住（≥6MB/s，约为 4K 码率的 2 倍）；
+//   2) 合批没有退化成"一块一帧"（平均帧 ≥4KiB），否则帧数暴涨会直接吃掉 CPU 预算。
+// 关掉限速（WS_DOWNLINK_BPS=0），否则测的是令牌桶而不是 batcher。
+// 注意测法：**先把总量同步塞进流里**，再量"多长时间全部送达"——
+// 若改成"喂一轮 await 一次 setTimeout"，测到的是 Node 定时器粒度（实测 ~14ms/轮），
+// 不是管线（第一版就这么写的，结果 1.6MB/s 全是假信号）。
+plan = { mode: 'stream', queue: [] };
+const chunkCase = await openConnection('case11', makeEnv({
+    SUB_PATH: 'ws-downlink-smallchunk',
+    WS_DOWNLINK_BPS: '0'
+}));
+const SMALL = 3 * 1024;
+const TOTAL_CHUNKS = 8 * 1024;                 // 8192 × 3KiB = 24MiB
+const offered = SMALL * TOTAL_CHUNKS;
+const startedAt = Date.now();
+for (let i = 0; i < TOTAL_CHUNKS; i++) streamCtrl.enqueue(new Uint8Array(SMALL).fill(0x61));
+// 等送达（首帧含 2 字节 VLESS 响应头）；上限 5s 防挂死
+let delivered = 0;
+while (Date.now() - startedAt < 5000) {
+    delivered = chunkCase.frames.reduce((n, f) => n + f.bytes.byteLength, 0) - 2;
+    if (delivered >= offered) break;
+    await sleep(20);
+}
+const elapsedMs = Date.now() - startedAt;
+const frameCount = chunkCase.frames.length;
+const mbPerSec = (delivered / 1048576) / (elapsedMs / 1000);
+check('小块饱和喂入：吞吐 ≥ 6MB/s（batcher 定时器没有成为瓶颈）', mbPerSec >= 6,
+    `${mbPerSec.toFixed(1)}MB/s delivered=${delivered}B in ${elapsedMs}ms frames=${frameCount}`);
+check('小块饱和喂入：平均帧 ≥ 4KiB（仍在合批，没有退化成一帧一块）',
+    frameCount > 0 && delivered / frameCount >= 4096,
+    `avgFrame=${frameCount ? Math.round(delivered / frameCount) : 0}B frames=${frameCount}`);
+check('小块饱和喂入：字节总量与喂入量一致（不丢不重）', delivered === offered,
+    `delivered=${delivered}B offered=${offered}B`);
+
 restore();
 out(failures() === 0 ? '\nws-downlink-frame: OK' : `\nws-downlink-frame: ${failures()} 项失败`);
 process.exit(failures() === 0 ? 0 : 1);
