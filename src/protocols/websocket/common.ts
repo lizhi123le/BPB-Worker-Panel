@@ -1,5 +1,5 @@
 import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes, isBareIPv4 } from '@utils';
-import { evictOldest, safeErrorMessage, randomUserAgent } from '@common';
+import { evictOldest, safeErrorMessage, randomUserAgent, createSessionWatchdog, createSignatureGate, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
 // 核心修复：原写法 `export const connectSocket = getConnect()` 在模块加载期立即执行，
@@ -1221,7 +1221,7 @@ const FIRST_BYTE_TIMEOUT = 6000;          // 首字节超时 ms（触发 retry �
  * 一次调用 —— 长会话迟早把额度耗光，超限时平台返回 1102 并**连带打死整个 isolate**
  * （同 isolate 上的其它连接一起断）。按字节主动收口，把「不可控的 isolate 崩溃」换成
  * 「单条连接可控断开 + 客户端自动重连」。
- * 900MB 的量级：按 20MB/s 上限约 45 秒（客户端真能跑满时）；按 4K 真实码率（≈3.1MB/s）
+ * 900MB 的量级：按 10MB/s 上限约 90 秒（客户端真能跑满时）；按 4K 真实码率（≈3.1MB/s）
  * 约 5 分钟；1080p（≈0.8MB/s）约 19 分钟。断一次只是一次干净重连，不丢会话状态。
  *
  * env `WS_SESSION_MAX_MB` 可覆盖；**显式设为 0 表示关闭该保护**（回滚开关），
@@ -1230,16 +1230,22 @@ const FIRST_BYTE_TIMEOUT = 6000;          // 首字节超时 ms（触发 retry �
 const WS_SESSION_MAX_MB_DEFAULT = 900;
 
 /**
- * 下行速率上限的默认值（字节/秒，20MB/s ≈ 160Mbps）：**默认开启**。
+ * 下行速率上限的默认值（字节/秒，10MB/s ≈ 80Mbps）：**默认开启**。
  * 依据见 downlinkByteRate 的注释（平台没有发送侧背压）。
  *
- * 20MB/s 对 4K（25~50Mbps）有 3 倍以上余量，正常播放不会咬到它；它的作用是**兜底**：
+ * 10MB/s 对 4K（25~50Mbps）仍有 1.6~3 倍余量，正常播放不会咬到它；它的作用是**兜底**：
  * 一旦客户端链路远低于这个值，无界排队就会被压成稳定速率，而不是一直涨到 isolate 被打死。
- * 链路更快（>160Mbps）的部署在跑大文件下载时会被这个上限压住，需要时上调或设 `0` 关闭。
+ * 链路更快（>80Mbps）的部署在跑大文件下载时会被这个上限压住，需要时上调或设 `0` 关闭。
+ *
+ * 为什么从 20MB/s 下调：令牌桶容量 = 本速率（见 createByteGovernor），所以这个值同时是
+ * 「单次突发额度」。20MB/s 对常见客户端（3~6MB/s）等于**令牌永远够用 → 节流从不等待 →
+ * 流控实际不生效**，isolate 发送队列继续无界堆积，最终被平台以 `internal error;
+ * reference = …` 收口（同 isolate 上的在途请求一并失败）。10MB/s 既能保住 4K 余量，
+ * 又能让节流在真实链路上真正咬住。
  *
  * ⚠️ 它是**全量下行**的上限，不分协议。
  */
-const WS_DOWNLINK_BPS_DEFAULT = 20 * 1000 * 1000;
+const WS_DOWNLINK_BPS_DEFAULT = 10 * 1000 * 1000;
 
 function sessionByteBudget(): number {
     return Math.floor(envNumber('WS_SESSION_MAX_MB', WS_SESSION_MAX_MB_DEFAULT, true) * 1024 * 1024);
@@ -1261,7 +1267,7 @@ function sessionByteBudget(): number {
  * socket 接收缓冲填满 → TCP 窗口关闭 → 上游源站自然停顿。平台没有给我们发送侧信号，
  * 但接收侧（不读就不收）是真实的。
  *
- * env `WS_DOWNLINK_BPS`（字节/秒）：未设取 `WS_DOWNLINK_BPS_DEFAULT`（20MB/s），
+ * env `WS_DOWNLINK_BPS`（字节/秒）：未设取 `WS_DOWNLINK_BPS_DEFAULT`（10MB/s），
  * **显式设 0 = 关闭**。取值建议略高于客户端实际下行能力，再用 debug 日志里的 `capWait`
  * 校准：`capWait≈0` 说明上限没咬住（客户端比你设的更慢，应调低）；`capWait` 接近
  * 窗口长度说明上限才是瓶颈（可调高）。
@@ -1346,7 +1352,7 @@ export function envConnectionLimit(name: string, fallback: number): { raw: numbe
  *   - **显式 0** → `zeroMeansOff` 时返回 0（关闭），否则仍是 `fallback`；
  *   - 正数 → 原值。
  *
- * 为什么必须区分「未设」与「显式 0」：默认值一旦不是 0（如 20MB/s、900MB），
+ * 为什么必须区分「未设」与「显式 0」：默认值一旦不是 0（如 10MB/s、900MB），
  * `?? 0` 的写法会把"没设"也当成 0 —— 默认值就永远不生效（本仓库踩过这个坑）。
  * 同时保留显式 0 = 关闭，否则"改默认值"等于"永久失去回滚开关"。
  * 三处（会话字节预算、下行速率、上行 isolate 预算）共用这一份实现。
@@ -1583,6 +1589,8 @@ async function remoteSocketToWS(
             if (isByob) refreshBlock(readValue);
             let chunk = toUint8Array(readValue);
             if (!chunk.byteLength) continue;
+            // 下行有真实流量 → 刷新会话空闲计时（与上行同一个看门狗；见 startWsSessionGuard）
+            touchWsSession(webSocket);
 
             // Cancel first-byte retry timer on first real data
             if (!hasIncomingData) {
@@ -1686,6 +1694,87 @@ export function runWsCleanupHooks(webSocket: WebSocket): void {
     }
 }
 
+// ===== 会话生命周期上限：空闲超时 / 最长存活 =====
+/**
+ * 为什么需要它（2026-11 线上现场数据）：
+ * 平台会在「运行时更新宽限 ≈ 20 分钟」这类周期性动作里把长连接 **load-shed** 掉
+ * （Workers Logs: `$workers.outcome = "loadShed"`，wallTimeMs ≈ 1.17e6，cpuTimeMs ≈ 20），
+ * 客户端看到的是 1101 `internal error; reference = …`。
+ *
+ * 关键在于：`WS_SESSION_MAX_MB` 是**按已发送字节**算的，一条低速/空闲会话永远触发不了它
+ * （现场那条 19 分钟只花了 20ms CPU），于是只能等平台动手。这里改成我们**先**干净 close()：
+ * 客户端立刻自动重连（无错误页、无 1101），平台也就没机会 shed 它。
+ *
+ * 默认值都刻意小于平台的 ~20 分钟窗口：
+ *   - `WS_IDLE_TIMEOUT_S` 600s：双向都无流量 10 分钟 → 判为死连接，关掉；
+ *   - `WS_MAX_SESSION_S`  900s：单连接最长存活 15 分钟 → 强制换一条新连接。
+ * 两者都可 env 覆盖，**显式 0 = 关闭该保护**（与其它 WS_* 旋钮同一套 envNumber 语义）。
+ */
+const WS_IDLE_TIMEOUT_S_DEFAULT = 600;
+const WS_MAX_SESSION_S_DEFAULT = 900;
+
+/** 按连接登记看门狗。用 WeakMap：连接被回收时登记项自动消失，不需要显式遍历清理 */
+const wsSessionGuards = new WeakMap<WebSocket, SessionWatchdog>();
+/** 「生效值只在 env 变化时打一行」的闸门（与伪装熔断、连接上限共用同一实现） */
+const sessionLimitsGate = createSignatureGate();
+
+function wsSessionLimits(): { idleMs: number; maxMs: number } {
+    return {
+        idleMs: Math.floor(envNumber('WS_IDLE_TIMEOUT_S', WS_IDLE_TIMEOUT_S_DEFAULT, true) * 1000),
+        maxMs: Math.floor(envNumber('WS_MAX_SESSION_S', WS_MAX_SESSION_S_DEFAULT, true) * 1000)
+    };
+}
+
+/** WS 侧的粒度策略 = 「较小上限的 1/10」，夹在 [250ms, 5s]：默认 600s/900s → 5s；测试 1s → 250ms */
+function sessionWatchdogMs(idleMs: number, maxMs: number): number {
+    const smallest = Math.min(idleMs || Infinity, maxMs || Infinity);
+    if (!Number.isFinite(smallest)) return WATCHDOG_INTERVAL_MS;
+    return Math.max(250, Math.min(WATCHDOG_INTERVAL_MS, Math.floor(smallest / 10)));
+}
+
+/** 生效值只在 env 变化时打一行（对齐 camouflage 的预算日志），便于灰度期核对 */
+function logSessionLimitsOnce(idleMs: number, maxMs: number, log: Function): void {
+    if (!sessionLimitsGate.isNew(`${idleMs}/${maxMs}`)) return;
+    log(`session guard: idle=${idleMs ? `${idleMs / 1000}s` : 'off'} max=${maxMs ? `${maxMs / 1000}s` : 'off'}`);
+}
+
+/**
+ * 为一条 WS 会话启动看门狗。必须在 `webSocket.accept()` 之后调用。
+ * 到期收口走 onExpire（一次性，由 createSessionWatchdog 保证），外部收口走清理钩子。
+ */
+export function startWsSessionGuard(webSocket: WebSocket, log: Function): void {
+    const { idleMs, maxMs } = wsSessionLimits();
+    logSessionLimitsOnce(idleMs, maxMs, log);
+    // 两项都关（显式 0）：不登记、不挂清理钩子 —— 关掉的保护不该在每条连接上留一份残留
+    if (!idleMs && !maxMs) return;
+
+    const guard = createSessionWatchdog({
+        idleMs,
+        maxMs,
+        intervalMs: sessionWatchdogMs(idleMs, maxMs),
+        // 别处已关掉它（客户端断开 / 上行积压收口 / 字节预算耗尽）：停表，不留空转定时器
+        isAlive: () => webSocket.readyState === WS_READY_STATE_OPEN,
+        onExpire: (reason: string): void => {
+            wsSessionGuards.delete(webSocket);
+            log(`session ${reason}，主动关闭（客户端会立即重连）`);
+            safeCloseWebSocket(webSocket);
+        }
+    });
+
+    wsSessionGuards.set(webSocket, guard);
+
+    // 任何收口路径都会跑清理钩子 → 统一在这里停表并注销
+    registerWsCleanup(webSocket, () => {
+        guard.stop();
+        wsSessionGuards.delete(webSocket);
+    });
+}
+
+/** 记一次双向流量。未登记（如 XHTTP 入站）时是无副作用的 no-op。 */
+export function touchWsSession(webSocket: WebSocket): void {
+    wsSessionGuards.get(webSocket)?.touch();
+}
+
 /**
  * 上行背压阈值：WS 没有 pause/暂停 API（客户端发多少，message 事件就触发多少次），
  * 「消费者落后」只能靠**主动收口**处理 —— 丢帧会破坏被代理的 TCP 字节流，所以唯一正确的
@@ -1725,6 +1814,8 @@ export function makeReadableWebSocketStream(
                     runWsCleanupHooks(webSocketServer);
                     return;
                 }
+                // 上行有真实流量 → 刷新会话空闲计时（空闲超时按"双向"判，纯上传的连接不该被误杀）
+                touchWsSession(webSocketServer);
                 // WebSocket binaryType='arraybuffer' ensures event.data is always ArrayBuffer
                 controller.enqueue(event.data);
             });

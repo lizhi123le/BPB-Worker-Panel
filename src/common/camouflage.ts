@@ -6,7 +6,8 @@ import {
     randomUserAgent,
     randomAcceptLanguage,
     copySafeOutboundHeaders,
-    crossRequestSingleFlight
+    crossRequestSingleFlight,
+    createSignatureGate
 } from "@common";
 
 /**
@@ -95,7 +96,8 @@ const maskReqBucket: TokenBucket = { tokens: MASK_REQ_CAP_DEFAULT, last: 0 };
 const maskTextBucket: TokenBucket = { tokens: MASK_TEXT_CAP_DEFAULT, last: 0 };
 /** 降级日志限频（每桶 1 条/秒），避免攻击期刷爆 Workers Logs */
 const maskDegradeLogAt: Record<string, number> = { req: 0, text: 0 };
-let loggedBudgetSignature = '';
+/** 「生效阈值只在 env 变化时打一行」的闸门（与连接上限、会话看门狗共用同一实现） */
+const budgetGate = createSignatureGate();
 
 function readBudgetConfig(env: any): BudgetConfig {
     // 非法值（NaN / 负数 / 过小）一律回退默认：设错 env 不能让伪装面全挂，
@@ -119,8 +121,7 @@ function logBudgetOnce(env: any, cfg: BudgetConfig): void {
     const raw = [env?.MASK_REQ_BPS, env?.MASK_REQ_CAP, env?.MASK_TEXT_BPS, env?.MASK_TEXT_CAP, env?.MASK_TEXT_IP_CAP];
     if (raw.every((v) => v === undefined || v === null || v === '')) return;
     const sig = raw.join('|');
-    if (sig === loggedBudgetSignature) return;
-    loggedBudgetSignature = sig;
+    if (!budgetGate.isNew(sig)) return;
     console.log(`[伪装熔断] 生效阈值 req=${cfg.reqRate}/s cap=${cfg.reqCap} text=${cfg.textRate}B/s cap=${cfg.textCap}B perIP=${cfg.textPerIp}B`);
     // 设错 env 必须可见：回退是静默的，但"回退了哪个"要能一眼看出来（限频同上一行）
     const eff = [cfg.reqRate, cfg.reqCap, cfg.textRate, cfg.textCap, cfg.textPerIp];

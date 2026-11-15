@@ -374,7 +374,7 @@ check('send() 返回 thenable：字节仍完整有序',
 // 因此尺寸是常量，这里不再保留开关用例。
 
 // =========================================================== 用例 9：默认值钉死 + 显式 0 可关闭
-// 这两个默认值现在是**默认开启**的（20MB/s 速率上限、900MB 会话字节预算），所以它们
+// 这两个默认值现在是**默认开启**的（10MB/s 速率上限、900MB 会话字节预算），所以它们
 // 必须像 WS_MAX_CONNECTIONS 一样在测试里钉住：改默认值 = 改所有部署的行为，不能悄悄漂。
 // 判据用 debug 仪表那一行（它把生效值原样打出来），不靠读实现常量。
 // 用 WS_DOWNLINK_STATS=1 开仪表，而不是改 globalThis.settings —— 后者会被 KV 里的
@@ -389,7 +389,7 @@ for (let i = 0; i < 15; i++) {
     await sleep(100);
 }
 const defaultLines = logs.slice(logsBeforeDefaults).filter((l) => l.includes('downlink '));
-check('默认值：下行速率上限默认 20MB/s', defaultLines.some((l) => l.includes('cap=20000000B/s')),
+check('默认值：下行速率上限默认 10MB/s', defaultLines.some((l) => l.includes('cap=10000000B/s')),
     `lines=${defaultLines.slice(-2).join(' | ')}`);
 check('默认值：会话字节预算默认 900MB', defaultLines.some((l) => l.includes('budget=943718400B')),
     `lines=${defaultLines.slice(-2).join(' | ')}`);
@@ -451,6 +451,60 @@ check('小块饱和喂入：平均帧 ≥ 4KiB（仍在合批，没有退化成�
     `avgFrame=${frameCount ? Math.round(delivered / frameCount) : 0}B frames=${frameCount}`);
 check('小块饱和喂入：字节总量与喂入量一致（不丢不重）', delivered === offered,
     `delivered=${delivered}B offered=${offered}B`);
+
+// =========================================================== 用例 12：会话生命周期上限（先于平台的 loadShed 主动换连接）
+// 现场依据（2026-11-16）：平台在 ~20 分钟窗口把长连接 load-shed 掉（`$workers.outcome = "loadShed"`，
+// wallTimeMs ≈ 1.17e6、cpuTimeMs ≈ 20），客户端拿到 1101 `internal error; reference = …`。
+// 这条用例钉住「服务端比平台先动手」：上限设 1s，看门狗粒度自动从 5s 降到 250ms。
+check('默认值：会话看门狗默认 idle=600s / max=900s',
+    logs.some((l) => l.includes('session guard: idle=600s max=900s')),
+    `guardLines=${logs.filter((l) => l.includes('session guard')).slice(-2).join(' | ')}`);
+
+plan = { mode: 'stream', queue: [] };
+const closedBeforeMax = closed.length;
+await openConnection('case13', makeEnv({
+    SUB_PATH: 'ws-session-max',
+    WS_MAX_SESSION_S: '1',
+    WS_IDLE_TIMEOUT_S: '0'
+}));
+await sleep(1800);
+check('会话上限：到点主动关 WS（不等平台 shed）', closed.length > closedBeforeMax,
+    `closed=${closed.length - closedBeforeMax}`);
+check('会话上限：日志点明原因', logs.some((l) => l.includes('session reached max 1s')),
+    `tail=${logs.slice(-3).join(' | ')}`);
+const closedAfterMax = closed.length;
+await sleep(800);
+check('会话上限：到期只收口一次（看门狗不重复 close / 不刷日志）', closed.length === closedAfterMax,
+    `again=${closed.length - closedAfterMax}`);
+
+plan = { mode: 'stream', queue: [] };
+const closedBeforeIdle = closed.length;
+await openConnection('case14', makeEnv({
+    SUB_PATH: 'ws-session-idle',
+    WS_IDLE_TIMEOUT_S: '1',
+    WS_MAX_SESSION_S: '0'
+}));
+await sleep(1800);
+check('空闲超时：双向都无流量时主动关 WS', closed.length > closedBeforeIdle,
+    `closed=${closed.length - closedBeforeIdle}`);
+check('空闲超时：日志点明原因', logs.some((l) => l.includes('session idle')),
+    `tail=${logs.slice(-3).join(' | ')}`);
+
+// 回滚开关：显式 0 同时关闭两项 → 看门狗不登记，连接不会被本机制打断
+plan = { mode: 'stream', queue: [] };
+const closedBeforeOffGuard = closed.length;
+const noGuard = await openConnection('case15', makeEnv({
+    SUB_PATH: 'ws-session-off',
+    WS_IDLE_TIMEOUT_S: '0',
+    WS_MAX_SESSION_S: '0'
+}));
+streamCtrl.enqueue(new Uint8Array(4096).fill(0x71));
+await sleep(1500);
+check('回滚开关：显式 0 关闭两项后连接不会被打断', closed.length === closedBeforeOffGuard,
+    `closed=${closed.length - closedBeforeOffGuard}`);
+check('回滚开关：关闭后仍能正常下行',
+    noGuard.frames.reduce((n, f) => n + f.bytes.byteLength, 0) >= 2 + 4096,
+    `bytes=${noGuard.frames.reduce((n, f) => n + f.bytes.byteLength, 0)}`);
 
 restore();
 out(failures() === 0 ? '\nws-downlink-frame: OK' : `\nws-downlink-frame: ${failures()} 项失败`);

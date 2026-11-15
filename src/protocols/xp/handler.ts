@@ -1,4 +1,4 @@
-import { safeErrorMessage } from '@common';
+import { safeErrorMessage, createSessionWatchdog, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
 import {
     envConnectionLimit,
     envNumber,
@@ -47,8 +47,6 @@ const XP_HEADER_TIMEOUT_MS = 30_000;
  * env `XP_IDLE_TIMEOUT_S` 可覆盖，**显式 0 = 关闭空闲断流**（长暂停/长缓冲的播放器需要）。
  */
 const XP_IDLE_TIMEOUT_S_DEFAULT = 30;
-/** 看门狗轮询间隔上限：短超时按 timeout/2 自适应，避免"设 2s 却 5s 才检测" */
-const XP_IDLE_CHECK_INTERVAL_MS = 5_000;
 /**
  * 下行排队上限默认值（MB）：send() 是同步的，没法把背压反传给 remoteSocketToWS；
  * 超过这个积压量就收口，宁可断一个慢客户端也不让 isolate 内存被拖爆。
@@ -183,18 +181,18 @@ export async function handleXp(request: Request, env: Env): Promise<Response> {
     };
 
     let terminated = false;
-    let watchdog: ReturnType<typeof setInterval> | null = null;
+    let watchdog: SessionWatchdog | null = null;
     let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
     let uplinkReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let uplinkWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
     let uplinkWriterSocket: Socket | null = null;
     const remoteSocketRef: { value: Socket | null } = { value: null };
-    let lastActivityAt = Date.now();
     let readyState: number = WS_READY_STATE_OPEN;
     /** 下行积压首次越过上限的时刻（0 = 当前未超限）；配合 graceMs 实现"持续超限才断" */
     let overflowSince = 0;
 
-    const touch = () => { lastActivityAt = Date.now(); };
+    /** 记活动：看门狗未装（XP_IDLE_TIMEOUT_S=0）时是 no-op */
+    const touch = () => { watchdog?.touch(); };
 
     /** 统一的收口：关 socket、关下行流、跑连接级清理钩子（UDP 的 DNS socket）、释放配额。
      *  所有退出路径都必须走到这里 —— 参考实现曾因建连失败漏释放配额，32 次失败后该路径恒 429。 */
@@ -202,7 +200,7 @@ export async function handleXp(request: Request, env: Env): Promise<Response> {
         if (terminated) return;
         terminated = true;
         if (watchdog) {
-            clearInterval(watchdog);
+            watchdog.stop();
             watchdog = null;
         }
         if (uplinkReader) {
@@ -436,18 +434,19 @@ export async function handleXp(request: Request, env: Env): Promise<Response> {
     return new Response(readable, { headers: XP_RESPONSE_HEADERS });
 
     /** 空闲看门狗：两个方向（上行 chunk / 下行 send）都算活动，静默超时才断开。
-     *  `XP_IDLE_TIMEOUT_S=0` 时完全不装看门狗（长暂停/长缓冲的播放器需要）。 */
+     *  `XP_IDLE_TIMEOUT_S=0` 时 createSessionWatchdog 返回空实现（不装定时器）——
+     *  长暂停/长缓冲的播放器需要这个回滚开关。 */
     function startWatchdog(): void {
-        lastActivityAt = Date.now();
-        if (limits.idleTimeoutMs <= 0) return;
         // 轮询间隔跟随超时自适应：设 2s 却 5s 才检测是没意义的
-        const interval = Math.max(200, Math.min(XP_IDLE_CHECK_INTERVAL_MS, Math.floor(limits.idleTimeoutMs / 2)));
-        watchdog = setInterval(() => {
-            if (Date.now() - lastActivityAt > limits.idleTimeoutMs) {
+        watchdog = createSessionWatchdog({
+            idleMs: limits.idleTimeoutMs,
+            // 短超时按 timeout/2 自适应，避免"设 2s 却 5s 才检测"；上限与 WS 侧共用同一常量
+            intervalMs: Math.max(200, Math.min(WATCHDOG_INTERVAL_MS, Math.floor(limits.idleTimeoutMs / 2))),
+            onExpire: () => {
                 log(`idle for ${limits.idleTimeoutMs}ms, closing`);
                 terminate();
             }
-        }, interval);
+        });
     }
 
     /** 上行泵（TCP）：把 request body 的后续 chunk 写进当前出站 socket。

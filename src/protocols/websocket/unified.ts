@@ -3,6 +3,7 @@ import {
     handleTCPOutBound,
     makeReadableWebSocketStream,
     registerWsCleanup,
+    startWsSessionGuard,
     sendAndWaitIfPossible,
     envNumber,
     envConnectionLimit,
@@ -10,7 +11,7 @@ import {
     WS_READY_STATE_OPEN,
     connectSocket
 } from './common';
-import { evictOldest, safeErrorMessage } from '@common';
+import { evictOldest, safeErrorMessage, createSignatureGate } from '@common';
 
 // 对齐 cfnew c0eb20c（明文源吗 L33-40）：隐私增强 —— 智能剥离随机填充前缀
 // 客户端首包可能携带 [0xED 0x7F][2 字节 padLen][padLen 字节随机填充]，若不剥离直接做
@@ -132,21 +133,15 @@ export { getXPaddingIdentifier } from '@utils';
  * 所以它不是全局并发上限；env 设 `0` 或非法值都回退默认值（永不表示"禁止连接"）。
  */
 const WS_MAX_CONNECTIONS_DEFAULT = 128;
-let loggedConnLimitSignature = '';
+/** 「连接上限只在 env 变化时打一条」的闸门（与伪装熔断预算、会话看门狗共用同一实现） */
+const connLimitGate = createSignatureGate();
 
 /** 生效的连接上限；env 越界时按边界钳制并 warn 一次（同一签名只打一条，不刷日志） */
 function wsMaxConnections(): number {
     const { raw, value } = envConnectionLimit('WS_MAX_CONNECTIONS', WS_MAX_CONNECTIONS_DEFAULT);
-    const signature = `${raw}|${value}`;
-    if (signature !== loggedConnLimitSignature) {
-        loggedConnLimitSignature = signature;
-        if (value !== raw) {
-            console.warn(`[WS 连接上限] WS_MAX_CONNECTIONS=${raw} 超出 ${CONNECTION_LIMIT_RANGE} 安全范围，按 ${value} 处理`);
-        } else if (value > WS_MAX_CONNECTIONS_DEFAULT) {
-            // 建议的安全线就是默认值本身：高于它的部分要运维自己确认内存余量
-            console.warn(`[WS 连接上限] WS_MAX_CONNECTIONS=${value} 高于建议值 ${WS_MAX_CONNECTIONS_DEFAULT}：`
-                + '每连接稳态缓冲 ≈136KiB（最坏 336KiB），请自行确认 isolate 内存余量');
-        }
+    if (!connLimitGate.isNew(`${raw}|${value}`)) return value;
+    if (value !== raw) {
+        console.warn(`[WS 连接上限] WS_MAX_CONNECTIONS=${raw} 超出 ${CONNECTION_LIMIT_RANGE} 安全范围，按 ${value} 处理`);
     }
     return value;
 }
@@ -204,6 +199,10 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
     const logDebug = (info: string) => {
         if (globalThis.settings?.logLevel === 'debug') log(info);
     };
+
+    // 空闲超时 / 最长存活看门狗：比平台的 ~20 分钟 loadShed 窗口更早、更可控地换连接
+    //（现场依据见 common.ts 的 startWsSessionGuard 注释与 §10）
+    startWsSessionGuard(webSocket, log);
 
     const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
     // 上行积压上限按 isolate 预算折算：N 条连接各 8MiB 会让"每连接有界、整体无界"

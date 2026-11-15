@@ -153,6 +153,97 @@ export async function fetchWithTimeout(
     return await withTimeout(fetch(url, init), ms, 'fetch');
 }
 
+/** 看门狗默认轮询粒度（调用方可用 intervalMs 覆盖：粒度策略属于协议侧，不在这里猜） */
+export const WATCHDOG_INTERVAL_MS = 5000;
+
+export interface SessionWatchdogOptions {
+    /** 空闲上限（毫秒）；<= 0 表示不判空闲 */
+    idleMs: number;
+    /** 最长存活上限（毫秒）；<= 0 / 省略表示不判最长存活 */
+    maxMs?: number;
+    /** 轮询粒度（毫秒），由调用方按自己协议的自适应策略算好 */
+    intervalMs?: number;
+    /** 每次 tick 先问「还活着吗」；返回 false 就地停表，不再判超时（用于感知外部关闭） */
+    isAlive?: () => boolean;
+    /** 到期回调。reason 是给人看的原因，文案由本函数生成 */
+    onExpire: (reason: string) => void;
+}
+
+export interface SessionWatchdog {
+    /** 记一次活动（双向流量都应调用；应放在热路径上，O(1)） */
+    touch(): void;
+    /** 停表。幂等；到期或连接结束时调用 */
+    stop(): void;
+}
+
+/**
+ * 通用会话看门狗：轮询「空闲」与「最长存活」两个上限，到期回调**一次**后自行停表。
+ *
+ * 为什么是轮询而不是每次活动重设定时器：调用方在数据面热路径上（下行每秒数千块），
+ * 逐块 clearTimeout + setTimeout 本身就是可观开销；固定粒度轮询把成本摊成
+ * 「每连接每 intervalMs 一次空跑」。粒度由调用方按自己的超时量级自适应。
+ *
+ * 为什么 stop() 放在 onExpire 之前调用：这就是「到期只收口一次」的全部保证 ——
+ * 定时器已清，后续 tick 不存在；调用方无需再维护 expired 标志。
+ *
+ * 两个上限都 <= 0 时返回一个空实现（显式 0 = 关闭该保护），调用方不必自己判空。
+ */
+export function createSessionWatchdog(opts: SessionWatchdogOptions): SessionWatchdog {
+    const idleMs = opts.idleMs > 0 ? opts.idleMs : 0;
+    const maxMs = opts.maxMs && opts.maxMs > 0 ? opts.maxMs : 0;
+    if (!idleMs && !maxMs) return { touch() { /* 两项都关 */ }, stop() { /* 无定时器 */ } };
+
+    const intervalMs = Math.max(1, Math.floor(opts.intervalMs || WATCHDOG_INTERVAL_MS));
+    const startedAt = Date.now();
+    let lastActivity = startedAt;
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    const stop = (): void => {
+        if (timer !== null) {
+            clearInterval(timer);
+            timer = null;
+        }
+    };
+
+    timer = setInterval(() => {
+        if (opts.isAlive && !opts.isAlive()) { stop(); return; }
+        const now = Date.now();
+        if (maxMs && now - startedAt >= maxMs) {
+            stop();
+            opts.onExpire(`reached max ${Math.round(maxMs / 1000)}s`);
+            return;
+        }
+        if (idleMs && now - lastActivity >= idleMs) {
+            stop();
+            opts.onExpire(`idle ${Math.round((now - lastActivity) / 1000)}s >= ${Math.round(idleMs / 1000)}s`);
+        }
+    }, intervalMs);
+    // 让 Node 桩环境（tools/*.test.mjs）能正常退出；workerd 里 setInterval 返回 number，?. 是 no-op
+    (timer as unknown as { unref?: () => void })?.unref?.();
+
+    return {
+        touch(): void { lastActivity = Date.now(); },
+        stop
+    };
+}
+
+export interface SignatureGate {
+    /** 签名与上次不同 → 返回 true 并记住；相同 → false。用于「生效值只在变化时打一行」 */
+    isNew(signature: string): boolean;
+}
+
+/** 「同一签名只处理一次」闸门。三个调用点（伪装熔断阈值 / WS 连接上限 / 会话看门狗）共用。 */
+export function createSignatureGate(): SignatureGate {
+    let last = '';
+    return {
+        isNew(signature: string): boolean {
+            if (signature === last) return false;
+            last = signature;
+            return true;
+        }
+    };
+}
+
 /**
  * 跨请求安全单飞（同键去重）。**不共享 Promise** —— 这是平台约束，不是风格问题。
  *
