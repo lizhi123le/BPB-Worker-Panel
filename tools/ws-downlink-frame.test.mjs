@@ -314,7 +314,9 @@ check('非 BYOB 回退：普通 reader 下仍能正确成帧',
 // 平台没有任何发送侧背压。客户端慢于上游时未发完的帧只能在运行时里无界堆积，表现为
 // 「越播越卡 → 最后断」（延迟线性增长 + 堆顶到内存上限）。节流是唯一能形成端到端背压的点：
 // await 令牌 → 不 read() → socket 接收缓冲满 → TCP 窗口关闭 → 上游停顿。
-// 容量取 max(速率, 256KiB)：本用例 128KiB/s → 容量 256KiB，先放 256KiB，其余按 128KiB/s 排队。
+// 容量 = clamp(min(速率, WS_DOWNLINK_BURST_KB), 下限 256KiB)：本用例 128KiB/s → 容量 256KiB
+//（突发额度默认 2MB 不构成限制，限制来自速率；256KiB 是「必须大于单块」的下界）。
+// 结果：先放 256KiB，其余按 128KiB/s 排队。
 plan = { mode: 'stream', queue: [] };
 const seventh = await openConnection('case7', makeEnv({
     SUB_PATH: 'ws-downlink-throttle',
@@ -505,6 +507,40 @@ check('回滚开关：显式 0 关闭两项后连接不会被打断', closed.len
 check('回滚开关：关闭后仍能正常下行',
     noGuard.frames.reduce((n, f) => n + f.bytes.byteLength, 0) >= 2 + 4096,
     `bytes=${noGuard.frames.reduce((n, f) => n + f.bytes.byteLength, 0)}`);
+
+// =========================================================== 用例 13：突发额度与速率解耦（WS_DOWNLINK_BURST_KB）
+// 现场依据（2026-11-16）：测速场景同时开 8 条连接，旧实现「容量 = 速率」= 每条可瞬时灌 10MB，
+// 8 条 = 80MB，直接把 128MB 的 isolate 顶到平台回收（报 internal error 而非 1102）。
+// 这条用例钉住两件事：突发额度按 KB 生效；显式 0 回到旧行为（容量 = 速率）。
+const burstTotal = (conn) => conn.frames.reduce((n, f) => n + f.bytes.byteLength, 0);
+
+plan = { mode: 'stream', queue: [] };
+const burstConn = await openConnection('case16', makeEnv({
+    SUB_PATH: 'ws-downlink-burst',
+    WS_DOWNLINK_BPS: '1048576',      // 1MB/s：速率不是这一段的限制，限制来自容量
+    WS_DOWNLINK_BURST_KB: '256'      // 容量 = 256KiB
+}));
+for (let i = 0; i < 32; i++) streamCtrl.enqueue(new Uint8Array(64 * 1024));  // 共 2MiB
+await sleep(500);
+const burstEarly = burstTotal(burstConn);
+// 期望 ≈ 256KiB 容量 + 500ms × 1MB/s ≈ 756KiB；旧行为（容量=1MB）会是 ≈1.5MB
+check('突发额度：容量按 WS_DOWNLINK_BURST_KB 咬住（500ms 内 < 1MiB）', burstEarly < 1024 * 1024,
+    `early=${burstEarly}B`);
+await sleep(2200);   // 余量 ≈ (2MiB-256KiB)/1MiB/s ≈ 1.75s
+check('突发额度：限速后余下字节仍全部到齐（不丢）', burstTotal(burstConn) === 32 * 64 * 1024 + 2,
+    `total=${burstTotal(burstConn)}B expect=${32 * 64 * 1024 + 2}B`);
+
+plan = { mode: 'stream', queue: [] };
+const legacyConn = await openConnection('case17', makeEnv({
+    SUB_PATH: 'ws-downlink-burst-off',
+    WS_DOWNLINK_BPS: '1048576',
+    WS_DOWNLINK_BURST_KB: '0'        // 显式 0 = 回滚：容量重新等于速率（1MiB）
+}));
+for (let i = 0; i < 32; i++) streamCtrl.enqueue(new Uint8Array(64 * 1024));
+await sleep(500);
+const legacyEarly = burstTotal(legacyConn);
+check('突发额度：显式 0 回到「容量 = 速率」的旧行为（500ms 内 ≥ 1MiB）', legacyEarly >= 1024 * 1024,
+    `early=${legacyEarly}B`);
 
 restore();
 out(failures() === 0 ? '\nws-downlink-frame: OK' : `\nws-downlink-frame: ${failures()} 项失败`);

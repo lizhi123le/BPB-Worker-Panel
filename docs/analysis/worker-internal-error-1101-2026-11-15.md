@@ -315,7 +315,8 @@ console.error('[stream] upstream dropped', { path, upstream, ... });
 
 | env | 代码默认 | 建议 | 说明 |
 |---|---|---|---|
-| `WS_DOWNLINK_BPS` | ~~`20 * 1000 * 1000`~~ → **`10 * 1000 * 1000`**（[common.ts:1248](src/protocols/websocket/common.ts#L1248)，2026-11-15 已改默认） | 保持 `10000000`（10MB/s ≈ 80Mbps；4K 场景 8–12，1080p 4–6） | 按「客户端实际下行峰值 × 1.2~1.5」设；**它同时是突发额度，不要设成"带宽上限"那样大** |
+| `WS_DOWNLINK_BPS` | ~~`20 * 1000 * 1000`~~ → **`10 * 1000 * 1000`**（[common.ts:1248](src/protocols/websocket/common.ts#L1248)，2026-11-15 已改默认） | 保持 `10000000`（10MB/s ≈ 80Mbps；4K 场景 8–12，1080p 4–6） | 按「客户端实际下行峰值 × 1.2~1.5」设。**突发额度已由 `WS_DOWNLINK_BURST_KB` 单独控制**（见 §11），不再随速率放大 |
+| `WS_DOWNLINK_BURST_KB` | `2048`（2026-11-16 新增） | 保持 2048（2MB/连接） | 令牌桶容量=单连接瞬时突发额度；8 条并发 = 16MB，而不是「8 × 速率」 |
 | `WS_SESSION_MAX_MB` | `900`（[common.ts:1230](src/protocols/websocket/common.ts#L1230)） | 保持 900 | 单连接字节预算，撞线主动断开让客户端重连（可控断开 > 平台打死 isolate） |
 | `WS_MAX_CONNECTIONS` | `128`（[unified.ts:134](src/protocols/websocket/unified.ts#L134)） | 保持 128 | isolate 级并发；调高会线性抬高内存水位 |
 | `WS_UPLINK_ISOLATE_MB` | `32`（[unified.ts:163](src/protocols/websocket/unified.ts#L163)） | 保持 32 | 上行积压 isolate 预算（按连接数折算） |
@@ -418,6 +419,58 @@ $workers.outcome = "exception"       → 真 bug，去抓堆栈
 
 ---
 
+## 11. 追记三（2026-11-16 02:32 / 02:41）：测速场景的 Internal —— 突发额度 × 并发
+
+### 11.1 两批样本
+
+| 批次 | 时间 (+08) | 形态 |
+|---|---|---|
+| A | 02:32:05.637 | 3 个 reference + 1 条 `GET /environment`，同毫秒 |
+| B | 02:41:42.472 | 6 个 reference + 2 条 `GET /environment`，同毫秒；此前 35 秒（02:41:07）有测速收尾日志 |
+
+B 批之前的 02:41:07 还留下了三条业务日志（同一连接）：
+
+```
+[speedtest.hnd.fdcservers.net:8080--… tcp] readableWebSocketStream is abort {}
+[speedtest.hnd.fdcservers.net:8080--… tcp] readableWebSocketStream pipeTo error [object ErrorEvent]
+[speedtest.hnd.fdcservers.net:8080--… tcp] webSocketServer has error
+```
+
+对应代码：`abort()` 分支（[unified.ts:546](src/protocols/websocket/unified.ts#L546-L548)）、`failUplink`（[unified.ts:579](src/protocols/websocket/unified.ts#L579-L584)）、WS error 监听（[common.ts:1832](src/protocols/websocket/common.ts#L1832)）。**这些是客户端主动断开的正常收尾日志**（测速相位结束），不是故障。
+
+### 11.2 为什么不是 `1102`（CPU 超限）
+
+- Workers 的 CPU 只计 **JS 执行时间**，等 I/O 不计入；WS 隧道是「read 一块 → send 一块」的纯搬运，实测一条 19 分钟的会话 `cpuTimeMs = 20`；
+- 平台的资源失败有两条收口路径：计量能捕获的 → `1102 exceededCpu` / `exceededMemory`；**流/连接状态被拆、isolate 被回收** → `Internal`（`internal error; reference = …`）或 `loadShed`；
+- 测速把**带宽**打满不会把 CPU 打满，先撞墙的是内存/并发/流状态 —— 所以失败形态必然是后者。
+
+### 11.3 真正被打爆的：并发 × **每连接突发额度**
+
+旧实现里令牌桶容量 = 速率（`capacity = max(bytesPerSec, 4 × 读块)`），于是：
+
+| 并发 | 瞬时额度（旧，10MB/s） | 瞬时额度（新，burst=2MB） |
+|---|---|---|
+| 3 条 | 30 MB | 6 MB |
+| **8 条（测速）** | **80 MB** | **16 MB** |
+| 16 条 | 160 MB（必然爆） | 32 MB |
+
+128MB 的 isolate 扣掉常量开销后，80MB 的瞬时排队就是「一次相位切换即被回收」的量级 —— 这正是 B 批 6 条同毫秒 Internal 的成因（同一 isolate 上的多条连接被一起拆）。
+
+### 11.4 修复：`WS_DOWNLINK_BURST_KB`（把突发额度与速率解耦）
+
+- 新增 env `WS_DOWNLINK_BURST_KB`，默认 `2048`（2MB/连接）；
+- 容量 = `clamp(min(速率, 突发额度), 下限 4 × 读块 = 256KiB)`；
+- **显式 `0` = 回滚**（容量重新等于速率，即改动前行为）；
+- 速率 `WS_DOWNLINK_BPS` 语义不变（长期平均），只是不再顺带决定突发额度。
+
+验证见 `tools/ws-downlink-frame.test.mjs` 用例 13：`burst=256KB + rate=1MB/s` 时 500ms 内送达 < 1MiB（旧行为 ≈1.5MiB），且余下字节最终全部到齐；`burst=0` 时 500ms 内 ≥ 1MiB（旧行为）。两条都断言"不丢字节"。
+
+### 11.5 还要注意的两点
+
+1. **测速目标不在内置白名单**：`isSpeedTestSite` 只匹配 `speed.cloudflare.com` / `cp.cloudflare.com`（[unified.ts:1042–1046](src/protocols/websocket/unified.ts#L1042-L1046)），`speedtest.hnd.fdcservers.net:8080` 是**真的从 Worker 出站到公网**，属于大流量隧道；
+2. **这类日志该按 outcome 过滤，不是修**：`Internal` / `loadShed` 是平台侧；只有 `exception` 才是代码问题。测速本身产生一批 Internal 属预期噪声。
+
+---
 ## 附录 A：字段与代码索引
 
 | 主题 | 位置 |

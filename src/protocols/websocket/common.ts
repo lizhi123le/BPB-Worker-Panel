@@ -1237,11 +1237,11 @@ const WS_SESSION_MAX_MB_DEFAULT = 900;
  * 一旦客户端链路远低于这个值，无界排队就会被压成稳定速率，而不是一直涨到 isolate 被打死。
  * 链路更快（>80Mbps）的部署在跑大文件下载时会被这个上限压住，需要时上调或设 `0` 关闭。
  *
- * 为什么从 20MB/s 下调：令牌桶容量 = 本速率（见 createByteGovernor），所以这个值同时是
- * 「单次突发额度」。20MB/s 对常见客户端（3~6MB/s）等于**令牌永远够用 → 节流从不等待 →
- * 流控实际不生效**，isolate 发送队列继续无界堆积，最终被平台以 `internal error;
- * reference = …` 收口（同 isolate 上的在途请求一并失败）。10MB/s 既能保住 4K 余量，
- * 又能让节流在真实链路上真正咬住。
+ * 为什么从 20MB/s 下调：旧实现的令牌桶容量 = 本速率，于是这个值同时决定了「单次突发额度」。
+ * 20MB/s 对常见客户端（3~6MB/s）等于**令牌永远够用 → 节流从不等待 → 流控实际不生效**，
+ * isolate 发送队列继续无界堆积，最终被平台以 `internal error; reference = …` 收口
+ * （同 isolate 上的在途请求一并失败）。10MB/s 既能保住 4K 余量，又能让节流在真实链路上咬住；
+ * 突发额度已由 `WS_DOWNLINK_BURST_KB` 单独控制（见 downlinkBurstBytes），不再随速率一起放大。
  *
  * ⚠️ 它是**全量下行**的上限，不分协议。
  */
@@ -1277,11 +1277,34 @@ function downlinkByteRate(): number {
 }
 
 /**
- * 字节令牌桶。容量取 `max(速率, 4 × 读块)`：必须**大于单块上限**，否则「块大于桶」
- * 会让 take() 永远等不满而死锁。等待一律让出事件循环（1~50ms 分片），不做忙等。
+ * 下行「突发额度」（字节）：令牌桶**容量**，与速率解耦。
+ *
+ * 为什么必须解耦：桶容量决定了「一条连接在开始被限速之前能灌多少字节进运行时队列」。
+ * 旧实现容量 = 速率，于是 `WS_DOWNLINK_BPS=10MB/s` 意味着**每条连接可瞬时灌 10MB**；
+ * 现场测速场景同时开 8 条 → 瞬时额度 80MB，128MB 的 isolate 直接被顶到平台回收
+ * （表现仍是 `internal error; reference = …`，而不是 1102）。速率与突发是两件事：
+ * 前者是长期平均，后者是单次尖峰的内存风险，必须分开设。
+ *
+ * env `WS_DOWNLINK_BURST_KB`（KB）：未设取 2048（2MB）；**显式 0 = 沿用旧行为（容量 = 速率）**，
+ * 作为回滚开关。本函数只算「策略」，`4 × 读块` 这个下界由 createByteGovernor 单独兜（唯一一处），
+ * 避免两处各写一遍同一条不变式。
  */
-function createByteGovernor(bytesPerSec: number) {
-    const capacity = Math.max(bytesPerSec, 4 * DOWNLOAD_BLOCK_SIZE);
+const WS_DOWNLINK_BURST_KB_DEFAULT = 2048;
+
+function downlinkBurstBytes(bytesPerSec: number): number {
+    const kb = envNumber('WS_DOWNLINK_BURST_KB', WS_DOWNLINK_BURST_KB_DEFAULT, true);
+    // 显式 0：容量退回「速率」，即改动前的行为
+    if (!kb) return bytesPerSec;
+    return Math.min(bytesPerSec, Math.floor(kb * 1024));
+}
+
+/**
+ * 字节令牌桶。容量由调用方给定（见 {@link downlinkBurstBytes}），但恒 ≥ `4 × 读块`：
+ * 必须**大于单块上限**，否则「块大于桶」会让 take() 永远等不满而死锁。
+ * 等待一律让出事件循环（1~50ms 分片），不做忙等。
+ */
+function createByteGovernor(bytesPerSec: number, capacityBytes: number) {
+    const capacity = Math.max(4 * DOWNLOAD_BLOCK_SIZE, capacityBytes);
     let credit = capacity;
     let last = Date.now();
     let waitedMs = 0;
@@ -1543,7 +1566,7 @@ async function remoteSocketToWS(
     let budgetExceeded = false;
     // 下行速率上限（默认关闭，见 downlinkByteRate 注释）：平台没有发送侧背压，这是唯一流控点
     const downlinkRate = downlinkByteRate();
-    const governor = downlinkRate ? createByteGovernor(downlinkRate) : null;
+    const governor = downlinkRate ? createByteGovernor(downlinkRate, downlinkBurstBytes(downlinkRate)) : null;
     // 1 秒粒度仪表：默认跟随面板 Log Level=debug；`WS_DOWNLINK_STATS=1` 可单独打开
     // （运维只想快照一行吞吐、不想为此改面板设置；测试也用它，避免依赖 KV 里的 settings）
     const statsOn = (globalThis as any).settings?.logLevel === 'debug'
