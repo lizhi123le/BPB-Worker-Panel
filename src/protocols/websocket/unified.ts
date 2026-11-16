@@ -114,7 +114,7 @@ export { getXPaddingIdentifier } from '@utils';
  * + 下行合批缓冲 1~2 × 24~40KiB（首次 flush 才分配第二块）
  * + 上行合批缓冲 1~2 × 32KiB
  * 典型 ≈ 136KiB，最坏 ≈ 336KiB（三条都吃满）；128 条即 17MiB ~ 43MiB，256 条即 34MiB ~ 86MiB。
- * 上行积压另有 isolate 级预算（WS_UPLINK_ISOLATE_MB = 32，按建连时的活动连接数折算），
+ * 上行积压另有 isolate 级预算（WS_UPLINK_ISOLATE_MB = 16，按建连时的活动连接数折算），
  * 因此"每连接有界、整体无界"这个漏洞已经堵住（注意：折算是**建连时一次性的**，
  * 不是实时总账，见 uplinkIsolateCap 的说明）；剩下的是缓冲本身。
  *
@@ -151,11 +151,11 @@ function wsMaxConnections(): number {
  * 测试也用它把阈值压到可触发的小值。非法值回退默认，绝不放行成无上限。
  *
  * ⚠️ 已知近似（不是实时总账）：折算发生在**建连那一刻**，之后每个连接按自己的静态上限运行。
- * 因此「32MiB 总预算」只在建连瞬间成立 —— 早建的连接保留较大额度，且每连接下限 256KiB
- * 会让并发超过 128 条后总额度超出 32MiB（上限仍被 WS_MAX_CONNECTIONS × 256KiB 钉死）。
+ * 因此「16MiB 总预算」只在建连瞬间成立 —— 早建的连接保留较大额度，且每连接下限 256KiB
+ * 会让并发超过 64 条后总额度超出 16MiB（上限仍被 WS_MAX_CONNECTIONS × 256KiB 钉死）。
  * 要真正做成 isolate 总账，得改成按帧共享计数器计费/退还。
  */
-const WS_UPLINK_ISOLATE_MB = 32;
+const WS_UPLINK_ISOLATE_MB = 16;
 const WS_UPLINK_PER_CONN_FLOOR = 256 * 1024;
 
 function uplinkIsolateCap(): number {

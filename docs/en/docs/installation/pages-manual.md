@@ -135,7 +135,7 @@ These environment variables control the reverse-proxy used to disguise the panel
 | `MASK_CACHE_NOISE_EXTRA` | *(empty)* | Extra query parameters to ignore in the cache key. ⚠️ Only parameters that never change content — adding `id`/`page`/`token` merges different pages into one cache entry. |
 | `MASK_CACHE_TS_NORM` | `1` | `0` disables timestamp normalisation (rollback switch). |
 | `MASK_IMG_MODE` | `shell` | `data` restores the legacy inline `data:` URI image page (rollback switch). |
-| `WS_UPLINK_ISOLATE_MB` | `32` | Isolate-wide uplink buffering budget (MB), split across active WebSockets. |
+| `WS_UPLINK_ISOLATE_MB` | `16` | Isolate-wide uplink buffering budget (MB), split across active WebSockets (per-connection floor 256 KiB). |
 | `WS_MAX_CONNECTIONS` | `128` | WebSocket connections per isolate (clamped 1–1024; `0`/invalid → default). ≈136 KiB of buffers per connection (worst ≈336 KiB), so 128 ≈ 17–43 MiB of the 128 MB isolate; raise it only if you watch memory. |
 | `WS_DOWNLINK_BPS` | `10000000` | Downlink rate cap in **bytes per second** (10 MB/s ≈ 80 Mbps) — the only downlink flow control that exists, since the Workers `WebSocket` has no `bufferedAmount` and `send()` returns `void`. Raise it for >80 Mbps links, or set `0` to disable. The burst allowance is a separate knob (`WS_DOWNLINK_BURST_KB`). |
 | `WS_DOWNLINK_BURST_KB` | `2048` | Per-connection burst allowance (bucket capacity) in KiB, floored at 256 KiB. Decoupled from the rate so that 8 parallel connections (e.g. a speed test) queue 16 MiB instead of `8 × rate`. `0` restores capacity = rate. |

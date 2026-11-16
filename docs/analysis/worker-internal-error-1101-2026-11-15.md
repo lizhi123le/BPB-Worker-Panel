@@ -319,7 +319,7 @@ console.error('[stream] upstream dropped', { path, upstream, ... });
 | `WS_DOWNLINK_BURST_KB` | `2048`（2026-11-16 新增） | 保持 2048（2MB/连接） | 令牌桶容量=单连接瞬时突发额度；8 条并发 = 16MB，而不是「8 × 速率」 |
 | `WS_SESSION_MAX_MB` | `900`（[common.ts:1230](src/protocols/websocket/common.ts#L1230)） | 保持 900 | 单连接字节预算，撞线主动断开让客户端重连（可控断开 > 平台打死 isolate） |
 | `WS_MAX_CONNECTIONS` | `128`（[unified.ts:134](src/protocols/websocket/unified.ts#L134)） | 保持 128 | isolate 级并发；调高会线性抬高内存水位 |
-| `WS_UPLINK_ISOLATE_MB` | `32`（[unified.ts:163](src/protocols/websocket/unified.ts#L163)） | 保持 32 | 上行积压 isolate 预算（按连接数折算） |
+| `WS_UPLINK_ISOLATE_MB` | ~~`32`~~ → **`16`**（[unified.ts:158](src/protocols/websocket/unified.ts#L158)，2026-11-16 已改默认） | 保持 16 | 上行积压 isolate 预算（按连接数折算，每连接下限 256KiB） |
 | `WS_DOWNLINK_STATS` | `0` | 校准期设 `1` | 打开后每秒一行 `downlink … cap=… capWait=…ms/…ms` |
 | `XP_*`（XHTTP 入站） | 见 [xp/handler.ts:57–66](src/protocols/xp/handler.ts#L57-L66) | 默认即可 | XHTTP 有自己的积压窗口（`XP_MAX_QUEUED_MB=8`、`XP_QUEUE_GRACE_S=15`），比 WS 侧更严格 |
 
