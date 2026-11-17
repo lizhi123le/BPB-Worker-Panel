@@ -1,8 +1,8 @@
 {
   "_note": "体积/单行参数的**生效中**配置（本文件即被 scripts/build-params.mjs 读取的 harden.config.json）。需要模板/示例请看 harden.config.example.json（不会被任何脚本读取）；优先级 CLI > 环境变量 > 本文件 > 默认值。",
   "_format": "targetBytes/targetZipBytes 支持 320000、320k、1m、75%（百分比相对首次混淆产物）；0 = 关闭该限制",
-  "_note_size_history": "2026-11 XHTTP 传输上线（入站 handler + xray/clash 节点生成）后源码增大约 23KB，原 522k/232k 在混淆阶段已无可行候选。此后改为按「实测最小可达成值 + 余量」上调。 / 2026-11 伪装面形态适配（熔断令牌桶 / 缓存键时间戳归一 / 图片壳页 / Range+内容哈希 ETag）+ WS 数据面零拷贝与背压：实测 577.8k / zip 255.5k。 / 2026-11 审查修复轮（B/S/P/D/H 共 60+ 项）后实测 592,327 B / zip 275,830 B：raw 距 580k 只剩 1,593 B（0.27%）、zip 距 280k 剩 10,890 B（3.8%）。 / ⚠️ 真实约束不是「构建失败」而是「混淆强度被静默降级」：obfuscate.mjs 会二分搜索「刚好达标的最小 minConcealedLength」，实测本轮 21→592.9k 达标、24→590.3k、32→588.9k，即每抬高 3 档可再挤约 2.6KB，代价是长度 21~31 的字符串不再密文化。**改动前请先按此表规划，不要以为撞到 593,920 才会出问题。**",
-  "targetBytes": "580k",
+  "_note_size_history": "2026-11 XHTTP 传输上线（入站 handler + xray/clash 节点生成）后源码增大约 23KB，原 522k/232k 在混淆阶段已无可行候选。此后改为按「实测最小可达成值 + 余量」上调。 / 2026-11 伪装面形态适配（熔断令牌桶 / 缓存键时间戳归一 / 图片壳页 / Range+内容哈希 ETag）+ WS 数据面零拷贝与背压：实测 577.8k / zip 255.5k。 / 2026-11 审查修复轮（B/S/P/D/H 共 60+ 项）后实测 592,327 B / zip 275,830 B：raw 距 580k 只剩 1,593 B（0.27%）、zip 距 280k 剩 10,890 B（3.8%）。 / ⚠️ 真实约束不是「构建失败」而是「混淆强度被静默降级」：obfuscate.mjs 会二分搜索「刚好达标的最小 minConcealedLength」，实测本轮 21→592.9k 达标、24→590.3k、32→588.9k，即每抬高 3 档可再挤约 2.6KB，代价是长度 21~31 的字符串不再密文化。**改动前请先按此表规划，不要以为撞到 593,920 才会出问题。** / 2026-11 伪装面阈值可配化（MASK_TEXT_REWRITE_MAX / MASK_IMG_CACHE_MAX / MASK_IMG_CACHE_BYTES）+ 阈值表重构：混淆输入只增 601 B（551,800 → 552,401），但 580k 目标下搜索把门槛从 20 顶到 23（实测 591,929 B / zip 275,347 B）—— 0.6KB 的增量换掉了 3 档混淆。为把门槛换回 20，targetBytes 580k → 600k。**这正是上面那句警告的实例：撞线时先看档位，不要只看字节数。** / 2026-11 实测（targetBytes=600k 后）：搜索落在 minConcealedLength=**16**（比原来的 20 更强），raw 602,996 B / zip 285,499 B。⚠️ 此时**瓶颈已从 raw 变为 zip**：zip 距 280k 只剩 1,221 B（raw 还剩 11,404 B）。再加代码请先看 zip，必要时把 targetZipBytes 一并上调。",
+  "targetBytes": "600k",
   "targetZipBytes": "280k",
   "maxRuns": 20,
   "oneLine": true

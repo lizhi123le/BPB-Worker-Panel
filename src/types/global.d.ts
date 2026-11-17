@@ -72,6 +72,12 @@ declare global {
         readonly MASK_CACHE_NOISE_EXTRA?: string;
         /** 伪装图片形态（'data' = 回滚到 base64 内联） */
         readonly MASK_IMG_MODE?: string;
+        /** 单响应文本改写上限（字节，默认 1048576；低于 65536 回退默认） */
+        readonly MASK_TEXT_REWRITE_MAX?: string;
+        /** 伪装图片缓存张数上限（默认 12；小于 1 或非法回退默认） */
+        readonly MASK_IMG_CACHE_MAX?: string;
+        /** 伪装图片缓存总字节预算（默认 8388608；低于 65536 回退默认） */
+        readonly MASK_IMG_CACHE_BYTES?: string;
         /** 强制启用 HSTS（'1' / 'true'） */
         readonly HSTS_ENABLE?: string;
         /** 反代池缓存的调试日志开关 */

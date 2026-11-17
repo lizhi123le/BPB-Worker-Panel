@@ -146,6 +146,9 @@ These variables control the reverse-proxy used to disguise the panel domain. **A
 | `MASK_TEXT_BPS` | `1048576` | Sustained **rewritten text** bytes/second. This is the real CPU driver (decode + replace + encode). |
 | `MASK_TEXT_CAP` | `16777216` | Burst capacity for rewritten text. Keep it comfortably larger than your largest page. |
 | `MASK_TEXT_IP_CAP` | `4194304` | Per-IP rewritten-text budget per 60 s window. Prevents one IP from exhausting the whole isolate. Minimum accepted value: `65536`. |
+| `MASK_TEXT_REWRITE_MAX` | `1048576` | Maximum bytes of **one response** that get rewritten. It is also the threshold for the buffered (cacheable) branch: a body at or above it is streamed and, past the limit, forwarded **unrewritten** — that tail leaks the upstream hostname. Keep it well below `MASK_TEXT_IP_CAP`, otherwise a single large page drains the per-IP budget and every later request from that IP gets the 1101 page (an enumerable fingerprint). Minimum accepted value: `65536`. |
+| `MASK_IMG_CACHE_MAX` | `12` | How many images the disguise keeps in the isolate cache. Raising it trades memory for a better hit rate on image-heavy disguise targets. Values below `1` fall back to the default. |
+| `MASK_IMG_CACHE_BYTES` | `8388608` | Total bytes of cached image bodies per isolate. An image larger than this budget is **not cached at all** (it would evict every other image while still occupying the memory). Minimum accepted value: `65536`. |
 | `MASK_CACHE_NOISE_EXTRA` | *(empty)* | Comma-separated extra query parameters to ignore when building the cache key. ⚠️ **Only add parameters that never change the content** — adding `id`, `page` or `token` will make different pages share one cache entry. |
 | `MASK_CACHE_TS_NORM` | `1` | Set to `0` to disable timestamp normalisation in cache keys (rollback switch). |
 | `MASK_IMG_MODE` | `shell` | Set to `data` to fall back to the legacy single-response inline `data:` URI image page (rollback switch). |

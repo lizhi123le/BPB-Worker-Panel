@@ -132,6 +132,9 @@ These environment variables control the reverse-proxy used to disguise the panel
 | `MASK_TEXT_BPS` | `1048576` | Sustained **rewritten text** bytes/second — the real CPU driver. |
 | `MASK_TEXT_CAP` | `16777216` | Burst capacity for rewritten text; keep it larger than your biggest page. |
 | `MASK_TEXT_IP_CAP` | `4194304` | Per-IP rewritten-text budget per 60 s (minimum `65536`). |
+| `MASK_TEXT_REWRITE_MAX` | `1048576` | Maximum bytes of one response that get rewritten; past it the tail is forwarded **unrewritten** (leaks the upstream hostname). Keep it well below `MASK_TEXT_IP_CAP` (minimum `65536`). |
+| `MASK_IMG_CACHE_MAX` | `12` | Number of images kept in the isolate cache (memory ↔ hit-rate trade-off). |
+| `MASK_IMG_CACHE_BYTES` | `8388608` | Total cached image bytes per isolate; a single image larger than this is not cached at all (minimum `65536`). |
 | `MASK_CACHE_NOISE_EXTRA` | *(empty)* | Extra query parameters to ignore in the cache key. ⚠️ Only parameters that never change content — adding `id`/`page`/`token` merges different pages into one cache entry. |
 | `MASK_CACHE_TS_NORM` | `1` | `0` disables timestamp normalisation (rollback switch). |
 | `MASK_IMG_MODE` | `shell` | `data` restores the legacy inline `data:` URI image page (rollback switch). |

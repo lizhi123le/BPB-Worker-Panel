@@ -27,7 +27,15 @@ import { clientIp } from './client-ip';
  */
 
 const MASK_HOME_CACHE_TTL = 300000;       // 5 分钟
-const MASK_IMAGE_CACHE_MAX = 12;          // 图片缓存最大张数
+/**
+ * 图片缓存的出厂默认值（张数 / 总字节）。**两者都可 env 覆盖**：`MASK_IMG_CACHE_MAX` /
+ * `MASK_IMG_CACHE_BYTES`（见 readBudgetConfig）。
+ *
+ * 为什么做成可配：壳页的命中率直接决定「图片路径是否回源」，而访客量级与图源单图体积
+ * （几十 KB ~ 2 MB）能差两个数量级 —— 写死 12 张在大图床上几乎等于「每次都回源」，
+ * 在小图上又白占内存。改这两个值同样受「单条超预算不入缓存」约束（见 cacheImageEntry）。
+ */
+const MASK_IMAGE_CACHE_MAX_DEFAULT = 12;
 /**
  * 图片缓存的**总字节预算**（按缓存的**原始字节**计）。
  *
@@ -35,18 +43,33 @@ const MASK_IMAGE_CACHE_MAX = 12;          // 图片缓存最大张数
  * 复用同一份字节，因此既省掉整段 base64，也让内存口径从「HTML（膨胀 4/3）」回到 raw。
  * 仍必须按字节封顶：12 张 × 2MB 会逼近 isolate 的 128MB 并对 GC 形成持续压力。
  */
-const MASK_IMAGE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const MASK_IMAGE_CACHE_MAX_BYTES_DEFAULT = 8 * 1024 * 1024;
 const MASK_HOME_CACHE_MAX = 100;          // 文本缓存最大条目
 /**
  * 首页缓存的**总字节预算**。这是本文件里最关键的资源上限：
- * isolate 内存只有 128MB，而单条缓存正文最长可达 TEXT_REWRITE_MAX（1MB）。
+ * isolate 内存只有 128MB，而单条缓存正文最长可达 `TEXT_REWRITE_MAX_DEFAULT`（默认 1MB，
+ * 可用 env `MASK_TEXT_REWRITE_MAX` 调大 —— 调大后这条预算的相对权重同步上升）。
  * 只按「条目数」限流时，100 条 × 1MB = 100MB，缓存本身就是内存炸弹 ——
  * 逼近上限后 V8 会持续高强度 GC，而 GC 消耗的是**CPU 时间**，
  * 表现为「CPU 超限规律性复发」而不是内存报错。因此必须按字节封顶。
  * 4MB 相对 128MB 只是零头，命中率损失远小于 GC 抖动带来的代价。
  */
 const MASK_HOME_CACHE_MAX_BYTES = 4 * 1024 * 1024;
-const TEXT_REWRITE_MAX = 1 * 1024 * 1024; // 1MB
+/**
+ * 单响应改写上限的出厂默认值（字节）。env `MASK_TEXT_REWRITE_MAX` 可覆盖（见 readBudgetConfig）。
+ *
+ * ⚠️ 它同时是三个东西的边界，改动前请一起读：
+ *  1. **缓冲分支的门槛**（`contentLength < 它` 才整份读取 + 改写 + 可缓存，见 camouflageProxy）；
+ *  2. **流式分支的切断点**（越过它余下一律原样流出，见 streamWithBudgetRewrite）；
+ *  3. 首页缓存**单条正文**的上界（缓存条目越大，`MASK_HOME_CACHE_MAX_BYTES` 装得下的条数越少）。
+ *
+ * 上界受两个因素夹住：isolate 128MB（`collected` 会整份累积）；以及单 IP 额度
+ * `MASK_TEXT_IP_CAP`（默认 4MiB/60s）—— 调大它意味着「一个页面就吃掉单 IP 额度的一大半」，
+ * 之后同 IP 的请求统一 1101，反而变成「该站大页面必错」这种可枚举指纹。
+ */
+const TEXT_REWRITE_MAX_DEFAULT = 1 * 1024 * 1024; // 1MB
+/** 下界：低于它连一个读块/页面头都装不下，等于把改写关掉（同 `MASK_TEXT_*` 的回退语义） */
+const TEXT_REWRITE_MAX_MIN = 64 * 1024;
 const FETCH_TIMEOUT = 39000;
 
 /**
@@ -72,11 +95,12 @@ const FETCH_TIMEOUT = 39000;
  *  - textBytes 采用「先预留、按实际改写量结算退款」。额度不足时**降级为 1101，而不是把
  *    `未改写的正文原样流出`** —— 未改写正文里带着上游域名，是伪装面最硬的指纹。
  *
- *    ⚠️ 已知遗留（不是本规则能覆盖的）：`streamWithBudgetRewrite` 在单个响应**超过
- *    `TEXT_REWRITE_MAX`（1MB）** 时会停止改写、把尾部原样流出，那里确实会露出上游域名。
+ *    ⚠️ 已知遗留（不是本规则能覆盖的）：`streamWithBudgetRewrite` 在单个响应**超过改写上限
+ *    `TEXT_REWRITE_MAX_DEFAULT`（默认 1MB，env `MASK_TEXT_REWRITE_MAX` 可调）** 时会停止
+ *    改写、把尾部原样流出，那里确实会露出上游域名。
  *    它由体积触发（与额度无关），且既有测试显式钉住了这个行为
  *    （`tools/camouflage-cpu.test.mjs` 的「超大 chunked：预算外部分原样保留」）。
- *    换言之：**≤1MB 的文本永远不会流出未改写内容；>1MB 的尾部仍会**，属于待办而非已修。
+ *    换言之：**上限以内的文本永远不会流出未改写内容；越过上限的尾部仍会**，属于待办而非已修。
  *  - 所有阈值可用 env 覆盖；非法值回退默认并 warn，**绝不 fail-open 成无上限**。
  */
 const MASK_REQ_RATE_DEFAULT = 20;                  // 令牌/秒
@@ -93,6 +117,12 @@ interface BudgetConfig {
     textRate: number;
     textCap: number;
     textPerIp: number;
+    /** 单响应改写上限（字节） */
+    rewriteMax: number;
+    /** 图片缓存张数上限 */
+    imgCacheMax: number;
+    /** 图片缓存总字节预算 */
+    imgCacheBytes: number;
 }
 
 type TokenBucket = { tokens: number; last: number };
@@ -104,36 +134,61 @@ const maskDegradeLogAt: Record<string, number> = { req: 0, text: 0 };
 /** 「生效阈值只在 env 变化时打一行」的闸门（与连接上限、会话看门狗共用同一实现） */
 const budgetGate = createSignatureGate();
 
+/**
+ * 阈值表 —— **唯一来源**：名字、默认值、下界、取整规则、落到哪个字段，只写这一次。
+ * readBudgetConfig 按它读，logBudgetOnce 按它对比和打印。
+ *
+ * 为什么不用「代码里逐个 pick() + 平行数组做回退提示」：那样加一个 knob 要同步改三处
+ * （读取、sig、names），漏一处就是「回退提示指向错的 env」；而且每个 env 名会以
+ * 字符串字面量出现两次（字面量在混淆阶段不可密文化，属于纯体积损失）。
+ */
+type BudgetSpec = {
+    readonly key: string;
+    readonly field: keyof BudgetConfig;
+    readonly def: number;
+    readonly min: number;
+    /** 非负整数（张数这类） */
+    readonly int?: boolean;
+};
+
+const BUDGET_SPEC: readonly BudgetSpec[] = [
+    { key: 'MASK_REQ_BPS', field: 'reqRate', def: MASK_REQ_RATE_DEFAULT, min: 1 },
+    { key: 'MASK_REQ_CAP', field: 'reqCap', def: MASK_REQ_CAP_DEFAULT, min: 1 },
+    { key: 'MASK_TEXT_BPS', field: 'textRate', def: MASK_TEXT_RATE_DEFAULT, min: 1024 },
+    { key: 'MASK_TEXT_CAP', field: 'textCap', def: MASK_TEXT_CAP_DEFAULT, min: 64 * 1024 },
+    { key: 'MASK_TEXT_IP_CAP', field: 'textPerIp', def: MASK_TEXT_PER_IP_DEFAULT, min: 64 * 1024 },
+    { key: 'MASK_TEXT_REWRITE_MAX', field: 'rewriteMax', def: TEXT_REWRITE_MAX_DEFAULT, min: TEXT_REWRITE_MAX_MIN },
+    { key: 'MASK_IMG_CACHE_MAX', field: 'imgCacheMax', def: MASK_IMAGE_CACHE_MAX_DEFAULT, min: 1, int: true },
+    { key: 'MASK_IMG_CACHE_BYTES', field: 'imgCacheBytes', def: MASK_IMAGE_CACHE_MAX_BYTES_DEFAULT, min: 64 * 1024 }
+];
+
 function readBudgetConfig(env: any): BudgetConfig {
     // 非法值（NaN / 负数 / 过小）一律回退默认：设错 env 不能让伪装面全挂，
     // 也不能反过来 fail-open 把三轮才稳住的 CPU 保护静默撤掉
-    const pick = (raw: unknown, def: number, min: number): number => {
-        if (raw === undefined || raw === null || raw === '') return def;
-        const v = Number(raw);
-        return Number.isFinite(v) && v >= min ? v : def;
-    };
-    return {
-        reqRate: pick(env?.MASK_REQ_BPS, MASK_REQ_RATE_DEFAULT, 1),
-        reqCap: pick(env?.MASK_REQ_CAP, MASK_REQ_CAP_DEFAULT, 1),
-        textRate: pick(env?.MASK_TEXT_BPS, MASK_TEXT_RATE_DEFAULT, 1024),
-        textCap: pick(env?.MASK_TEXT_CAP, MASK_TEXT_CAP_DEFAULT, 64 * 1024),
-        textPerIp: pick(env?.MASK_TEXT_IP_CAP, MASK_TEXT_PER_IP_DEFAULT, 64 * 1024)
-    };
+    const cfg = {} as BudgetConfig;
+    for (const spec of BUDGET_SPEC) {
+        const raw = env?.[spec.key];
+        const num = raw === undefined || raw === null || raw === '' ? NaN : Number(raw);
+        const value = Number.isFinite(num) && num >= spec.min ? num : spec.def;
+        cfg[spec.field] = spec.int ? Math.floor(value) : value;
+    }
+    return cfg;
 }
 
 /** 生效阈值只在 env 变化时打一行，便于灰度期核对，避免每请求刷日志 */
 function logBudgetOnce(env: any, cfg: BudgetConfig): void {
-    const raw = [env?.MASK_REQ_BPS, env?.MASK_REQ_CAP, env?.MASK_TEXT_BPS, env?.MASK_TEXT_CAP, env?.MASK_TEXT_IP_CAP];
-    if (raw.every((v) => v === undefined || v === null || v === '')) return;
-    const sig = raw.join('|');
+    const isEmpty = (v: unknown): boolean => v === undefined || v === null || v === '';
+    const rows = BUDGET_SPEC.map((spec) => ({ spec, raw: env?.[spec.key] as unknown }));
+    if (rows.every(({ raw }) => isEmpty(raw))) return;
+    const sig = rows.map(({ raw }) => String(raw ?? '')).join('|');
     if (!budgetGate.isNew(sig)) return;
-    console.log(`[伪装熔断] 生效阈值 req=${cfg.reqRate}/s cap=${cfg.reqCap} text=${cfg.textRate}B/s cap=${cfg.textCap}B perIP=${cfg.textPerIp}B`);
+    console.log(`[伪装熔断] 生效阈值 req=${cfg.reqRate}/s cap=${cfg.reqCap} text=${cfg.textRate}B/s`
+        + ` cap=${cfg.textCap}B perIP=${cfg.textPerIp}B rewriteMax=${cfg.rewriteMax}B`
+        + ` imgCache=${cfg.imgCacheMax}张/${cfg.imgCacheBytes}B`);
     // 设错 env 必须可见：回退是静默的，但"回退了哪个"要能一眼看出来（限频同上一行）
-    const eff = [cfg.reqRate, cfg.reqCap, cfg.textRate, cfg.textCap, cfg.textPerIp];
-    const names = ['MASK_REQ_BPS', 'MASK_REQ_CAP', 'MASK_TEXT_BPS', 'MASK_TEXT_CAP', 'MASK_TEXT_IP_CAP'];
-    const bad = raw
-        .map((v, i) => (v === undefined || v === null || v === '' || Number(v) === eff[i] ? null : names[i]))
-        .filter((v): v is string => v !== null);
+    const bad = rows
+        .filter(({ spec, raw }) => !isEmpty(raw) && Number(raw) !== cfg[spec.field])
+        .map(({ spec }) => spec.key);
     if (bad.length) console.warn(`[伪装熔断] 非法或过低、已回退默认值的 env：${bad.join(', ')}`);
 }
 
@@ -166,7 +221,7 @@ function returnTokens(bucket: TokenBucket, cap: number, amount: number): void {
 
 /**
  * 单次**准入**成本。实际改写量在结算时按真实字节扣/退，因此准入只需要一个小的、稳定的
- * 门槛值 —— 若按"整页大小"或"TEXT_REWRITE_MAX"预留，并发几个未知长度的文本响应就会把
+ * 门槛值 —— 若按"整页大小"或"`budget.rewriteMax`"预留，并发几个未知长度的文本响应就会把
  * per-IP 额度吃光（评审 BLOCKER：4 个并发 1MiB 预留 = 4MiB 上限直接见底）。
  */
 const TEXT_ADMIT_COST = 64 * 1024;
@@ -776,16 +831,23 @@ function buildImageDataPage(body: ArrayBuffer, contentType: string, reqURL: URL)
     return buildImagePageHtml(reqURL, `data:${contentType || 'image/jpeg'};base64,${bytesToBase64(body)}`);
 }
 
-/** 图片缓存写入：张数上限 + **总字节预算**双天花板，Map 插入顺序即淘汰顺序（FIFO） */
-function cacheImageEntry(url: string, entry: ImageCacheEntry): void {
+/**
+ * 图片缓存写入：张数上限 + **总字节预算**双天花板，Map 插入顺序即淘汰顺序（FIFO）。
+ * 两个天花板都来自 `BudgetConfig`（env `MASK_IMG_CACHE_MAX` / `MASK_IMG_CACHE_BYTES`）。
+ */
+function cacheImageEntry(url: string, entry: ImageCacheEntry, budget: BudgetConfig): void {
     const prev = maskImageCache.get(url);
     if (prev) {
         maskImageCacheBytes -= prev.bytes;
         maskImageCache.delete(url);
     }
-    // 单条上限由 fetchImageLoad（≤2MB 才缓冲）保证，这里只需维持字节预算与张数上限
-    while (maskImageCache.size && (maskImageCache.size >= MASK_IMAGE_CACHE_MAX
-        || maskImageCacheBytes + entry.bytes > MASK_IMAGE_CACHE_MAX_BYTES)) {
+    // 单张超预算直接不入缓存：否则它会在下面的淘汰循环里把所有已缓存图片清空，自己留下来 ——
+    // 命中率归零而内存照占（与首页缓存 cacheHomeEntry 的同一条判据）。默认 8MiB 下不可达
+    // （单张 ≤ MASK_IMAGE_MAX_BUFFER=2MiB），但字节预算可被 env 调小到 64KiB。
+    if (entry.bytes > budget.imgCacheBytes) return;
+    // 单条上限另由 fetchImageLoad（≤2MB 才缓冲）保证，这里只需维持字节预算与张数上限
+    while (maskImageCache.size && (maskImageCache.size >= budget.imgCacheMax
+        || maskImageCacheBytes + entry.bytes > budget.imgCacheBytes)) {
         const oldest = maskImageCache.keys().next();
         if (oldest.done) break;
         const victim = maskImageCache.get(oldest.value);
@@ -826,7 +888,7 @@ type ImageLoad =
 const maskImageLoading = new Set<string>();
 
 /** 取图（缓存优先、并发合并）；返回 null 表示「不是图片/失败」→ 调用方降级普通反代 */
-async function fetchImageLoad(maskURL: URL): Promise<ImageLoad | null> {
+async function fetchImageLoad(maskURL: URL, budget: BudgetConfig): Promise<ImageLoad | null> {
     const url = maskURL.href;
     return await crossRequestSingleFlight<ImageLoad>(
         maskImageLoading,
@@ -859,7 +921,7 @@ async function fetchImageLoad(maskURL: URL): Promise<ImageLoad | null> {
                             time: Date.now(),
                             bytes: body.byteLength,
                             etag
-                        });
+                        }, budget);
                     }
                     return { kind: 'bytes', body, status: resp.status, contentType, etag };
                 }
@@ -957,9 +1019,10 @@ async function buildImagePageResponse(
     request: Request,
     reqURL: URL,
     maskURL: URL,
-    env: any
+    env: any,
+    budget: BudgetConfig
 ): Promise<Response | null> {
-    const load = await fetchImageLoad(maskURL);
+    const load = await fetchImageLoad(maskURL, budget);
     if (!load) return null;
 
     if (load.kind === 'bytes') {
@@ -1025,10 +1088,10 @@ function placeholderImageResponse(request: Request, env: any, status = 200): Res
  *  - `Accept-Ranges` + 单段 206：字节已在内存里，切片近乎零成本；
  *  - `Last-Modified` 取缓存条目时间，与 `If-Modified-Since` 配合。
  */
-async function serveMaskedImage(paramValue: string, request: Request, env: any): Promise<Response> {
+async function serveMaskedImage(paramValue: string, request: Request, env: any, budget: BudgetConfig): Promise<Response> {
     const maskURL = findMaskURLByHash(paramValue);
     if (!maskURL) return placeholderImageResponse(request, env);
-    const load = await fetchImageLoad(maskURL);
+    const load = await fetchImageLoad(maskURL, budget);
     // B-28：取图失败也走中性占位图 —— 裸 503（无 Content-Type/nosniff/HSTS）与同文件其它
     // 兜底响应的头策略不一致，而这正是「这台部署有没有在代理图片」的旁路指纹。
     if (!load) return placeholderImageResponse(request, env);
@@ -1248,7 +1311,8 @@ function cacheHomeEntry(key: string, entry: CacheEntry): void {
  * 边流边改写：把上游 body 的每个 chunk 解码、替换 host、再编码流出。
  *
  * 为什么不用 `clone().text()` 一把梭：那会先把整份 body 读进内存再全量 replaceAll，
- * CPU 与体积线性相关。这里同一个 token 预算（TEXT_REWRITE_MAX）卡的是「累计已处理字节」，
+ * CPU 与体积线性相关。这里同一个 token 预算（`budget.rewriteMax`，env `MASK_TEXT_REWRITE_MAX`）
+ * 卡的是「累计已处理字节」，
  * 一旦超出预算立刻停止改写、把当前与后续 chunk 原样流出 —— 除了一次性的
  * 判断开销，CPU 不再随页面变大而增长。
  *
@@ -1298,10 +1362,10 @@ function streamWithBudgetRewrite(
             }
 
             // 预算耗尽：本 chunk 与后续一律原样流出，并放弃缓存
-            if (processed + chunk.byteLength > TEXT_REWRITE_MAX) {
+            if (processed + chunk.byteLength > budget.rewriteMax) {
                 rewritable = false;
                 collected = '';
-                console.warn(`伪装页超过 ${TEXT_REWRITE_MAX}B 改写预算，余下部分原样流出`);
+                console.warn(`伪装页超过 ${budget.rewriteMax}B 改写预算，余下部分原样流出`);
                 controller.enqueue(chunk);
                 return;
             }
@@ -1320,7 +1384,7 @@ function streamWithBudgetRewrite(
                 controller.enqueue(encoder.encode(rewrittenTail));
             }
 
-            // 按「实际改写过的字节」结算退款（预留的是 TEXT_REWRITE_MAX 上限）
+            // 按「实际改写过的字节」结算（预留的只是准入成本 TEXT_ADMIT_COST，见 reserveTextBudget）
             settleTextReservation(budget, reservation, processed);
 
             if (rewritable && cacheable) {
@@ -1398,12 +1462,12 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
     // 命中缓存零出站；未命中直接取图并回**图片字节**（绝不回壳页 HTML）。
     if (isImageTarget && reqURL.pathname === '/' && request.method !== 'POST') {
         const want = reqURL.searchParams.get(maskImgParamName());
-        if (want) return await serveMaskedImage(want, request, env);
+        if (want) return await serveMaskedImage(want, request, env, budget);
     }
 
     // 图片目标的常规请求：壳页（默认）/ data 页（回滚）。缓存字节命中时零上游。
     if (isImageTarget) {
-        const page = await buildImagePageResponse(request, reqURL, maskURL, env);
+        const page = await buildImagePageResponse(request, reqURL, maskURL, env, budget);
         if (page) return page;
     }
 
@@ -1438,7 +1502,7 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
     // 注意：准入额度已在函数开头（图片/缓存分支之前）判定，这里不再重复。
     // 文本改写的**字节**额度在下面两条文本分支里"先预留、按实际改写量结算"；
     // 额度不足时降级 1101，而不是把未改写正文原样流出（那会带出上游域名）。
-    // 例外见文件头注释的「已知遗留」：单响应 >TEXT_REWRITE_MAX 的尾部仍会原样流出。
+    // 例外见文件头注释的「已知遗留」：单响应 >`budget.rewriteMax` 的尾部仍会原样流出。
 
     const headers = buildMaskedHeaders(request.headers, maskURL);
     const fetchInit: RequestInit = { method: request.method, headers, cf: {} };
@@ -1459,7 +1523,7 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
         // contentLength === 0（上游不报长度 / chunked）不走这条分支：
         // 旧写法把「未知大小」当成「小」，会把任意体积的 body 全部 clone + 解码 + replaceAll，
         // 正是 GET / 打穿 CPU 预算的主要路径。现在交给下面的流式改写。
-        if (isTextBody && contentLength > 0 && contentLength < TEXT_REWRITE_MAX) {
+        if (isTextBody && contentLength > 0 && contentLength < budget.rewriteMax) {
             // 改写前先预留额度：不足就降级 1101 —— **绝不**退化成"直接流未改写正文"，
             // 那会把上游域名发给访客，是比 1101 更严重的指纹（评审 BLOCKER）。
             const reservation = reserveTextBudget(budget, clientIP, contentLength);
@@ -1501,20 +1565,21 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
                 settleTextReservation(budget, reservation, 0);
                 // P-04：单份内存的代价 —— body 此刻已被 text() 读过（或被 withTimeout 超时打断
                 // 但读取仍在进行），**不可能**再退回流式转发（那只会拿到 locked/已消费的 body，
-                // 还会漏掉流式分支预留下的 TEXT_REWRITE_MAX 额度）。这里尽力取消，
+                // 还会漏掉流式分支预留下的准入额度）。这里尽力取消，
                 // 然后交回外层统一兜底（首页根路径重试 → nginx 页），与其它抓取失败同一出口。
                 try { await resp.body?.cancel(); } catch { /* text() 仍持锁 / 已消费：无可取消 */ }
                 console.warn('伪装页缓冲读取失败，交由外层兜底:', (e as Error)?.message ?? String(e));
                 throw e;
             }
         }
-        // 长度未知或 ≥1MB 的文本：边流边改写，超过预算立即停止改写、余下原样流出。
+        // 长度未知、或 ≥ 改写上限（budget.rewriteMax）的文本：边流边改写，超过预算立即停止改写、余下原样流出。
         // 超预算的具体日志在 streamWithBudgetRewrite 内（那里才是真正发生的地方），此处不重复打印。
         if (isTextBody) {
-            // 流式分支先预留上限（TEXT_REWRITE_MAX），实际改写量在 flush 里结算退款
-            const reservation = reserveTextBudget(budget, clientIP, TEXT_REWRITE_MAX);
+            // 流式分支先按改写上限预留（reserveTextBudget 内部会把它夹到 TEXT_ADMIT_COST），
+            // 实际改写量在 flush 里结算退款
+            const reservation = reserveTextBudget(budget, clientIP, budget.rewriteMax);
             if (!reservation) {
-                logMaskDegrade('text', budget, TEXT_REWRITE_MAX);
+                logMaskDegrade('text', budget, budget.rewriteMax);
                 try { await resp.body?.cancel(); } catch { /* 已消费/已关闭 */ }
                 return await cf1101Response(reqURL.host, clientIP, env);
             }

@@ -13,6 +13,8 @@
  *   5. 带 utm_* 等噪声参数的请求**既不读也不写缓存**（S-02：原先是「从键里剥掉」，
  *      那会让 `?utm_source=<script>` 的响应以无 query 的键被缓存并发给所有访客）；
  *      非噪声参数（如 `?page=2`）仍各自成为独立缓存条目。
+ *   6. 资源形态阈值走 env 覆盖（`MASK_TEXT_REWRITE_MAX` / `MASK_IMG_CACHE_MAX` /
+ *      `MASK_IMG_CACHE_BYTES`），非法值或低于下界一律回退默认，绝不 fail-open 成无上限。
  *
  * 为什么需要它：这四条都靠「体积」和「次数」这类边界触发，手测很难稳定复现；
  * 而回归的方向又极其具体 —— 退化成「全部缓冲」就是 CPU 超限复发，
@@ -341,11 +343,11 @@ check('缓存字节有界：最近的条目仍在缓存（0 次出站）', fetch
 // 改成这样是为了把「每请求 ~2.7MB 内联 data URI」的带宽降下来（CPU 已在上一轮修好）。
 const IMAGE_TARGET = 'https://upstream.example.net/photo.jpg';
 const IMAGE_BODY = 'JPEGDATA'.repeat(100);
-const imgEnv = () => ({ ...env, FALLBACK: IMAGE_TARGET });
+const imgEnv = (target = IMAGE_TARGET) => ({ ...env, FALLBACK: target });
 const imageReq = (path, extraHeaders = {}) => new Request(ORIGIN + path, {
     headers: { Host: 'panel.example.com', 'CF-Connecting-IP': '203.0.113.9', ...extraHeaders }
 });
-const getImagePage = () => handler.fetch(imageReq('/'), imgEnv(), ctx);
+const getImagePage = (target) => handler.fetch(imageReq('/'), imgEnv(target), ctx);
 const fetchImagePath = (path, extraHeaders = {}) => handler.fetch(imageReq(path, extraHeaders), imgEnv(), ctx);
 
 plan = { mode: 'known', body: IMAGE_BODY, extra: { 'content-type': 'image/jpeg' } };
@@ -651,6 +653,67 @@ await (await get(`/about?k=off&t=${nowSec}`)).text();
 await (await get(`/about?k=off&t=${nowSec + 1}`)).text();
 check('缓存键：MASK_CACHE_TS_NORM=0 可关闭归一（回滚开关）', fetchCount === beforeOff + 2,
     `before=${beforeOff} now=${fetchCount}`);
+
+// ---------- 13. 资源形态 env：改写上限 / 图片缓存张数与字节预算 ----------
+// 这三条此前是源码里的常量（TEXT_REWRITE_MAX / MASK_IMAGE_CACHE_MAX / MASK_IMAGE_CACHE_MAX_BYTES），
+// 现在统一由 readBudgetConfig 读 env。判据与其它 MASK_* 一致：**非法值回退默认，绝不 fail-open**。
+await widenBudget();
+
+// (a) MASK_TEXT_REWRITE_MAX 调小到 64KiB：≈200KB 的已知长度正文，尾部必须原样流出（露出上游域名）
+const RW_UNIT = '<i>upstream.example.net</i>';
+const RW_BODY = RW_UNIT.repeat(Math.ceil((200 * 1024) / RW_UNIT.length));
+plan = { mode: 'known', body: RW_BODY, extra: {} };
+await widenBudget({ MASK_TEXT_REWRITE_MAX: String(64 * 1024) });
+const smallLimitText = await (await get('/about?rw=small')).text();
+check('改写上限：MASK_TEXT_REWRITE_MAX 调小后尾部原样流出（含上游域名）',
+    smallLimitText.startsWith('<i>panel.example.com</i>') && smallLimitText.includes(UPSTREAM_HOST),
+    `len=${smallLimitText.length} head=${smallLimitText.slice(0, 40)}`);
+
+// (b) 低于下界（64KiB）的非法值回退默认 1MB：同一份正文必须被完整改写
+await widenBudget({ MASK_TEXT_REWRITE_MAX: '1024' });
+const fallbackLimitText = await (await get('/about?rw=fallback')).text();
+check('改写上限：低于下界的非法值回退默认（200KB 全文改写，不含上游域名）',
+    !fallbackLimitText.includes(UPSTREAM_HOST),
+    `len=${fallbackLimitText.length} tail=${fallbackLimitText.slice(-60)}`);
+
+// (c) MASK_IMG_CACHE_MAX=1：两张图互相淘汰，回头再取第一张必须重新出站
+const IMG_A = 'https://upstream.example.net/a.jpg';
+const IMG_B = 'https://upstream.example.net/b.jpg';
+plan = { mode: 'known', body: IMAGE_BODY, extra: { 'content-type': 'image/jpeg' } };
+await widenBudget({ MASK_IMG_CACHE_MAX: '12' });
+const beforeWarm = fetchCount;
+await (await getImagePage(IMG_A)).text();        // 出站 1（并进缓存）
+await (await getImagePage(IMG_A)).text();        // 命中缓存 → 0 次出站
+check('图片缓存：张数上限内重复访问命中缓存（0 次额外出站）', fetchCount === beforeWarm + 1,
+    `before=${beforeWarm} now=${fetchCount}`);
+
+await widenBudget({ MASK_IMG_CACHE_MAX: '1' });
+const beforeB = fetchCount;
+await (await getImagePage(IMG_B)).text();        // 出站 +1，并把 A 挤出（上限 1 张）
+check('图片缓存：MASK_IMG_CACHE_MAX=1 时新图仍需出站', fetchCount === beforeB + 1,
+    `before=${beforeB} now=${fetchCount}`);
+const beforeA2 = fetchCount;
+await (await getImagePage(IMG_A)).text();        // A 已被挤出 → 重新出站
+check('图片缓存：MASK_IMG_CACHE_MAX=1 时最旧的图被淘汰（重新出站）', fetchCount === beforeA2 + 1,
+    `before=${beforeA2} now=${fetchCount}`);
+
+// (d) MASK_IMG_CACHE_BYTES 小于单图：单条超预算不入缓存（不能"清空别人、留下自己"）
+plan = { mode: 'known', body: 'J'.repeat(100 * 1024), extra: { 'content-type': 'image/jpeg' } };
+const BIG_IMG = 'https://upstream.example.net/big.jpg';
+await widenBudget({ MASK_IMG_CACHE_BYTES: String(64 * 1024) });
+const beforeBig1 = fetchCount;
+await (await getImagePage(BIG_IMG)).text();
+const beforeBig2 = fetchCount;
+await (await getImagePage(BIG_IMG)).text();
+check('图片缓存：单张超字节预算时不入缓存（第二次仍出站）', beforeBig2 === beforeBig1 + 1
+    && fetchCount === beforeBig2 + 1,
+    `afterFirst=${beforeBig2} afterSecond=${fetchCount}`);
+
+// 收尾：把本节改过的 env 还原，避免影响后续（以及未来新增的）用例
+await widenBudget();
+delete env.MASK_TEXT_REWRITE_MAX;
+delete env.MASK_IMG_CACHE_MAX;
+delete env.MASK_IMG_CACHE_BYTES;
 
 out(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);
