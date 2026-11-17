@@ -214,21 +214,12 @@ async function connectWithRaceDial(
             // 用 throw 而不是返回 socket:null —— Promise.any 只该在「真的拿到了 socket」时才 settle。
             if (!blacklistBypass && blacklistCheck(key)) throw new Error('candidate blacklisted');
 
-            // 先到先得闸门与黑名单记账留在本路径；拨号与写首包的收口见 dialCandidate
-            const socket = await dialCandidate(
+            // 先到先得闸门与黑名单记账留在本路径；建连与写首包的收口见 openCandidate / writeFirstPacket
+            const socket = await openCandidate(
                 { hostname: cleanIp, port: entryPort },
-                rawClientData,
                 PROXY_DIAL_TIMEOUT,
                 fetcher,
-                {
-                    onSocket,
-                    // 保持原语义：只有「连上了但首包写不出去」的候选才记黑名单
-                    // （连不上的不算，那由抽取阶段的可达性探测与批量回退负责）
-                    onWriteFailure: (error) => {
-                        log(`race dial write failed for ${cleanIp}:${entryPort}: ${safeErrorMessage(error)}`);
-                        blacklistRecord(key);
-                    }
-                }
+                { onSocket }
             );
 
             // B-11：晚到的候选（本批已经有人连上）自行关闭并出局
@@ -257,22 +248,19 @@ async function connectWithRaceDial(
         if (winner) {
             const { socket, ip: winnerIp, port: winnerPort, index } = winner;
             try {
-                // 先写首包再返回，避免连接被重置（对齐 cfnew 连接值发送 L4766-4768：
-                // if (值数据378.byteLength) await 写入器.write(值数据378)）
-                const writer = socket.writable.getWriter();
-                if (rawClientData && rawClientData.byteLength) {
-                    await writer.write(rawClientData);
-                }
-                writer.releaseLock();
+                // 只有胜者写首包（每个 ArrayBuffer 只能交给 write 一次，见 openCandidate 的说明），
+                // 且必须在关闭其余候选之前写，避免连接被重置。
+                await writeFirstPacket(socket, rawClientData);
                 // 成功：清除黑名单 + 游标推进到成功候选（对齐 edgetunnel 5799-5800）
                 blacklistClear(blacklistKey(winnerIp, winnerPort));
                 proxyIpPoolCursor = index;
                 log(`race dial winner: ${winnerIp}:${winnerPort} (proxy: ${proxyAddr})`);
                 return { socket, usedIp: winnerIp };
             } catch (writeError) {
+                // 保持原语义：只有「连上了但首包写不出去」的候选才记黑名单（连不上的不算，
+                // 那由抽取阶段的可达性探测与批量回退负责）。writeFirstPacket 已关闭该 socket。
                 log(`race dial write failed for ${winnerIp}:${winnerPort}: ${safeErrorMessage(writeError)}`);
                 blacklistRecord(blacklistKey(winnerIp, winnerPort));
-                try { socket.close(); } catch {}
             }
         }
 
@@ -376,11 +364,11 @@ async function connectWithDirectRaceDial(
 
         // 并发拨号，取最快成功的（对齐 cfnew 并发连接候选 Promise.any）
         // 并发拨号，取最快成功的（对齐 cfnew 并发连接候选 Promise.any）
-        // R-03：单候选的拨号/写首包/失败回收全在 dialCandidate（其注释是这条不变式的唯一出处）
+        // R-03：建连归 openCandidate（统一 onSocket 时机 / 超时关连接 / 定时器清理），
+        // 首包由**胜者单独写**（共享 ArrayBuffer 不可写多次）。
         const dialPromises = batchCandidates.map(async (candidate) => {
-            const socket = await dialCandidate(
+            const socket = await openCandidate(
                 { hostname: candidate.hostname, port: candidate.port },
-                rawClientData,
                 DIRECT_DIAL_TIMEOUT,
                 fetcher,
                 { onSocket }
@@ -390,6 +378,9 @@ async function connectWithDirectRaceDial(
 
         try {
             const { socket, candidate } = await Promise.any(dialPromises);
+
+            // 先写首包（只有胜者写），再关闭败者 —— 顺序反了会因连接被重置而丢首包
+            await writeFirstPacket(socket, rawClientData);
 
             // 关闭其余候选 socket（对齐 cfnew 并发连接候选关闭败者）
             for (const p of dialPromises) {
@@ -405,9 +396,14 @@ async function connectWithDirectRaceDial(
             log(`direct race dial winner: ${candidate.key}`);
             return { socket, usedIp: candidate.hostname };
         } catch (batchError) {
-            // 本批全部失败 → 记录黑名单（对齐 cfnew L4763）
+            // 本批全部失败（或胜者首包写失败）→ 记录黑名单（对齐 cfnew L4763），并回收可能已建立的败者
             for (const candidate of batchCandidates) {
                 blacklistRecord(candidate.key);
+            }
+            for (const p of dialPromises) {
+                p.then(({ socket: otherSocket }) => {
+                    try { otherSocket.close(); } catch {}
+                }).catch(() => {});
             }
         }
     }
@@ -438,17 +434,26 @@ const parseIPs = (value: string) => value ? value.split(',').map(val => val.trim
  *
  * 出错时本函数**已经**完成回收并抛出，调用方只需决定「要不要记黑名单」，不需要再关 socket。
  */
-async function dialCandidate(
+/**
+ * R-03 / 回归修复：**建连 + 等建立**（不含写首包）。
+ *
+ * 为什么必须与「写首包」分开：竞速会对同一批候选并发建连，而首包 `rawClientData` 是**同一个**
+ * ArrayBuffer —— `write(arrayBuffer)` 在把它交给 socket sink 时会 detach 该缓冲区，
+ * 于是「每个候选都写一次」会让第一个写成功的候选吃掉缓冲区、真正的胜者只能写出 0 字节。
+ * 表现就是：反代（CF 目标）首跳拿不到 VLESS 头与目标信息 → 连接建立但整条不通，
+ * 而单条拨号（只写一次）与非池路径都正常。
+ * 所以顺序必须是「先决出胜者 → 只有胜者写 → 再关闭其余」。
+ *
+ * 本函数保证的三条不变式（原先三处各写一遍，且各漏过其中一条）：
+ *  1. `onSocket` 早于 `await opened`（写卡住时上层拿不到 socket，teardown 只能靠这个登记）；
+ *  2. `opened` 超时或 reject 时**就地关闭** socket（竞速败者分支不携带 socket 引用）；
+ *  3. 定时器在 `finally` 清理（`Promise.race` 的 setTimeout 不会自动取消）。
+ */
+async function openCandidate(
     target: { hostname: string; port: number },
-    rawClientData: ArrayBuffer | undefined,
     timeoutMs: number,
     fetcher?: any,
-    hooks?: {
-        onSocket?: (socket: Socket) => void;
-        onOpened?: () => void;
-        /** 首包写失败时的回调（socket 已解锁并关闭）。只有需要「按失败阶段记账」的调用方才传。 */
-        onWriteFailure?: (error: unknown) => void;
-    }
+    hooks?: { onSocket?: (socket: Socket) => void }
 ): Promise<Socket> {
     const socket = connectSocket(target, fetcher);
 
@@ -469,8 +474,15 @@ async function dialCandidate(
         if (timer) clearTimeout(timer);
     }
 
-    hooks?.onOpened?.();
+    return socket;
+}
 
+/**
+ * 写首包。**每个 ArrayBuffer 只能交给它一次**（见 openCandidate 的说明）——
+ * 调用方必须保证「一个连接只调用一次」。
+ * 失败时先解锁再关闭：锁死的 writable 会让上层再次 getWriter 抛错，把整条上行泵打死。
+ */
+async function writeFirstPacket(socket: Socket, rawClientData: ArrayBuffer | undefined): Promise<void> {
     // F-19：rawClientData 可能为 undefined（首包剥离后无残余载荷），直接 write(undefined) 会抛 TypeError
     const writer = socket.writable.getWriter();
     try {
@@ -478,27 +490,40 @@ async function dialCandidate(
     } catch (writeError) {
         try { writer.releaseLock(); } catch { /* 有未决写时释放会抛 */ }
         try { socket.close(); } catch { /* 已关闭 */ }
-        // 首包写失败与「连不上」是两种失败：反代池只对前者记黑名单（后者由可达性探测负责）。
-        // 需要区分的调用方自己传 onWriteFailure —— 不在异常对象上打标记，省掉一套类型与两个辅助函数。
-        hooks?.onWriteFailure?.(writeError);
         throw writeError;
     }
     writer.releaseLock();
-    return socket;
 }
 
 /**
- * 拨号 + 写首包的对外形态（保留原签名供既有调用点使用）。
- * 语义等价于直接调用 dialCandidate（hooks 的回调时机见其注释，不能挪）。
+ * 拨号 + 写首包的对外形态（单条拨号路径用；只有一个连接，不存在共享缓冲区问题）。
+ * = openCandidate + writeFirstPacket —— 不再多套一层同名函数（此前 dialCandidate 只服务本函数）。
+ * hooks 的回调时机是语义的一部分，不能挪：onSocket 早于 await opened、onOpened 在建连之后取 writer 之前。
  */
 async function dialAndWrite(
     address: string,
     port: number,
     rawClientData: ArrayBuffer | undefined,
     fetcher?: any,
-    hooks?: { onSocket?: (socket: Socket) => void; onOpened?: () => void }
+    hooks?: {
+        onSocket?: (socket: Socket) => void;
+        onOpened?: () => void;
+        /** 首包写失败时的回调（socket 已解锁并关闭） */
+        onWriteFailure?: (error: unknown) => void;
+    }
 ): Promise<Socket> {
-    return await dialCandidate({ hostname: address, port }, rawClientData, DIRECT_DIAL_TIMEOUT, fetcher, hooks);
+    const socket = await openCandidate({ hostname: address, port }, DIRECT_DIAL_TIMEOUT, fetcher, hooks);
+
+    hooks?.onOpened?.();
+
+    try {
+        await writeFirstPacket(socket, rawClientData);
+    } catch (writeError) {
+        hooks?.onWriteFailure?.(writeError);
+        throw writeError;
+    }
+
+    return socket;
 }
 
 /** NAT64 prefix 模式：将目标域名解析为 IPv4，转换为 IPv6 NAT64 地址连接 */

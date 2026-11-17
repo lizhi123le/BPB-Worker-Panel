@@ -67,11 +67,16 @@ const check = (name, ok, detail = '') => {
 };
 
 // ── VLESS 首包：ver(1) + uuid(16) + optLen(1) + cmd(1) + port(2) + atyp(1) + 域名字节
-function vlessDomainPacket(domain, port = 443) {
+function vlessDomainPacket(domain, port = 443, payload = []) {
     const head = [0, ...UUID.split('-').join('').match(/../g).map((h) => parseInt(h, 16)), 0, 1, port >> 8, port & 0xff, 2];
     const d = [...Buffer.from(domain, 'utf8')];
-    return Uint8Array.from([...head, d.length, ...d]);
+    // payload 是「VLESS 头之后的剩余载荷」—— 服务端会把它当首包数据写进后端 socket。
+    // 必须带载荷：否则 rawClientData 为空、写首包被跳过，「首包只写一次」的断言会变成空转。
+    return Uint8Array.from([...head, d.length, ...d, ...payload]);
 }
+
+/** 首包载荷（长度固定、内容可辨识），用于断言「胜者收到的字节 = 这份载荷」 */
+const PACKET_PAYLOAD = Array.from({ length: 16 }, (_, i) => 0xa0 + i);
 
 function makeKv(seed = {}) {
     const store = new Map(Object.entries(seed));
@@ -132,6 +137,12 @@ globalThis.WebSocketPair = class {
  *  IPv6 地址本身含冒号，用 `split(':')[0]` 解析会把 `2001:db8::1` 截成 `2001`，v6 断言必然假绿。 */
 let dialedThisConnection = [];
 let dialedHostsThisConnection = [];
+/** 每个 dialed socket 收到的首包写入记录：`{ host, writes: number, bytes: number[] }`。
+ *  为什么要记：竞速拨号的首包是**同一个 ArrayBuffer**，而 write() 会 detach 它 ——
+ *  一旦「每个候选都写一次」，第一个写成功的候选吃掉缓冲区、真正的胜者只能写出 0 字节，
+ *  表现是「反代（CF 目标）首跳连上但整条不通」。桩若不记录写入内容，这类回归会全绿通过
+ *  （曾经真实发生过：R-03 合并把写入挪进候选内部，15/15 全绿但线上反代失效）。 */
+let firstPacketWritesThisConnection = [];
 globalThis.connect = ({ hostname, port }) => {
     dialedThisConnection.push(`${hostname}:${port}`);
     dialedHostsThisConnection.push(hostname);
@@ -139,11 +150,19 @@ globalThis.connect = ({ hostname, port }) => {
     let rejectOpened;
     const opened = new Promise((res, rej) => { resolveOpened = res; rejectOpened = rej; });
     opened.catch(() => {}); // 未被 await 的分支也别变成 unhandled rejection
+    const writeRecord = { host: hostname, writes: 0, bytes: [] };
+    firstPacketWritesThisConnection.push(writeRecord);
     const socket = {
         opened,
         closed: new Promise(() => {}),
         readable: new ReadableStream({ start() {} }), // 永不产出：避免 remoteSocketToWS 早退
-        writable: new WritableStream({ write() {} }),
+        writable: new WritableStream({
+            write(chunk) {
+                // 记录每次写入的字节量（断言「胜者恰好写一次且字节完整」用）
+                writeRecord.writes++;
+                writeRecord.bytes.push(chunk?.byteLength ?? 0);
+            }
+        }),
         close() {}
     };
     if (FAILING.has(hostname)) rejectOpened(new Error('ECONNREFUSED'));
@@ -202,15 +221,16 @@ const env = {
     kv: makeKv()
 };
 
-const PACKET = vlessDomainPacket(TARGET);
+const PACKET = vlessDomainPacket(TARGET, 443, PACKET_PAYLOAD);
 
 /** 发一次 WS 升级，等首包处理跑完，返回本次观测。
  *  target 默认是 TARGET；验证目标识别（CF 网段）时传 CF_TARGET。 */
 async function runConnection(query = '?qj=only', target = TARGET) {
     dialedThisConnection = [];
     dialedHostsThisConnection = [];
+    firstPacketWritesThisConnection = [];
     logs.length = 0;
-    const packet = target === TARGET ? PACKET : vlessDomainPacket(target);
+    const packet = target === TARGET ? PACKET : vlessDomainPacket(target, 443, PACKET_PAYLOAD);
     const earlyData = Buffer.from(packet).toString('base64url');
     const request = new Request(`${ORIGIN}/${query}`, {
         headers: {
@@ -225,6 +245,8 @@ async function runConnection(query = '?qj=only', target = TARGET) {
     const probed = new Set(dialedHostsThisConnection);
     const drawLog = logs.find((l) => /got \d+ IPs for proxy .* drawing \d+/.test(l)) || '';
     const m = /got (\d+) IPs for proxy .* drawing (\d+) \((\d+) in backoff\)/.exec(drawLog);
+    // 首包写入总账：竞速时同一 ArrayBuffer 只能被写一次（write 会 detach 它）
+    const wroteOnce = firstPacketWritesThisConnection.filter((w) => w.writes > 0);
     return {
         status: response.status,
         dialed: [...dialedThisConnection],
@@ -232,7 +254,9 @@ async function runConnection(query = '?qj=only', target = TARGET) {
         poolSize: m ? Number(m[1]) : null,
         drawn: m ? Number(m[2]) : null,
         inBackoff: m ? Number(m[3]) : null,
-        drawLog
+        drawLog,
+        /** 首包字节数（应等于剥离 VLESS 头后的载荷长度，绝不是 0） */
+        firstPacketBytes: wroteOnce.length ? wroteOnce[0].bytes[0] : null,
     };
 }
 
@@ -433,6 +457,25 @@ check('默认模式 + CF 目标：反代池成功后不再拨官方直连池',
 check('默认模式 + CF 目标：拨号候选来自反代池解析结果（不是官方直连 IP）',
     cfRun.probed.size > 0 && [...cfRun.probed].every((ip) => BIG_POOL.includes(ip)),
     `probed=${[...cfRun.probed].join(',')}`);
+
+// ── 首包写入总账（R-03 回归的守卫）──
+// 竞速时同一批候选共享**同一个** ArrayBuffer：只要「每个候选各写一次」，就会有多个 socket
+// 收到同一份首包（write 语义上是 transfer，真正该拿到的胜者可能反而写出 0 字节）→
+// 表现为「反代（CF 目标）首跳连上但整条不通」。桩此前是空 `write() {}`，这类回归全绿也发现不了。
+// 这里钉两条**确定成立**的不变量：
+//  ① 至少有 socket 收到首包（否则断言空转，等于没测）；
+//  ② 每次写入的字节数都等于载荷长度 —— write 是 transfer 语义，同一缓冲区被第二个写者
+//     拿到时会变成 0 字节，这条正是「共享缓冲区被多写」的探针。
+// 注：不钉「每个 socket 只能写一次」——实测存在同一 socket 被写两次的情形（疑为回退/上行泵
+// 复用同一 socket），在未查明前不把它写成断言，避免把未知行为固化成契约。
+const wroteAny = firstPacketWritesThisConnection.filter((w) => w.writes > 0);
+const zeroByteWrites = firstPacketWritesThisConnection.filter((w) => w.writes > 0 && w.bytes.some((n) => n === 0));
+check('CF 目标：确有 socket 收到首包（守卫非空转）',
+    wroteAny.length > 0 && cfRun.firstPacketBytes === PACKET_PAYLOAD.length,
+    `writers=${wroteAny.length} bytes=${cfRun.firstPacketBytes} expect=${PACKET_PAYLOAD.length}`);
+check('CF 目标：没有 0 字节的首包写入（共享缓冲区未被多写吃掉）',
+    zeroByteWrites.length === 0,
+    `zero=${JSON.stringify(zeroByteWrites)} all=${JSON.stringify(firstPacketWritesThisConnection)}`);
 check('默认模式 + CF 目标：连接成功返回 101',
     cfRun.status === 101,
     `status=${cfRun.status}`);
