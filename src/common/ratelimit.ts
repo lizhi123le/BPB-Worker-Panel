@@ -162,7 +162,10 @@ const rateLimitPool = new Map<string, RateLimitRecord>();
 export function isPathInDictionary(pathSegments: string[]): boolean {
     const segments = pathSegments.flatMap(seg => seg.split('/')).filter(Boolean);
     if (segments.length === 0) return false;
-    return segments.every(seg => PUBLIC_PATH_DICTIONARY.has(seg));
+    // B-10：必须大小写归一。同文件的 isBuiltinRouteWord、worker.ts 的 isXpPathAllowed 都做了，
+    // 只有这里漏了 → `/Index.html`、`/Images/a.jpg` 一律被判「字典外」，
+    // 而浏览器并发拉取伪装站静态资源时大小写混用很常见（判错会一路推到永久封禁）。
+    return segments.every(seg => PUBLIC_PATH_DICTIONARY.has(seg.toLowerCase()));
 }
 
 /** 检查是否仍在限流（未超限返回 true） */
@@ -259,32 +262,98 @@ export async function checkRateLimitShared(kv: KVNamespace | undefined, ip: stri
  */
 const AUTH_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 分钟
 const AUTH_RATE_LIMIT_MAX_FAILURES = 10;          // 每窗口最多 10 次失败
+/**
+ * B-27：本池的内存条目上限，与 RATE_LIMIT_MAX_TRACKED_IPS 同量级。
+ * 池是 isolate 私有的，条目数只受「被攻击过的源 IP 数量」约束 —— 分布式口令爆破
+ * （每个 IP 只试一次）可以让内存条目单调增长且永不过期，长生命周期 isolate 下就是内存泄漏。
+ */
+const AUTH_RATE_LIMIT_MAX_TRACKED_IPS = 10000;
 
 const authFailurePool = new Map<string, number[]>();
 
+/**
+ * 「每键时间戳窗口」的通用实现（第 2、3 个池共用；第 1 个池 `rateLimitPool` 因为还带
+ * kvWritten / kvCheckedAt / sharedOver 三个跨边缘字段，结构不同，保持独立）。
+ *
+ * 三条不变式集中在这里，避免复制第二遍时漏掉任何一条：
+ *  1. **空即删**：窗口内没有有效时间戳时把键删掉，而不是写回空数组 —— 否则该键永久占一个条目；
+ *  2. **插入前封顶**：只在新建条目时 `evictOldest(pool, max - 1)`，保证插入后不超过上限；
+ *  3. 空键（无法识别的 IP）一律放行 / 不记账。
+ */
+function windowAllow(pool: Map<string, number[]>, key: string, windowMs: number, max: number): boolean {
+    if (!key) return true;
+    const record = pool.get(key);
+    if (!record) return true;
+
+    const windowStart = Date.now() - windowMs;
+    const valid = record.filter(t => t > windowStart);
+    if (valid.length === 0) {
+        pool.delete(key);
+        return true;
+    }
+    pool.set(key, valid);
+    return valid.length < max;
+}
+
+function windowRecord(pool: Map<string, number[]>, key: string, windowMs: number, trackedMax: number): void {
+    if (!key) return;
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    const existing = pool.get(key);
+    if (!existing) evictOldest(pool, trackedMax - 1);
+    const record = (existing || []).filter(t => t > windowStart);
+    record.push(now);
+    pool.set(key, record);
+}
+
 /** 检查认证失败是否仍在允许范围内（未超限返回 true；空 ip 放行） */
 export function checkAuthRateLimit(ip: string): boolean {
-    if (!ip) return true;
-    const windowStart = Date.now() - AUTH_RATE_LIMIT_WINDOW_MS;
-    const record = authFailurePool.get(ip);
-    if (!record) return true;
-    const valid = record.filter(t => t > windowStart);
-    authFailurePool.set(ip, valid);
-    return valid.length < AUTH_RATE_LIMIT_MAX_FAILURES;
+    // B-27：空即删 + 插入前封顶由 windowAllow / windowRecord 统一保证
+    return windowAllow(authFailurePool, ip, AUTH_RATE_LIMIT_WINDOW_MS, AUTH_RATE_LIMIT_MAX_FAILURES);
 }
 
 /** 记录一次认证失败（空 ip 不计数） */
 export function recordAuthFailure(ip: string): void {
-    if (!ip) return;
-    const now = Date.now();
-    const windowStart = now - AUTH_RATE_LIMIT_WINDOW_MS;
-    const record = (authFailurePool.get(ip) || []).filter(t => t > windowStart);
-    record.push(now);
-    authFailurePool.set(ip, record);
+    windowRecord(authFailurePool, ip, AUTH_RATE_LIMIT_WINDOW_MS, AUTH_RATE_LIMIT_MAX_TRACKED_IPS);
 }
 
 /** 认证成功后清空该 IP 的失败记录（空 ip 忽略） */
 export function resetAuthRateLimit(ip: string): void {
     if (!ip) return;
     authFailurePool.delete(ip);
+}
+
+/**
+ * S-07：DoH 中继（`/dns-query/<subPath>`）的每 IP 频率限制。
+ *
+ * 为什么需要：`/dns-query` 在 worker.ts 是**内置路由分支**，不经过 `guardNonBuiltinPath`
+ * 的限流闸门；而 `subPath` 随订阅 URL 分发给所有用户，等于一个「持订阅者即可用」的无鉴权
+ * DoH 转发器（method / content-type / 2KB 体积已收口，但频率此前没有约束）。
+ *
+ * 口径：60 秒滑动窗口、每 IP 默认 120 次（≈2 次/秒）—— 正常客户端一次页面加载常见的
+ * 并发解析是几十次，120 留足余量；`DOH_RATE_PER_MIN=0` 关闭（回滚开关），非法值回退默认。
+ * 与其它池一致：空 ip 放行（无法识别就不该拦）、条目有空即删 + 容量封顶。
+ */
+const DOH_RATE_WINDOW_MS = 60_000;
+const DOH_RATE_PER_MIN_DEFAULT = 120;
+const DOH_RATE_MAX_TRACKED_IPS = 10000;
+const dohRatePool = new Map<string, number[]>();
+
+function dohRateLimitPerMinute(): number {
+    const raw = Number((globalThis as any).env?.DOH_RATE_PER_MIN);
+    if (!Number.isFinite(raw) || raw < 0) return DOH_RATE_PER_MIN_DEFAULT;
+    return Math.floor(raw);
+}
+
+/** 检查该 IP 是否仍在 DoH 频率范围内（未超限返回 true；空 ip / 限流关闭一律放行） */
+export function checkDohRateLimit(ip: string): boolean {
+    const limit = dohRateLimitPerMinute();
+    if (!ip || limit === 0) return true;
+    return windowAllow(dohRatePool, ip, DOH_RATE_WINDOW_MS, limit);
+}
+
+/** 记录一次 DoH 请求（空 ip / 限流关闭时不记账） */
+export function recordDohRequest(ip: string): void {
+    if (!ip || dohRateLimitPerMinute() === 0) return;
+    windowRecord(dohRatePool, ip, DOH_RATE_WINDOW_MS, DOH_RATE_MAX_TRACKED_IPS);
 }

@@ -1,6 +1,8 @@
 import { SignJWT, jwtVerify } from 'jose';
 import { HttpStatus, isKvBound, respond, safeErrorMessage } from '@common';
 import { checkAuthRateLimit, recordAuthFailure, resetAuthRateLimit } from './common/ratelimit';
+// S-03：IP 只从校验过的取用点拿（非法头视为无 IP，不拿假键记账）
+import { clientIp } from './common/client-ip';
 
 /** 会话生命周期（秒）：JWT 过期时间与 Cookie Max-Age 必须同源，否则浏览器会拿着已过期令牌反复请求（F9） */
 const SESSION_TTL_SECONDS = 24 * 60 * 60;
@@ -38,8 +40,13 @@ async function issueSessionToken(env: Env): Promise<string> {
     let secretKey = await env.kv.get('secretKey');
 
     if (!secretKey) {
-        secretKey = generateSecretKey();
-        await env.kv.put('secretKey', secretKey);
+        const generated = generateSecretKey();
+        await env.kv.put('secretKey', generated);
+        // B-55：首访并发竞态 —— 两个并发登录都会读到 null 并各自 put，后写覆盖先写，
+        // 于是先签发的那张 Cookie 立刻验不过（同一次成功登录却拿不到会话）。
+        // 写入后**读回**以 KV 的真实值为准签发（不是重写：重试只会让两者继续互相覆盖，
+        // 胜负仍然随机）。KV 没有 CAS，这里是能做到的最小代价收敛。
+        secretKey = (await env.kv.get('secretKey')) || generated;
     }
 
     const secret = new TextEncoder().encode(secretKey);
@@ -57,7 +64,7 @@ export async function generateJWTToken(request: Request, env: Env): Promise<Resp
         return respond(false, 405, 'Method not allowed.');
     }
 
-    const ip = request.headers.get('CF-Connecting-IP') || '';
+    const ip = clientIp(request);
 
     // 认证限流：超限不返回 429、不暴露限流特征，仍返回同样 401 但固定延迟。
     // 顺序很重要：必须排在读取 KV 之前。否则已被限流的爆破请求仍会逐次消耗 kv.get('pwd')
@@ -111,7 +118,7 @@ export async function initializePassword(request: Request, env: Env): Promise<Re
         );
     }
 
-    const ip = request.headers.get('CF-Connecting-IP') || '';
+    const ip = clientIp(request);
 
     // 顺序与 generateJWTToken 一致：限流判定排在一切 KV 读之前（超限时 0 次 KV 读）
     if (!checkAuthRateLimit(ip)) {
@@ -134,6 +141,14 @@ export async function initializePassword(request: Request, env: Env): Promise<Re
     }
 
     await env.kv.put('pwd', newPassword);
+
+    // B-34：「读 pwd（null）→ 写 pwd」不是原子的 —— 首访瞬间两个并发请求都看到 null，
+    // 后写会悄悄覆盖先写的口令（第一个访客随即被踢回登录页，且无从判断发生了什么）。
+    // 写入后**读回校验**：KV 里的值不是本次提交的口令，说明有人先写成功，本次提交作废
+    // （不重试写入 —— 那只会让两个请求继续互相覆盖）。KV 没有「仅当不存在时写」，这是最小代价的收敛。
+    if ((await env.kv.get('pwd')) !== newPassword) {
+        return respond(false, HttpStatus.UNAUTHORIZED, 'Administrator password is already set. Please log in.');
+    }
 
     // 设置成功即视为一次成功认证：清掉本 IP 之前攒下的失败计数（例如拿着过期页面反复重试）
     resetAuthRateLimit(ip);
@@ -179,7 +194,12 @@ export async function Authenticate(request: Request, env: Env): Promise<boolean>
         }
 
         const { payload } = await jwtVerify(token, secret);
-        console.log(`Successfully authenticated, User ID: ${payload.userID}`);
+        // S-06：不要把 userID（= VLESS UUID）写进日志 —— Authenticate 是 /panel/* 与 /proxy-ip*
+        // 的公共入口，原写法等于按请求把代理凭据刷进 Workers Logs，与本仓
+        // 「unified.ts 不回写 UUID」「错误页凭据脱敏」的既有裁决直接冲突。
+        // 只保留前 4 位用于把同一会话的多条日志串起来，不足以还原凭据（UUID 有 122 bit 熵）。
+        const uid = String((payload as { userID?: unknown }).userID ?? '');
+        console.log(`Successfully authenticated (user ${uid.slice(0, 4)}…)`);
 
         return true;
     } catch (error) {

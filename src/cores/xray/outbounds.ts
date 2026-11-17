@@ -2,10 +2,12 @@ import {
     base64ToDecimal,
     isBareIPv4,
     isBareIPv6,
-    isTlsPort,
     toRange,
-    selectSniHost,
-    pickRandomEch,
+    // R-04 / R-05：判据的唯一真源（原先三端各复制一份，见 @utils 内注释）
+    resolveNodeTls,
+    normalizeTransportPath,
+    earlyDataHeaderName,
+    omitEmpty,
     type CleanProxyEntry
 } from '@utils';
 
@@ -103,39 +105,23 @@ interface NodeTlsContext {
 }
 
 function buildNodeTlsContext(address: string, port: number, isFragment: boolean): NodeTlsContext {
-    const {
-        settings: {
-            fingerprint,
-            alpn,
-            enableECH,
-            echServerName,
-            hostSniList
-        }
-    } = globalThis;
+    const { settings: { fingerprint } } = globalThis;
 
-    // 与 handlers.ts#buildConfig（URI 侧）的判定逐字一致：显式端口表里出现过该端口即按 TLS 处理，
-    // 否则同一节点会出现 URI 写 security=tls、JSON 写 security=none 的自相矛盾配置。
-    // 判据（含 entryPortMap 的按调用求值）统一由 @utils 的 isTlsPort 维护。
-    const isTLS = isTlsPort(port, address);
-    // 随机抽取顺序（先 hostSniList 再 echServerName）必须保持不变：它决定同一份订阅里
-    // SNI 与 ECH 名的配对，改变顺序会让既有节点的输出漂移。
-    const { host, sni, allowInsecure } = selectSniHost(address, pickRandomEch(hostSniList));
-    // G13-C10：echServerName 名单为空时回退到该节点的 host，与 handlers.ts#buildConfig（URI 侧）的
-    // `pickRandomEch(echServerName) || host` 逐字一致，避免同一节点出现「URI 有 ech、JSON 无 ECH」的分歧。
-    const pickedEch = enableECH && !isFragment ? (pickRandomEch(echServerName) || host) : undefined;
+    // R-04：判据统一走 @utils#resolveNodeTls，与 sing-box / Clash 同一份实现。
+    // 该函数内部保证「先 hostSniList 再 echServerName」的抽取顺序、名单为空时 ECH 名回退到
+    // 本节点 host、并且仅在本节点真的启用 ECH 时才抑制 alpn（G13-C7/G13-C10）。
+    const criterion = resolveNodeTls(address, port, isFragment);
 
     return {
-        host,
-        isTLS,
-        tlsSettings: isTLS ? buildTlsSettings(
-            sni,
+        host: criterion.host,
+        isTLS: criterion.isTLS,
+        tlsSettings: criterion.isTLS ? buildTlsSettings(
+            criterion.sni,
             fingerprint,
-            allowInsecure,
-            !!pickedEch,
-            pickedEch,
-            // G13-C7：仅当本节点真的启用 ECH（pickedEch 有值）时才抑制 alpn；分片节点本就不启用 ECH
-            // （pickedEch 为 undefined），必须放行 alpn，否则该节点既无 ECH 也无 alpn。
-            pickedEch ? undefined : (alpn || undefined),
+            criterion.allowInsecure,
+            !!criterion.echName,
+            criterion.echName,
+            criterion.alpn,
         ) : undefined
     };
 }
@@ -307,7 +293,7 @@ export function buildWarpOutbound(
     return {
         protocol: "wireguard",
         settings: wgSettings,
-        streamSettings: streamSettings.omitEmpty(),
+        streamSettings: omitEmpty(streamSettings),
         tag: isWoW ? "chain" : "proxy"
     } satisfies Outbound;
 }
@@ -451,6 +437,11 @@ function buildTransport(
     mode?: string,
     authority?: string
 ): Record<string, Transport> {
+    // R-05：传输层 path 的唯一预处理（剥掉 query）。B-50 的成因就是这里 —— outProxy 的
+    // `?ed=` 若原样写进 wsSettings.path，客户端会把整串当成 WS 请求路径，节点连不上；
+    // early-data 阈值另有 maxEarlyData 字段承载。普通节点的 path 不含 query → 输出逐字不变。
+    path = normalizeTransportPath(path);
+
     switch (type) {
         case 'tcp':
         case 'raw':
@@ -481,7 +472,7 @@ function buildTransport(
                     host: host,
                     path: path,
                     maxEarlyData: earlyData,
-                    earlyDataHeaderName: earlyData ? "Sec-WebSocket-Protocol" : undefined
+                    earlyDataHeaderName: earlyDataHeaderName(earlyData)
                 } satisfies WsSettings
             };
 

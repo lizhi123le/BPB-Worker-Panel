@@ -40,7 +40,8 @@ const NODE_MODULES = join(ROOT, 'node_modules');
 
 /**
  * 构建 / 类型检查链上必需的包。
- * 其余 devDependencies（eslint、@eslint/* 等）只服务 lint，缺了不影响构建。
+ * 其余 devDependencies（eslint、@eslint/js、@eslint/css、@eslint/markdown 与只服务 lint 的
+ * globals）只服务 `npm run lint`，缺了不影响构建。
  */
 export const REQUIRED_DEPS = [
     // 产物构建（scripts/build.js）
@@ -49,9 +50,13 @@ export const REQUIRED_DEPS = [
     'terser',
     'html-minifier',
     'jszip',
-    // 混淆 + 静态闸门（scripts/obfuscate.mjs / scripts/verify.mjs）
+    // 混淆 + 静态闸门（scripts/obfuscate.mjs / scripts/verify.mjs / scripts/harden-source.mjs）
     'js-confuser',
     '@babel/parser',
+    // scripts/harden-source.mjs 直接 `import traverse from '@babel/traverse'`。
+    // 它过去只因 js-confuser 的传递依赖被 npm 提升到顶层才恰好能解析（pnpm / 关闭提升即
+    // ERR_MODULE_NOT_FOUND），所以必须在 package.json 里显式声明并在本表里复查。
+    '@babel/traverse',
     // 类型检查（npm run check）—— 不装就会被 CI 镜像里的全局 tsc 假绿
     'typescript',
     '@cloudflare/workers-types',

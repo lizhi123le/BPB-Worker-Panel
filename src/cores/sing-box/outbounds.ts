@@ -1,13 +1,15 @@
 import {
-    isTlsPort,
     base64ToDecimal,
     parseHostPort,
-    selectSniHost,
     isDomain,
     isBareIPv4,
     isBareIPv6,
-    pickRandomEch,
-    pickEarlyData,
+    // R-04 / R-05 / R-06：判据的唯一真源（原先三端各复制一份，见 @utils 内注释）
+    resolveNodeTls,
+    normalizeTransportPath,
+    earlyDataHeaderName,
+    resolveChainEarlyData,
+    getChainExplicitEarlyData,
     type CleanProxyEntry
 } from '@utils';
 import { NODE_DNS_TAG } from './dns';
@@ -53,7 +55,11 @@ function buildOutbound<T>(
         ...fields,
         tls,
         transport,
-        domain_resolver: isDomain(server) ? (isChain ? "dns-remote" : (isNodeHost(server) ? NODE_DNS_TAG : "dns-direct")) : undefined
+        // B-06：链式出站的**服务器域名解析**必须走 dns-direct，不能走 dns-remote。
+        // dns-remote 的 detour 就是链式分组「🔗 最佳延迟 🚀」（dns.ts:55），而该分组本身由这些
+        // 链式出站组成 —— 「查域名要先建隧道、建隧道又要查域名」成环，链式节点会全部建不起来。
+        // 与 Clash 的 `proxy-server-nameserver`（显式不带 detour）保持同一口径。
+        domain_resolver: isDomain(server) ? (isChain ? "dns-direct" : (isNodeHost(server) ? NODE_DNS_TAG : "dns-direct")) : undefined
     } as T;
 }
 
@@ -67,6 +73,7 @@ function isNodeHost(server: string): boolean {
     return !!hostName && server.toLowerCase() === hostName.toLowerCase();
 }
 
+
 export function buildWebsocketOutbound(
     protocol: string,
     remark: string,
@@ -79,39 +86,29 @@ export function buildWebsocketOutbound(
     const {
         dict: { _VL_ },
         globalConfig: { userID, TrPass },
-        settings: { 
-            fingerprint, 
-            alpn, 
-            enableTFO, 
-            enableECH, 
-            echServerName, 
-            hostSniList
-        }
+        settings: { enableTFO, fingerprint }
     } = globalThis;
 
-    const pickedEch = enableECH && !isFragment ? pickRandomEch(echServerName) : undefined;
-    const { host, sni, allowInsecure } = selectSniHost(address, pickRandomEch(hostSniList));
+    // 判据只求值一次：resolveNodeTls 内含两次随机抽取（hostSniList 与 echServerName），
+    // 求值两次会得到两套互不配对的 SNI / ECH 名，必须复用同一个对象。
+    const criterion = resolveNodeTls(address, port, isFragment);
     // early-data 由调用点用 pickEarlyData(usedEds) 无放回抽取（2048..2560，513 个取值），构造器只负责装配：
     // 与 generateWsPath(usedPaths) 同一套路，保证同一份订阅内任意两个节点的 ed 两两不同，消除固定长度这一常量特征。
     // 下限不再取更低：ed 是「首包长度阈值」，首包超过它会直接不启用 Early Data（丢 0-RTT）。
-    const transport = buildTransport("ws", "none", path, host, undefined, earlyData);
-    // 与 handlers.ts 的 URI 侧判定对齐：任一地址的显式端口表里出现过该端口也视为 TLS，
-    // 否则同一节点会出现 URI 写 security=tls、JSON 写 none 的自相矛盾组合。
-    // 判据（含 entryPortMap 的按调用求值）统一由 @utils 的 isTlsPort 维护。
-    const tls = isTlsPort(port, address)
+    const transport = buildTransport("ws", "none", path, criterion.host, undefined, earlyData);
+    // R-04 的 sing-box 侧渲染：判据 → tls 块。record_fragment 只在 TLS 节点上才写（非 TLS 节点无 tls 块）。
+    const tls = criterion.isTLS
         ? buildTLS(
             "tls",
             isFragment,
-            allowInsecure,
-            sni,
-            // G13-C7/C10：是否启用 ECH 一律以「该节点抽到的 ECH 名称」为准（分片节点与空名单都不启用），
-            // 与下方抑制 alpn 用同一个判据，避免 ECH 参数与 alpn 参数各按一套条件判断而互相矛盾。
-            !!pickedEch,
-            pickedEch,
-            // G13-C7：抑制 alpn 的条件必须是「该节点确实启用了 ECH」（pickedEch 非空），
-            // 而不是只看全局 enableECH。分片节点恒 `enableECH && !isFragment` = 未启用 ECH，
-            // 旧写法会连 alpn 一起抹掉，得到「既无 ECH 也无 alpn」的节点。
-            pickedEch ? undefined : (alpn || undefined),
+            criterion.allowInsecure,
+            criterion.sni,
+            // G13-C7/C10：是否启用 ECH 一律以「该节点抽到的 ECH 名称」为准（分片节点不启用；
+            // 名单为空时已回退到 host，仍算启用，见上方 B-43），
+            // 与判据里抑制 alpn 用同一个字段，避免 ECH 参数与 alpn 参数各按一套条件判断而互相矛盾。
+            !!criterion.echName,
+            criterion.echName,
+            criterion.alpn,
             fingerprint
         ) : undefined;
 
@@ -173,23 +170,6 @@ export function buildWarpOutbound(
     } satisfies WireguardEndpoint;
 }
 
-/**
- * 读取 outProxy URI 中显式给出的 ed（early-data 阈值）。
- * 未给出、非数值、outProxy 缺失或 URI 非法时返回 undefined；绝不抛错。
- * 显式值是用户自己的配置，故不做区间钳制（可能超出 2048..2560，保持既有「原样沿用」行为）。
- */
-export function getChainExplicitEarlyData(): number | undefined {
-    const outProxy = globalThis.settings?.outProxy;
-    if (!outProxy) return undefined;
-
-    try {
-        const ed = new URL(outProxy).searchParams.get("ed");
-        if (ed === null || !Number.isFinite(+ed)) return undefined;
-        return +ed;
-    } catch {
-        return undefined;
-    }
-}
 
 /** Clean IPs / Domains 里的 socks / socks5 / http(s) 代理条目 → 独立可选节点出站 */
 export function buildCleanProxyOutbound(proxy: CleanProxyEntry, tag: string): HttpOutbound | SocksOutbound {
@@ -220,7 +200,6 @@ export function buildChainOutbound(usedEds?: Set<number>): ChainOutbound | undef
     const {
         dict: { _VL_, _TR_, _SS_, _VM_ },
         settings: {
-            outProxy,
             outProxyParams: {
                 protocol, server, port, user,
                 pass, password, method, uuid,
@@ -231,12 +210,9 @@ export function buildChainOutbound(usedEds?: Set<number>): ChainOutbound | undef
         }
     } = globalThis;
 
-    const { searchParams } = new URL(outProxy);
-    const ed = searchParams.get("ed");
-    // 链式出站同样要开 0-RTT：URI 显式带 ed 时优先沿用该值，并登记进 usedEds（避免与其它节点撞值）；
-    // 未显式给出时按主出站同一套路无放回抽取（与主出站共用同一个 usedEds 池）
-    const earlyData = ed ? +ed : pickEarlyData(usedEds);
-    if (ed && usedEds && !usedEds.has(+ed)) usedEds.add(+ed);
+    // R-06：取值判据在 @utils（显式 `ed` 优先、只消费一次、结果登记进 usedEds），
+    // 与主出站共用同一个 usedEds 池，避免其它节点抽到同一阈值。
+    const earlyData = resolveChainEarlyData(usedEds, getChainExplicitEarlyData());
 
     const tls = buildTLS(security, false, false, sni || server, false, undefined, alpn, fp, pbk, sid);
     const transport = buildTransport(type, headerType, path, host, serviceName, earlyData);
@@ -305,10 +281,10 @@ export function redrawChainEarlyData(chain: ChainOutbound, usedEds: Set<number>,
     const transport = hasTransport(chain) ? chain.transport : undefined;
     if (!transport || transport.type !== "ws") return;
 
-    const earlyData = explicitEd ?? pickEarlyData(usedEds);
-    if (usedEds && !usedEds.has(earlyData)) usedEds.add(earlyData);
+    // R-06：取值判据在 @utils（显式值优先 + 只消费一次 + 无放回注册）
+    const earlyData = resolveChainEarlyData(usedEds, explicitEd);
     transport.max_early_data = earlyData;
-    transport.early_data_header_name = earlyData ? "Sec-WebSocket-Protocol" : undefined;
+    transport.early_data_header_name = earlyDataHeaderName(earlyData);
 }
 
 export function buildUrlTest(
@@ -340,11 +316,11 @@ function buildTLS(
     shortID?: string
 ): TLS | undefined {
     if (!["tls", "reality"].includes(security)) return undefined;
-    // G13-C8：此处对用户 alpn 列表做的 `h2` 过滤是本端独有（Xray/Clash 原样下发），
-    // 三端 alpn 集合因此在用户勾选含 h2 的档位时不一致。仓库内未找到任何依据
-    // （无注释、无类型约束、无测试）说明 h2 必须剥离，且面板提供 h3,h2 / h2,http/1.1 档位。
-    // 依据「证据不足不得贸然放开」保留现状（放开可能让节点连不上），仅标注：未证实，暂不动。
-    const tlsAlpns = alpn?.split(',').filter(value => value !== 'h2');
+    // B-42：删除本端独有的 `h2` 过滤（原 G13-C8：`alpn.split(',').filter(v => v !== 'h2')`）。
+    // 三端统一**原样下发**用户 alpn —— 这是有意对齐，不是遗漏：旧过滤只存在于 sing-box，
+    // 用户勾选含 h2 的档位（面板提供 h3,h2 / h2,http/1.1）时三端协商出的 ALPN 集合不同，
+    // 按某端调好的结论在另一端不成立；仓库内没有任何依据说明 h2 必须剥离。
+    const tlsAlpns = alpn?.split(',');
 
     const tls: TLS = {
         enabled: true,
@@ -374,6 +350,7 @@ function buildTLS(
 }
 
 
+
 function buildTransport(
     type: TransportType,
     headerType?: "http" | "none",
@@ -382,7 +359,7 @@ function buildTransport(
     serviceName?: string,
     earlyData?: number
 ): Transport | undefined {
-    path = path?.split("?")[0];
+    path = normalizeTransportPath(path);
 
     switch (type) {
         case 'tcp':
@@ -402,9 +379,9 @@ function buildTransport(
         case 'ws':
             return {
                 type: "ws",
-                path: path?.split('?ed=')[0],
+                path: path,
                 max_early_data: earlyData,
-                early_data_header_name: earlyData ? "Sec-WebSocket-Protocol" : undefined,
+                early_data_header_name: earlyDataHeaderName(earlyData),
                 headers: {
                     Host: host
                 }
@@ -414,7 +391,7 @@ function buildTransport(
             return {
                 type: "httpupgrade",
                 host: host,
-                path: path?.split('?ed=')[0]
+                path: path
             } satisfies HttpupgradeTransport;
 
         case 'grpc':

@@ -1,9 +1,9 @@
 {
-  "_note": "体积/单行参数的引用文件。复制为 harden.config.json 后生效；CLI > 环境变量 > 本文件 > 默认值。",
+  "_note": "体积/单行参数的**生效中**配置（本文件即被 scripts/build-params.mjs 读取的 harden.config.json）。需要模板/示例请看 harden.config.example.json（不会被任何脚本读取）；优先级 CLI > 环境变量 > 本文件 > 默认值。",
   "_format": "targetBytes/targetZipBytes 支持 320000、320k、1m、75%（百分比相对首次混淆产物）；0 = 关闭该限制",
-  "_note_size_history": "2026-11 XHTTP 传输上线（入站 handler + xray/clash 节点生成）后源码增大约 23KB，原 522k/232k 在混淆阶段已无可行候选。此后改为按「实测最小可达成值 + 余量」上调。 / 2026-11 伪装面形态适配（熔断令牌桶 / 缓存键时间戳归一 / 图片壳页 / Range+内容哈希 ETag）+ WS 数据面零拷贝与背压：实测 577.8k / zip 255.5k。zip 是硬约束，250k 下只剩 482B 余量，故调到 264k（余量 ~3.3%）、raw 580k（余量 ~2.7%）。",
+  "_note_size_history": "2026-11 XHTTP 传输上线（入站 handler + xray/clash 节点生成）后源码增大约 23KB，原 522k/232k 在混淆阶段已无可行候选。此后改为按「实测最小可达成值 + 余量」上调。 / 2026-11 伪装面形态适配（熔断令牌桶 / 缓存键时间戳归一 / 图片壳页 / Range+内容哈希 ETag）+ WS 数据面零拷贝与背压：实测 577.8k / zip 255.5k。 / 2026-11 审查修复轮（B/S/P/D/H 共 60+ 项）后实测 592,327 B / zip 275,830 B：raw 距 580k 只剩 1,593 B（0.27%）、zip 距 280k 剩 10,890 B（3.8%）。 / ⚠️ 真实约束不是「构建失败」而是「混淆强度被静默降级」：obfuscate.mjs 会二分搜索「刚好达标的最小 minConcealedLength」，实测本轮 21→592.9k 达标、24→590.3k、32→588.9k，即每抬高 3 档可再挤约 2.6KB，代价是长度 21~31 的字符串不再密文化。**改动前请先按此表规划，不要以为撞到 593,920 才会出问题。**",
   "targetBytes": "580k",
-  "targetZipBytes": "264k",
+  "targetZipBytes": "280k",
   "maxRuns": 20,
   "oneLine": true
 }

@@ -1,6 +1,6 @@
 import { getGeoAssets } from './geo-assets';
 import type { DNS, DnsServer, DnsHosts } from '#types/xray';
-import { resolveDNS, isDomain, getDomain, accDnsRules, antiSanctionDohTarget } from '@utils';
+import { resolveDNS, isDomain, getDomain, accDnsRules, antiSanctionDohTarget, concatIf, omitEmpty } from '@utils';
 
 export async function buildDNS(
     outboundAddrs: string[],
@@ -22,11 +22,10 @@ export async function buildDNS(
 
     const hosts: DnsHosts = {};
     const servers: DnsServer[] = [];
-    const fakeDnsDomains = [];
 
     if (remoteDnsHost.isDomain && !isWorkerLess && !isWarp) {
         const { ipv4, ipv6, host } = remoteDnsHost;
-        hosts[host] = ipv4.concatIf(enableIPv6, ipv6);
+        hosts[host] = concatIf(ipv4, enableIPv6, ipv6);
     }
 
     if (domainToStaticIPs) {
@@ -61,17 +60,15 @@ export async function buildDNS(
     const geoAssets = getGeoAssets();
     const dnsRules = accDnsRules(geoAssets);
 
-    const blockDomains = [
-        ...dnsRules.block.geosites,
-        ...dnsRules.block.domains.map(domain => `domain:${domain}`)
-    ];
-
-    blockDomains.forEach(domain => hosts[domain] = '#3');
+    // B-46：这里原先还给每个 block 域名写 `hosts[domain] = '#3'`。两处都不对：
+    //  1) Xray 的 `dns.hosts` 值语义是「IP 或可解析域名」，`#3` 两者都不是，等于一条垃圾记录；
+    //  2) 它把 `geosite:…` 也塞进 hosts 的键（键只能是域名模式，Clash 端早已因同一原因移除）。
+    // 拦截语义由**路由层**唯一承担（routing.ts 从同一份 geo 资产建 domain/geosite → block 规则），
+    // 与 sing-box 的 route 规则、Clash 的 `RULE-SET…,REJECT` 对称，故整段删除。
 
     dnsRules.bypass.localDNS.geositeGeoips.forEach(({ geosite, geoip }) => {
         const localDnsServer = buildDnsServer(localDNS, [geosite], [geoip!], skipFallback);
         servers.push(localDnsServer);
-        fakeDnsDomains.push(geosite);
     });
 
     const sanctionDomains = [
@@ -126,19 +123,19 @@ export async function buildDNS(
     if (bypassDomains.length) {
         const localDnsServer = buildDnsServer(localDNS, bypassDomains, undefined, skipFallback);
         servers.push(localDnsServer);
-        fakeDnsDomains.push(...bypassDomains);
     }
 
+    // B-51：fakeDNS 此前只对 **bypass（直连）域名**发假 IP —— 因为上面两处把 bypass 域名塞进
+    // `fakeDnsDomains` 当成了 fakedns 服务器的 domains。而 sing-box（tun-in 全量 A/AAAA 发 fakeip）
+    // 与 Clash（全域 fake-ip）都是「走代理的域名才发假 IP」，语义正好相反；更糟的是旁路列表为空时
+    // `fakeDnsDomains.length === 0` 会退化成裸 "fakedns"（对**所有**域名发假 IP），行为整体翻转。
+    // 现退化为裸 "fakedns"（无条件），与另两端同口径，并删掉那条反向依赖。
     if (fakeDNS || isWorkerLess) {
-        const fakeDNSServer = fakeDnsDomains.length
-            ? buildDnsServer("fakedns", fakeDnsDomains, undefined, false, undefined)
-            : "fakedns";
-
-        servers.unshift(fakeDNSServer);
+        servers.unshift("fakedns");
     }
 
     return {
-        hosts: hosts.omitEmpty(),
+        hosts: omitEmpty(hosts),
         servers,
         queryStrategy: isWarp && !enableIPv6 ? "UseIPv4" : "UseIP",
         tag: "dns"

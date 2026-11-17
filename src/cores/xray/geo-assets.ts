@@ -26,8 +26,12 @@ export function getGeoAssets(): GeoAsset[] {
     } = globalThis.settings;
 
     return [
+        // B-44：`geosite:category-ads-ir`（伊朗本地广告清单）原只在本端存在，sing-box / Clash 均无对应条目。
+        // 取舍（风险更小的一侧）：**删掉本端这条**，三端统一为只拦 `category-ads-all`。
+        // 理由：补齐另两端需要一个新的远程规则集 URL，而 sing-box 的远程 rule_set 取不到时是
+        // **启动期 FATAL**（不是跳过该条规则），在未联网核实 Chocolate4U 仓库确实提供 ads-ir 文件前，
+        // 下发猜测地址会让整个 sing-box 订阅不可用；删掉一条则最多少拦一类本地广告，且三端口径一致。
         { rule: blockAds, type: 'block', geosite: "geosite:category-ads-all" },
-        { rule: blockAds, type: 'block', geosite: "geosite:category-ads-ir" },
         { rule: blockPorn, type: 'block', geosite: "geosite:category-porn" },
         { rule: blockMalware, type: 'block', geosite: "geosite:malware", geoip: "geoip:malware" },
         { rule: blockPhishing, type: 'block', geosite: "geosite:phishing", geoip: "geoip:phishing" },

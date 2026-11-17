@@ -198,10 +198,6 @@ export async function recordViolationAndMaybeBan(
     }
 }
 
-/** 供测试/内存重置使用（清空内存缓存，下次读取重新从 KV 加载） */
-export function clearBlacklistMemoryCache(): void {
-    blacklistCache = null;
-    blacklistCacheTime = 0;
-    blacklistLoaded = false;
-    violationPool.clear();
-}
+// D-09：原此处有 `clearBlacklistMemoryCache()`，注释称「供测试用」，但全仓（含 tools/*.test.mjs）
+// 零调用点。留着它等于给「isolate 内黑名单状态可被外部重置」留一个无消费方的入口，
+// 且注释会让人以为测试依赖它 —— 已删除。

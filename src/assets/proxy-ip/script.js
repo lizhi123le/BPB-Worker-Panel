@@ -1,3 +1,7 @@
+// P-05：本页原先从 `cdn.skypack.dev` 无版本号地动态 import country-flag-emoji-polyfill，
+// 那段已删除（全仓没有 polyfillCountryFlagEmojis 消费点）。国旗在 loadGeoData 里用
+// `String.fromCodePoint(...)` 由两位区域码自拼；系统字体缺国旗 emoji（如 Windows）时
+// 退化为两个字母的国家代码，功能不受影响。
 // 背景 iframe：URL 池随机（带随机 query 绕过 5 分钟缓存，每次刷新换背景）
 (function initFallbackBg() {
     const bg = document.getElementById('fallback-bg');

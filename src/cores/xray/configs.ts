@@ -20,6 +20,7 @@ import {
     getConfigItems,
     cleanProxyEntries,
     cleanProxyRemark,
+    uniqueNodeName,
     generateRemark,
     generateWsPath,
     pickEarlyData,
@@ -29,9 +30,16 @@ import {
     parseHostPort,
     resetRemarkCounter,
     prependUpstreamItem,
-    portsForHost
+    portsForHost,
+    concatIf,
+    enumerateXpNodes,
+    remarkKeyOf,
+    earlyDataHeaderName,
+    getChainExplicitEarlyData
 } from '@utils';
 import { configJsonResponse } from '@common';
+// B-48：节点名唯一化统一走 @utils#uniqueNodeName
+
 
 function buildBalancer(tag: string, selector: string, fallbackTag?: string): Balancer {
     return {
@@ -75,8 +83,7 @@ async function buildConfig(
                 ?? outbounds.find(outbound => outbound.tag === "proxy-1")?.tag
             : undefined;
 
-        balancers = [buildBalancer("all-proxies", "proxy", fallbackTag)]
-            .concatIf(isChain, buildBalancer("all-chains", "chain"));
+        balancers = concatIf([buildBalancer("all-proxies", "proxy", fallbackTag)], isChain, buildBalancer("all-chains", "chain"));
 
         observatory = {
             subjectSelector: isChain ? ["chain", "proxy"] : ["proxy"],
@@ -100,7 +107,6 @@ async function buildConfig(
         inbounds: [
             buildMixedInbound(allowLANConnection, isWorkerLess, isWorkerLess || fakeDNS),
             buildDokodemoInbound(allowLANConnection),
-            // buildTunInbound(isWorkerLess, fakeDNS)
         ],
         outbounds: [
             ...outbounds,
@@ -162,8 +168,7 @@ async function addBestPingConfigs(
     configs: Config[],
     totalAddresses: string[],
     proxyOutbounds: Outbound[],
-    chainOutbounds: Outbound[],
-    isFragment: boolean
+    chainOutbounds: Outbound[]
 ) {
     const isChain = !!chainOutbounds.length;
     const chainSign = isChain ? '🔗 ' : '';
@@ -176,7 +181,8 @@ async function addBestPingConfigs(
     const config = await buildConfig(remark, outbounds, true, isChain, true, false, false, totalAddresses);
 
     if (isChain) {
-        await addBestPingConfigs(configs, totalAddresses, proxyOutbounds, [], isFragment);
+        // D-07：isFragment 只被递归传递、函数体从未读取，已删该形参
+        await addBestPingConfigs(configs, totalAddresses, proxyOutbounds, []);
     }
 
     configs.push(config);
@@ -291,7 +297,9 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     const usedPaths = new Set<string>();
     // 已占用 early-data 阈值集合：与 usedPaths 同粒度、同批次共享，保证任意两个节点的 ed 两两不同
     const usedEds = new Set<number>();
-    const chainProxy = outProxy ? buildChainOutbound(pickEarlyData(usedEds)) : undefined;
+    // R-06 / B-50：显式 `ed`（outProxy 里用户自己写的）优先沿用，缺失才从 usedEds 池无放回抽取。
+    // 判据住在 @utils#getChainExplicitEarlyData，与 sing-box / Clash 同一份。
+    const chainProxy = outProxy ? buildChainOutbound(getChainExplicitEarlyData() ?? pickEarlyData(usedEds)) : undefined;
     const items = await getConfigItems(isFragment);
     const entryPortMap = buildEntryPortMap();
     const totalPorts = ports.filter(port => !isFragment || isHttps(port));
@@ -311,13 +319,24 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     // 每个 (地址, 端口) 的 VLESS 节点备注：XHTTP 节点复用同一个基准名（与 raw URI 侧
     // `${wsRemark} XHTTP` 的命名逐字一致），这样同一次生成不会额外消耗 generateRemark 的编号。
     const vlRemarks = new Map<string, string>();
-    const remarkKey = (host: string, port: number) => `${host}\u0000${port}`;
+
+
+    // B-48：代理条目节点的备注（= 每条单节点配置的 remarks）同样要做唯一化 —— 两个 `#家宽`
+    // 在客户端配置列表里会变成两条同名配置（本端 tag 恒为 "proxy"，不会拒载，但用户无法区分）。
+    // 取「已占用名」集合的方式与另两端一致，见 @utils#uniqueNodeName（B-48）。
+    const cleanRemarks: string[] = [];
 
     // 按 cleanIPs 的输入顺序遍历：普通地址生成 VLESS/Trojan 节点，代理条目生成该协议自己的独立节点
     for (const item of items) {
         if (item.kind === 'proxy') {
-            const remark = cleanProxyRemark(item.value);
-            const outbound = buildCleanProxyOutbound(item.value, `cleanproxy-${index}`);
+            const remark = uniqueNodeName(cleanProxyRemark(item.value), cleanRemarks);
+            cleanRemarks.push(remark);
+            // B-04：tag 必须是 "proxy"。单节点配置的兜底路由恒指向 "proxy"
+            // （routing.ts 的 finallOutboundTag / remoteDnsProxy），原写法用 `cleanproxy-N`
+            // 会让这条配置的全部 TCP 流量路由到不存在的出站 → 客户端「导入成功但连不上」。
+            // 与下方普通 WS 单节点分支（buildWebsocketOutbound("proxy", …)）同一约定：
+            // 那里出站的 tag 就叫 "proxy"。
+            const outbound = buildCleanProxyOutbound(item.value, 'proxy');
             configs.push(await buildConfig(remark, [outbound], false, false, false, false, false, [item.value.server]));
             index++;
             continue;
@@ -325,7 +344,8 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
 
         const host = item.value;
         for (const protocol of protocols) {
-            const addrPorts = portsForHost(entryPortMap, host, totalPorts);
+            // B-52：分片订阅必须把 entries 自带的显式端口也按 TLS-only 过滤（见 @utils#portsForHost）
+            const addrPorts = portsForHost(entryPortMap, host, totalPorts, isFragment);
 
             for (const port of addrPorts) {
                 if ((port === upstreamPort) !== (host === upstreamServer)) continue;
@@ -336,7 +356,7 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
 
                 const remark = generateRemark(port, host, protocol, isFragment, false);
                 // 记下 VLESS 的备注供第二趟 XHTTP 节点复用（协议可能只有 Trojan，故按协议判定）
-                if (protocol === _VL_) vlRemarks.set(remarkKey(host, port), remark);
+                if (protocol === _VL_) vlRemarks.set(remarkKeyOf(host, port), remark);
                 const config = await buildConfig(remark, [outbound], false, false, false, false, false, [host]);
                 configs.push(config);
 
@@ -369,37 +389,19 @@ export async function getXrCustomConfigs(isFragment: boolean): Promise<Response>
     //   与 XHTTP 这一 HTTP 层传输无关，分片订阅里出现 XHTTP 节点没有意义；
     // - sing-box / mihomo 本轮不生成：sing-box 原生不支持 xhttp，mihomo 支持但版本门槛高，
     //   贸然下发只会给用户一份「导入后不可用」的配置。
+    // R-08：枚举逻辑统一走 @utils#enumerateXpNodes，本端只负责渲染成 Config。
     if (xpConfigs === true && !isFragment) {
-        for (const item of items) {
-            // 代理条目有自己的协议与出站，不派生 XHTTP 变体
-            if (item.kind !== 'address') continue;
-
-            const host = item.value;
-            const addrPorts = portsForHost(entryPortMap, host, totalPorts);
-
-            for (const port of addrPorts) {
-                // 与 WS 节点同一条上游代理排除规则，避免上游条目派生出重复的独立节点
-                if ((port === upstreamPort) !== (host === upstreamServer)) continue;
-
-                const outbound = buildXpOutbound(
-                    "proxy",
-                    host,
-                    port,
-                    // 与 WS 节点共用 usedPaths：同一次生成内两种传输的路径互不相同
-                    buildXpNodePath(randomPath, usedPaths)
-                );
-                // 备注加传输后缀：基准名优先复用同地址 VLESS 节点的备注（与 raw URI 侧
-                // `${wsRemark} XHTTP` 一致）；仅当 VLESS 被关掉、该键没有记录时才现取一次。
-                // 两条路径都不会让既有 WS / 链式节点的编号发生变化（复用不发号，兜底发生在主循环之后）。
-                const baseRemark = vlRemarks.get(remarkKey(host, port))
-                    ?? generateRemark(port, host, _VL_, isFragment, false);
-                const remark = `${baseRemark} XHTTP`;
-                configs.push(await buildConfig(remark, [outbound], false, false, false, false, false, [host]));
-            }
+        for (const plan of enumerateXpNodes({
+            items, entryPortMap, ports: totalPorts, vlRemarks,
+            upstreamServer, upstreamPort, isFragment,
+            nextPath: () => buildXpNodePath(randomPath, usedPaths)
+        })) {
+            const outbound = buildXpOutbound("proxy", plan.host, plan.port, plan.path);
+            configs.push(await buildConfig(plan.tag, [outbound], false, false, false, false, false, [plan.host]));
         }
     }
 
-    await addBestPingConfigs(configs, hosts, proxies, chains, isFragment);
+    await addBestPingConfigs(configs, hosts, proxies, chains);
 
     if (isFragment) {
         await addBestFragmentConfigs(configs, usedPaths, usedEds, chainProxy);
@@ -465,11 +467,15 @@ export async function getXrWarpConfigs(
 
     // Clean IPs / Domains 里的代理条目 → 独立可选节点
     //（只做节点：不挂 dialerProxy、不进 proxies/chains 数组，因此不参与链式与最佳延迟组）
-    let cleanProxyIndex = 1;
+    // B-48：备注唯一化，两个 `#家宽` 会得到 `家宽` / `家宽_2`（与另两端同一判据）
+    const cleanRemarks: string[] = [];
     for (const proxy of cleanProxyEntries(globalThis.settings.cleanIPs || [])) {
-        const outbound = buildCleanProxyOutbound(proxy, `cleanproxy-${cleanProxyIndex++}`);
+        const remark = uniqueNodeName(cleanProxyRemark(proxy), cleanRemarks);
+        cleanRemarks.push(remark);
+        // B-04：同上（getXrCustomConfigs 的代理条目分支），单节点配置的兜底路由指向 "proxy"
+        const outbound = buildCleanProxyOutbound(proxy, 'proxy');
         configs.push(await buildConfig(
-            cleanProxyRemark(proxy),
+            remark,
             [outbound],
             false,
             false,
@@ -520,7 +526,7 @@ function modifyOutbound(outbound: Outbound, tag: string, usedEds?: Set<number>, 
     const wsSettings = newOutbound.streamSettings?.wsSettings;
     if (wsSettings) {
         wsSettings.maxEarlyData = pickEarlyData(usedEds);
-        wsSettings.earlyDataHeaderName = "Sec-WebSocket-Protocol";
+        wsSettings.earlyDataHeaderName = earlyDataHeaderName(wsSettings.maxEarlyData);
     }
 
     return newOutbound;

@@ -3,8 +3,7 @@ interface WarpKeys {
     privateKey: string;
 }
 
-const defaultWarpAccounts: WarpAccount[] = [
-    {
+const defaultWarpAccounts: WarpAccount[] = [    {
         privateKey: "sBmQVHEywGAKQ8Ratzo/f5OUCa7MSozZpz1JK2PSVXE=",
         publicKey: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
         warpIPv6: "2606:4700:110:8dd8:de5f:9a89:bfac:749c/128",
@@ -18,7 +17,22 @@ const defaultWarpAccounts: WarpAccount[] = [
     }
 ];
 
-export async function fetchWarpAccounts(env: Env): Promise<WarpAccount[]> {
+/**
+ * B-02：内置兜底账号必须**导出** —— 失败路径要用「不写 KV、直接用内置账号」，
+ * 而 getDataset 需要拿到这份数据源才能跳过 fetchWarpAccounts。
+ *
+ * 注意这份账号是源码内的**公共身份**：所有注册失败的部署共享同一 WARP 身份。
+ * 因此它只应作为临时兜底，不能落进 KV（落进去就等于永久接管，见 kv.ts 的注释）。
+ */
+export const DEFAULT_WARP_ACCOUNTS: readonly WarpAccount[] = defaultWarpAccounts;
+
+/** 注册结果：`fallback === true` 表示走的是内置兜底账号，调用方据此决定是否写失败标记 / 报错 */
+export interface WarpAccountsResult {
+    accounts: WarpAccount[];
+    fallback: boolean;
+}
+
+export async function fetchWarpAccounts(env: Env): Promise<WarpAccountsResult> {
     const warpAccounts: WarpAccount[] = [];
 
     try {
@@ -49,7 +63,7 @@ export async function fetchWarpAccounts(env: Env): Promise<WarpAccount[]> {
         }
 
         await env.kv.put('warpAccounts', JSON.stringify(warpAccounts));
-        return warpAccounts;
+        return { accounts: warpAccounts, fallback: false };
 
     } catch (error) {
         console.error(
@@ -57,13 +71,19 @@ export async function fetchWarpAccounts(env: Env): Promise<WarpAccount[]> {
             error instanceof Error ? error.message : String(error)
         );
 
-        return defaultWarpAccounts;
+        // B-02：**不要**在这里 put 内置账号。kv.ts 的重新注册条件是「KV 里没有有效账号」，
+        // 而内置账号两条都形状合法 → 一旦落库就再也不会重试，把「每条连接重试」换成
+        // 「永远不重试」。失败标记由调用方写（见 kv.ts 的 warpAccountsStaleAt）。
+        return { accounts: [...defaultWarpAccounts], fallback: true };
     }
 }
 
 async function fetchAccount(key: WarpKeys): Promise<any> {
     const response = await fetch('https://api.cloudflareclient.com/v0a4005/reg', {
         method: 'POST',
+        // B-02：注册请求必须自带超时。原实现没有 signal —— 上游「收下连接但不回包」时
+        // 会一直挂到平台 fetch 超时才失败，而这条路径在失败后仍是每条连接都要重走一次。
+        signal: AbortSignal.timeout(8000),
         headers: {
             'User-Agent': 'insomnia/8.6.1',
             'Content-Type': 'application/json'

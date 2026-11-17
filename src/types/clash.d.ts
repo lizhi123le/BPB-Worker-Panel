@@ -255,8 +255,6 @@ export interface RuleProvider {
     "interval": number;
 }
 
-export type ProxyGroup = Selector | URLTest | LoadBalance | Fallback;
-
 interface ExternalControllerCors {
     "allow-origins": ["*"];
     "allow-private-network": true;

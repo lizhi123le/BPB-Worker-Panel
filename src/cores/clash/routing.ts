@@ -1,6 +1,6 @@
 import { RuleProvider } from '#types/clash';
 import { getGeoAssets } from './geo-assets';
-import { isIPv6, isIPv4, accRoutingRules } from '@utils';
+import { isIPv6, isIPv4, accRoutingRules, omitEmpty } from '@utils';
 
 /**
  * 不含 Block/Bypass 与 MATCH 兜底的基础规则行（局域网直连 + UDP 策略）。
@@ -58,10 +58,11 @@ export function buildBypassRules(): string[] {
 
 export function buildRuleProviders(): Record<string, RuleProvider> | undefined {
     const geoAssets = getGeoAssets();
-    return geoAssets.reduce((providers, asset) => {
+    // R-13：omitEmpty 已从 Object.prototype 改为普通函数
+    return omitEmpty(geoAssets.reduce((providers, asset) => {
         addRuleProvider(providers, asset);
         return providers;
-    }, {}).omitEmpty();
+    }, {} as Record<string, RuleProvider>));
 }
 
 function addRuleProvider(

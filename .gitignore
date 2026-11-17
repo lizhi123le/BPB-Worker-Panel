@@ -1,9 +1,16 @@
+# 全量否定 + 白名单：只有下面显式列出的路径会进版本库。
+# 刻意保持「默认不跟踪」——构建产物（dist/）、构建缓存/明文中间产物（.build/，内含
+# worker.reference.js 与 last-build.json 的密钥材料）以及 .wrangler/ 都必须永不入库：
+# 一次 `git add -f` 就会把混淆的意义清零。
 *
 !.gitignore
 !package.json
+!package-lock.json
 !harden.config.json
 !harden.config.example.json
 !tsconfig.json
+!eslint.config.mjs
+!wrangler.toml.example
 !src/
 !src/**
 !scripts/
@@ -17,6 +24,5 @@
 !README_fa.md
 !README.md
 !RELEASE.md
-!NAT64Prefixes.md
 !docs
 !docs/**

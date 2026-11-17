@@ -1,18 +1,20 @@
 import { Authenticate, clearSessionCookieHeader, generateJWTToken, initializePassword, requireSession, resetPassword } from "@auth";
 import { getDataset, updateDataset, InvalidSettingsError } from "@kv";
 import { setKvCache } from "../kv-cache";
-import { DEFAULT_SETTINGS, setSettings } from "@init";
+import { DEFAULT_FALLBACK_DOMAIN, DEFAULT_SETTINGS, setSettings } from "@init";
 import { getClNormalConfig, getClWarpConfig } from "@clash/configs";
 import { getSbCustomConfig, getSbWarpConfig } from "@sing-box/configs";
 import { getXrCustomConfigs, getXrWarpConfigs } from "@xray/configs";
 import { fetchWarpAccounts } from "@warp";
 import { UnifiedWSHandler } from "@unified";
 import { XP_MODE, buildXpExtra, buildXpNodePath } from "@cores/xp";
-import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, htmlResponse, HttpStatus, isKvBound, respond, safeErrorMessage } from "@common";
-import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, generateRemark, generateWsPath, getConfigItems, isTlsPort, parseHostPort, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectSniHost } from "@utils";
+import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, htmlResponse, HttpStatus, isKvBound, respond, safeErrorMessage, securityHeaders } from "@common";
+import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, generateRemark, generateWsPath, getConfigItems, isBareIPv4, isBareIPv6, isTlsPort, parseHostPort, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectSniHost } from "@utils";
 import JSZip from "jszip";
 
 import { prepareWsRuntimeConfig } from "./ws-runtime";
+// S-03：IP 只取校验过的形态
+import { clientIp } from "./client-ip";
 
 /**
  * WS 升级入口。
@@ -320,7 +322,8 @@ export async function fallback(request: Request): Promise<Response> {
         .split('|')
         .map(s => s.trim())
         .filter(s => s && s.toLowerCase() !== 'nginx');
-    const fallbackDomain = (raw.length > 0 ? raw[Math.floor(Math.random() * raw.length)] : 'www.hcaptcha.com')
+    // R-11：兜底域默认值的唯一定义在 @init#DEFAULT_FALLBACK_DOMAIN（原先此处自写了一份字面量）
+    const fallbackDomain = (raw.length > 0 ? raw[Math.floor(Math.random() * raw.length)] : DEFAULT_FALLBACK_DOMAIN)
         .replace(/^https?:\/\//i, '')
         .replace(/\/+$/, '');
     const { url, method, body } = request;
@@ -343,7 +346,14 @@ async function getMyIP(request: Request, env: Env): Promise<Response> {
     const denied = await requireSession(request, env, { method: 'POST' });
     if (denied) return denied;
 
-    const ip = await request.text();
+    // B-31：请求体是客户端输入，必须先校验形态再拼进第三方 URL。
+    // 原写法把 `ip` 原样插进 `http://ip-api.com/json/${ip}?nocache=…`：`1.2.3.4/../x`、`a?b=c`
+    // 之类会直接改写 path/query（轻则 500，重则打到意外端点），且是明文 http 外发。
+    const ip = (await request.text()).trim();
+
+    if (!isBareIPv4(ip) && !isBareIPv6(ip)) {
+        return respond(false, HttpStatus.BAD_REQUEST, 'Invalid IP address.');
+    }
 
     try {
         const response = await fetch(`http://ip-api.com/json/${ip}?nocache=${Date.now()}`);
@@ -366,7 +376,8 @@ async function getRegionInfo(request: Request, env: Env): Promise<Response> {
         const country = cf.country || '';
         const colo = cf.colo || '';
         const city = cf.city || '';
-        const clientIP = request.headers.get('CF-Connecting-IP') || '';
+        // S-03：校验过的形态（这个值会进地理查询 URL 与响应体）
+        const clientIP = clientIp(request);
 
         // Fetch client geolocation
         interface GeoResponse { country: string; countryCode: string; city: string; isp: string; }
@@ -461,7 +472,11 @@ async function getWarpConfigs(request: Request, env: Env): Promise<Response> {
 
         return new Response(arrayBuffer, {
             headers: {
+                // B-32：ZIP 与其它响应统一过一遍安全头（此前只有 Content-Type/Disposition，
+                // 没有 Cache-Control，也没有 nosniff）。
+                ...securityHeaders((globalThis as any)?.env),
                 "Content-Type": "application/zip",
+                // Content-Disposition 必须保留：去掉它浏览器会把 .zip 当成内联内容打开/预览
                 "Content-Disposition": `attachment; filename="${_project_}-Warp-${isPro ? "Pro-" : ""}configs.zip"`,
             },
         });
@@ -498,7 +513,12 @@ export async function serveIcon(): Promise<Response> {
 
     return new Response(body, {
         headers: {
+            // B-32：favicon 此前只带 Content-Type/Cache-Control，缺 nosniff 等安全头 ——
+            // 与其它响应头策略不一致本身就是可判定特征。
+            ...securityHeaders((globalThis as any)?.env),
             'Content-Type': 'image/x-icon',
+            // 图标是长缓存资源：securityHeaders 的 no-store 会把「每页一次 favicon 子请求」
+            // 变成每次都回源。这是它与面板页唯一的刻意差异（显式覆盖，不是漏改）。
             'Cache-Control': 'public, max-age=86400',
         }
     });
@@ -556,7 +576,14 @@ async function updateWarpConfigs(request: Request, env: Env): Promise<Response> 
     if (denied) return denied;
 
     try {
-        await fetchWarpAccounts(env);
+        const { fallback } = await fetchWarpAccounts(env);
+
+        // B-02：fetchWarpAccounts 已改为返回 fallback 标记。此前它内部吞掉一切异常，
+        // 导致这里的 catch 是死代码 —— 面板永远回「更新成功」，运维看不到失败。
+        if (fallback) {
+            return respond(false, HttpStatus.INTERNAL_SERVER_ERROR, 'Failed to register new Warp accounts (upstream unreachable). The built-in fallback accounts are still in use.');
+        }
+
         return respond(true, HttpStatus.OK, 'Warp configs updated successfully!');
     } catch (error) {
         console.log(error);
@@ -564,19 +591,85 @@ async function updateWarpConfigs(request: Request, env: Env): Promise<Response> 
     }
 }
 
-async function decompressHtml(content: string, asString: boolean): Promise<string | ReadableStream<Uint8Array>> {
-    const bytes = Uint8Array.from(atob(content), c => c.charCodeAt(0));
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+/**
+ * P-01：解压后的页面字节按内容缓存。
+ *
+ * 五个页面 HTML 都是**构建期常量**（esbuild define 注入），isolate 生命周期内不会变，
+ * 但原实现每次请求都做一遍 base64 解码 + gzip 解压：面板页 ~80KB → base64 ~110KB，
+ * `/login` 还要把解压结果整体转成字符串。这是每请求固定的 CPU/GC 峰值，
+ * 与本项目历史上多次「CPU 超限规律性复发」同源。
+ *
+ * 缓存的是**解压后的字节**（不是 Response / 不是字符串）：
+ *  - Response 不能复用（body 只能读一次）；
+ *  - 字节可以被多次包成新的 Blob/Stream，互不影响。
+ * 内存成本：五个页面合计约 150KB/isolate，相对 128MB 上限可忽略。
+ */
+const HTML_BYTES_CACHE = new Map<string, Uint8Array>();
 
-    if (asString) {
-        const decompressedArrayBuffer = await new Response(stream).arrayBuffer();
-        const decodedString = new TextDecoder().decode(decompressedArrayBuffer);
-        return decodedString;
+async function decompressHtml(content: string, asString: boolean): Promise<string | ReadableStream<Uint8Array>> {
+    let bytes = HTML_BYTES_CACHE.get(content);
+
+    if (!bytes) {
+        const compressed = Uint8Array.from(atob(content), c => c.charCodeAt(0));
+        const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
+        bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+        HTML_BYTES_CACHE.set(content, bytes);
     }
 
-    return stream;
+    if (asString) {
+        return new TextDecoder().decode(bytes);
+    }
+
+    // 每次返回新流：同一份字节可以被重复消费
+    return new Blob([bytes as unknown as BlobPart]).stream();
 }
 
+/** S-07：DoH 中继的单次请求体上限（RFC 8484 的常规 DNS 报文远小于此；2KB 是报告给的界） */
+const DOH_MAX_BODY_BYTES = 2048;
+
+/** S-07：入站闸门的统一出口（非法 method / content-type / 超限），带安全头与 no-store */
+function dohRejected(status: number, message: string): Response {
+    return new Response(message, {
+        status,
+        headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            ...securityHeaders((globalThis as any)?.env)
+        }
+    });
+}
+
+/**
+ * S-07：按上限读取请求体，超限返回 null。
+ * 不能只信 `Content-Length` —— 它可能缺失（chunked）或撒谎，而这条路径的滥用形态正是「大 body」。
+ */
+async function readBodyWithin(request: Request, limit: number): Promise<ArrayBuffer | null> {
+    const reader = request.body?.getReader();
+    if (!reader) return new ArrayBuffer(0);
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+        total += chunk.value.byteLength;
+        if (total > limit) {
+            try { await reader.cancel(); } catch { /* 已关闭 */ }
+            return null;
+        }
+        parts.push(chunk.value);
+    }
+    // 已经确认 ≤ limit，直接交给 Blob 拼装（比手写逐块 set 短，且只有一次小拷贝）
+    return new Blob(parts as BlobPart[]).arrayBuffer();
+}
+
+/**
+ * DoH 中继（`/dns-query/<subPath>` → `DOH_URL`）。
+ *
+ * S-07：本路由**无鉴权** —— 唯一的凭据是 subPath，而它随订阅 URL 分发给所有用户。
+ * 原实现不校验 method / content-type / 体积，把任意请求原样转发，等于给任何持订阅链接的人
+ * 一个公共 DoH 转发器（烧本 Worker 的请求配额与 CPU）。现在只放行 DoH 的两种合法形状：
+ *  · POST + `Content-Type: application/dns-message`，body ≤ 2KB（RFC 8484 的报文形式）；
+ *  · GET（DoH 的 GET 形式 `?dns=<base64url>`，以及兼容 `?name=&type=` 的 JSON 形态）。
+ * 两者之外一律 400/413。频率限制不在本函数：`/dns-query` 走了 worker.ts 的内置路由分支，
+ * 不经过 firstCheck 的限流闸门（见交付报告）。
+ */
 export async function handleDoH(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const { subPath } = globalThis.httpConfig;
@@ -586,17 +679,32 @@ export async function handleDoH(request: Request): Promise<Response> {
         return fallback(request);
     }
 
+    let dohBody: ArrayBuffer | undefined;
+    if (request.method === 'POST') {
+        const contentType = (request.headers.get('content-type') || '').toLowerCase();
+        if (!contentType.startsWith('application/dns-message')) {
+            return dohRejected(400, 'Bad Request');
+        }
+        const body = await readBodyWithin(request, DOH_MAX_BODY_BYTES);
+        if (!body) return dohRejected(413, 'Payload Too Large');
+        dohBody = body;
+    } else if (request.method !== 'GET') {
+        return dohRejected(405, 'Method Not Allowed');
+    } else if (!url.searchParams.has('dns') && !url.searchParams.has('name')) {
+        // GET 必须带 DoH 参数：`?dns=` 是 RFC 8484，`?name=` 是 JSON 形态。空 GET 只是拿中继探活。
+        return dohRejected(400, 'Bad Request');
+    }
+
     const targetURL = new URL(dohURL);
     url.searchParams.forEach((value, key) => {
         targetURL.searchParams.set(key, value);
     });
 
     // 显式构造：headers 剥离出站敏感头（原 `new Request(url, request)` 会把 Cookie 等整体复制给 DOH_URL）
-    const noBodyMethod = request.method === 'GET' || request.method === 'HEAD';
     const proxyRequest = new Request(targetURL.toString(), {
         method: request.method,
         headers: copySafeOutboundHeaders(request.headers),
-        body: noBodyMethod ? undefined : request.body,
+        body: dohBody,
         redirect: request.redirect
     });
     return fetch(proxyRequest);

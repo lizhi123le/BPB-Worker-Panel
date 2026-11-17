@@ -37,8 +37,14 @@ jobs:
         # 本镜像又自带全局 tsc，会让 `npm run check` 在缺本地 typescript 时照样显示成功，
         # 把问题一路掩盖到构建阶段——所以这里显式 --include=dev，再用 ensure-deps 复查一次：
         # 一旦发现缺包就自己执行 npm install --include=dev 补齐（scripts/build.js 里还会再查）。
+        #
+        # 用 `npm ci`（而不是 `npm install`）：本仓的依赖几乎全是 caret 范围，每小时一次的无锁
+        # 安装会让上游任意一个次版本静默改变发布产物（体积预算只剩 ~1.1KB zip 余量，见
+        # harden.config.json）。`npm ci` 严格按 package-lock.json 安装，产不出「昨天还绿、今天
+        # 卡在混淆搜索」的漂移。代价：仓库里必须有与 package.json 同步的 package-lock.json，
+        # 否则本步会直接失败（这是有意 fail-fast，而不是回退到无锁安装）。
         run: |
-          npm install --include=dev --no-audit --no-fund
+          npm ci --include=dev --no-audit --no-fund
           npm run ensure-deps
 
       - name: Type check

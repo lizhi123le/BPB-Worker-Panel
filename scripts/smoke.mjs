@@ -8,10 +8,14 @@
  *
  * 它把两份 bundle 各自放进**独立进程**、用同一套 Cloudflare 风格桩加载，回放同一段真实会话：
  *   /login、/secrets、/favicon.ico、/panel（未配置/已登录）、/login/authenticate、
- *   /panel/settings、/panel/update-settings、/panel/region、/panel/my-ip、/proxy-ip、/proxy-ip/get、
- *   /sub/<subPath>（raw / clash / sing-box / xray / 各种 query）、/sub/<错误路径>、
- *   /dns-query/<subPath>、/logout、根路径伪装、未知路径（黑名单 + 限流 + 伪装反代）、
- *   畸形编码路径，以及一次 WebSocket 升级。
+ *   /panel/settings、/panel/update-settings（JSON）、/panel/region、/panel/my-ip、/proxy-ip、/proxy-ip/get、
+ *   /sub/raw/<subPath>（xray / sing-box）、/sub/normal/<subPath>（clash / sing-box / xray + 各种 query）、
+ *   /sub/<错误 subPath>（应落伪装兜底）、/dns-query/<subPath>、/logout、根路径伪装、
+ *   未知路径（黑名单 + 限流 + 伪装反代）、畸形编码路径，以及一次 WebSocket 升级。
+ *
+ * 请求清单之外还有一张行为断言表（BEHAVIOR）：它检查"这条路径真的被路由到了 / 真的写进去了"，
+ * 而不只是"两份产物在这个请求上表现一致" —— 两边一起 500、一起落伪装兜底也是"一致"的，
+ * 那样三核心配置生成与设置写入这两层就永远没被执行过。
  *
  * 每份 bundle 都固定了 Math.random / Date / crypto.getRandomValues，并冻结了出站网络，
  * 所以两份产物的每一对响应都必须逐字节相同。任何差异都意味着混淆改变了行为。
@@ -300,10 +304,17 @@ const ctx = { waitUntil() {}, passThroughOnException() {} };
  * - V8 报错文本里内嵌的标识符名：`data is not iterable` → 混淆后 `Dz11iE is not iterable`。
  *   只替换"某个标识符 + 固定句式"这个形状，消息本身的语义（不可迭代 / 未定义 / 不是函数）
  *   原样保留；`Cannot read properties of undefined (reading 'x')` 里的属性名是真实取值，不动。
+ *
+ * 堆栈帧只认**带位置**的形状（`…:行:列`）。旧写法是「空白 + at + 一直吃到行尾」，它一路吃到
+ * 行尾，而单行响应体（压缩后的 HTML 页、raw base64 订阅）里"行尾"就是响应结尾 —— 于是这两类
+ * 响应体被整段删空，比对等于什么都没查。JSON 响应是 `JSON.stringify(data, null, 4)` 的多行
+ * 形态，行尾恰好是帧的结尾，所以旧写法在它们上面才碰巧是对的。
+ * （注意：本注释里刻意不写那个旧正则的字面量 —— 它包含星号加斜杠，会把块注释提前闭合。）
  */
 function normalizeBody(body) {
   return body
-    .replace(/\s+at\s[^\n]*/g, ' <frame>')
+    .replace(/\s+at\s+(?:async\s+)?[^\s(]*\([^)\n]*:\d+:\d+\)/g, ' <frame>')
+    .replace(/\s+at\s+(?:async\s+)?[^\s(]+:\d+:\d+/g, ' <frame>')
     .replace(/([A-Za-z_$][\w$]*)( is not )(iterable|defined|a function|a constructor|an object)/g, '<ident>$2$3')
     .replace(/(Identifier ')[^']+(' has already been declared)/g, '$1<ident>$2')
     .replace(/(Cannot access ')[^']+(' before initialization)/g, '$1<ident>$2');
@@ -336,11 +347,6 @@ function makeEnv() {
 
 /** 请求清单：顺序即状态演化顺序，两份 bundle 完全一致。 */
 function requests() {
-  const form = (fields) =>
-    Object.entries(fields)
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-      .join('&');
-
   return [
     ['GET /login', '/login', {}],
     ['GET /login/ (尾斜杠归一化)', '/login/', {}],
@@ -359,15 +365,19 @@ function requests() {
       '/panel/update-settings',
       {
         method: 'PUT',
-        headers: { cookie: COOKIE_SENTINEL, 'content-type': 'application/x-www-form-urlencoded' },
-        // cleanIPs 决定订阅里会不会出现节点；端口与协议开关决定生成哪些核心配置。
-        body: form({
+        headers: { cookie: COOKIE_SENTINEL, 'content-type': 'application/json' },
+        // 服务端是 `await request.json()`（src/kv.ts 的 updateDataset），面板本身也发 JSON
+        // （src/assets/panel/script.js 的 updateSettings）。字段名必须是 kv.ts 的 fields 白名单里
+        // 认得的名字：旧版本这里是 x-www-form-urlencoded + 自造字段名（vlessConfigs / protocol…），
+        // 于是 request.json() 必然抛错 → 500，而"参考与产物都 500"又必然一致 → 写设置这条链路
+        // （JSON 解析 → 逐字段校验 → KV 写入 → 版本键）从来没被执行过。
+        // ports / VLConfigs / TRConfigs / xpConfigs 决定订阅里生成哪些节点，cleanIPs 留默认。
+        body: JSON.stringify({
           remoteDNS: 'https://8.8.8.8/dns-query',
-          cleanIPs: '104.16.0.1,104.17.0.2',
-          ports: '443,8443',
-          vlessConfigs: 'true',
-          trojanConfigs: 'true',
-          protocol: 'vless'
+          ports: [443],
+          VLConfigs: true,
+          TRConfigs: true,
+          xpConfigs: false
         })
       }
     ],
@@ -375,11 +385,18 @@ function requests() {
     ['GET /proxy-ip (已认证)', '/proxy-ip', { headers: { cookie: COOKIE_SENTINEL } }],
     ['GET /proxy-ip/get (已认证)', '/proxy-ip/get', { headers: { cookie: COOKIE_SENTINEL } }],
 
-    ['GET /sub/<subPath> (raw)', `/sub/${SUB_PATH}`, {}],
-    ['GET /sub/<subPath>?app=clash', `/sub/${SUB_PATH}?app=clash`, {}],
-    ['GET /sub/<subPath>?app=sing-box', `/sub/${SUB_PATH}?app=sing-box`, {}],
-    ['GET /sub/<subPath>?app=xray', `/sub/${SUB_PATH}?app=xray`, {}],
-    ['GET /sub/<subPath>?app=xray&rm=no&qj=only&wk=NL', `/sub/${SUB_PATH}?app=xray&rm=no&qj=only&wk=NL`, {}],
+    // 必须是 handleSubscriptions 真正 switch 得到的路径：`/sub/normal/<subPath>`（clash / sing-box /
+    // xray）与 `/sub/raw/<subPath>`（xray / sing-box）。`app=` 也不能省：client 由 `?app=` 解析
+    // （src/common/init.ts 的 httpConfig.client），空 client 在每个 case 里都落 default → fallback。
+    // 旧版本用的是 `/sub/<subPath>?app=…`：一个 case 都匹配不上，五次请求全部落到伪装兜底，
+    // 于是三核心配置生成层一次都没跑过。
+    ['GET /sub/raw/<subPath>?app=xray', `/sub/raw/${SUB_PATH}?app=xray`, {}],
+    ['GET /sub/raw/<subPath>?app=sing-box', `/sub/raw/${SUB_PATH}?app=sing-box`, {}],
+    ['GET /sub/normal/<subPath>?app=clash', `/sub/normal/${SUB_PATH}?app=clash`, {}],
+    ['GET /sub/normal/<subPath>?app=sing-box', `/sub/normal/${SUB_PATH}?app=sing-box`, {}],
+    // rm/qj/wk 覆盖出站模式与地区，走的是同一 case 的另一条分支，故意保留。
+    ['GET /sub/normal/<subPath>?app=xray&rm=no&qj=only&wk=NL', `/sub/normal/${SUB_PATH}?app=xray&rm=no&qj=only&wk=NL`, {}],
+    // 负例（URL 故意保持"能匹配形状、但 subPath 不对"）：必须落到伪装兜底，不能被任何 case 误接。
     ['GET /sub/<uuid> (错误 subPath)', `/sub/${UUID}`, {}],
     ['GET /dns-query/<subPath>', `/dns-query/${SUB_PATH}?name=example.com&type=A`, {}],
 
@@ -531,6 +548,118 @@ function assertExpected(results) {
   return failures;
 }
 
+// ------------------------------------------------- 行为断言（每案：这条路径真的跑到了吗）
+/** 冻结 fetch 对"未知 URL"的固定响应 —— 伪装反代把上游响应原样回给请求方，就是这个形状。 */
+const UPSTREAM_STUB_BODY = '<!DOCTYPE html><html><body>smoke upstream</body></html>';
+
+const clip = (text, max = 160) => {
+  const value = typeof text === 'string' ? text : String(text);
+  return value.length > max ? `${value.slice(0, max)}…` : value;
+};
+
+/**
+ * 「这条路径真的被路由到了」的判据：响应不能是伪装兜底页。
+ *
+ * 兜底 = 把请求原样转给伪装域名并返回上游响应，所以在桩环境里它的特征就是 `text/html`
+ * 与上游桩那段固定 HTML。判据只认这两点，**不认具体订阅字节**：Clash 字段名、base64 换行
+ * 之类的格式改动不会让这里假失败（逐字节一致性另有参考/产物对照负责）。
+ */
+function notFallback(record) {
+  if (record.threw) return `请求抛错：${record.threw}`;
+  if (record.timeout) return '请求 5 秒超时';
+  if (record.status !== 200) return `期望 200，实际 ${record.status}（${clip(record.body)}）`;
+  const type = String(record.type || '');
+  if (type.includes('text/html')) return `响应是 HTML（content-type=${type}）—— 落到了伪装兜底`;
+  const body = typeof record.body === 'string' ? record.body : '';
+  if (body === UPSTREAM_STUB_BODY) return '响应体等于上游桩正文 —— 落到了伪装兜底';
+  if (body.length === 0) return '响应体为空';
+  return null;
+}
+
+/** raw 订阅：单行 base64（`getURLConfigs` 对节点文本做 base64EncodeUtf8）。 */
+function expectRawSubscription(record) {
+  const reason = notFallback(record);
+  if (reason) return reason;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(record.body)) return `raw 订阅不是单行 base64：${clip(record.body)}`;
+  return null;
+}
+
+/** 三核心 JSON 订阅：能落到兜底之外的正文，再去认一个核心特有的顶层键。 */
+function expectCoreConfig(keys) {
+  return (record) => {
+    const reason = notFallback(record);
+    if (reason) return reason;
+    const missing = keys.filter((key) => !record.body.includes(`"${key}"`));
+    return missing.length === 0 ? null : `配置里缺少顶层键 ${missing.join(', ')}：${clip(record.body)}`;
+  };
+}
+
+/** 设置写入：200 + success:true，且响应回显了刚写进去的值（KV 写入 + 版本键真的走完了）。 */
+function expectSettingsWritten(record) {
+  if (record.threw) return `请求抛错：${record.threw}`;
+  if (record.timeout) return '请求 5 秒超时';
+  if (record.status !== 200) return `期望 200，实际 ${record.status}（${clip(record.body)}）`;
+  let parsed;
+  try {
+    parsed = JSON.parse(record.body);
+  } catch {
+    return `响应不是 JSON：${clip(record.body)}`;
+  }
+  if (parsed.success !== true) return `success !== true（message=${clip(parsed.message)}）`;
+  const written = parsed.body;
+  if (!written || written.remoteDNS !== 'https://8.8.8.8/dns-query') {
+    return `响应体没有回显写入后的设置（body.remoteDNS）：${clip(JSON.stringify(written))}`;
+  }
+  if (!Array.isArray(written.ports) || written.ports[0] !== 443) {
+    return `响应体没有回显写入后的端口（body.ports）：${clip(JSON.stringify(written.ports))}`;
+  }
+  return null;
+}
+
+/** 负例：错误 subPath 必须落到伪装兜底（而不是被某个 case 误接成订阅）。 */
+function expectFallback(record) {
+  if (record.threw) return `请求抛错：${record.threw}`;
+  if (record.timeout) return '请求 5 秒超时';
+  const type = String(record.type || '');
+  if (!type.includes('text/html')) return `期望伪装兜底（text/html），实际 content-type=${type}`;
+  if (record.body !== UPSTREAM_STUB_BODY) return `期望上游桩正文，实际 ${clip(record.body)}`;
+  return null;
+}
+
+/**
+ * 行为断言表。键必须与 requests() 里的名字**逐字一致**（对不上会以"会话里没有 X"失败，
+ * 而不是静默跳过）。
+ */
+const BEHAVIOR = [
+  ['PUT /panel/update-settings (已认证)', expectSettingsWritten],
+  ['GET /sub/raw/<subPath>?app=xray', expectRawSubscription],
+  ['GET /sub/raw/<subPath>?app=sing-box', expectRawSubscription],
+  ['GET /sub/normal/<subPath>?app=clash', expectCoreConfig(['proxies'])],
+  ['GET /sub/normal/<subPath>?app=sing-box', expectCoreConfig(['outbounds'])],
+  ['GET /sub/normal/<subPath>?app=xray&rm=no&qj=only&wk=NL', expectCoreConfig(['outbounds'])],
+  ['GET /sub/<uuid> (错误 subPath)', expectFallback]
+];
+
+function assertBehavior(results) {
+  let failures = 0;
+  for (const [name, check] of BEHAVIOR) {
+    const entry = results.find(([n]) => n === name);
+    if (!entry) {
+      console.log(`  FAIL  会话里没有 ${name}（requests() 与 BEHAVIOR 的名字必须逐字一致）`);
+      failures++;
+      continue;
+    }
+    const reason = check(entry[1]);
+    if (reason) {
+      console.log(`  FAIL  ${name} — ${reason}`);
+      failures++;
+    } else {
+      console.log(`  PASS  ${name}（路径确实被路由到，未落伪装兜底）`);
+    }
+  }
+  return failures;
+}
+
 /** 用独立进程跑一份 bundle，避免共享 globalThis 造成假差异。 */
 function runInChild(bundlePath, tag) {
   mkdirSync(TMP, { recursive: true });
@@ -573,6 +702,7 @@ async function main() {
   if (!existsSync(REFERENCE)) {
     console.log('smoke: 没有参考文件 —— 退化为内容断言模式');
     failures += assertExpected(artifactRun.results);
+    failures += assertBehavior(artifactRun.results);
   } else {
     console.log(`smoke: 参考 ${REFERENCE}`);
     const referenceRun = runInChild(REFERENCE, 'reference');
@@ -603,6 +733,7 @@ async function main() {
       }
     }
     failures += assertExpected(artifactRun.results);
+    failures += assertBehavior(artifactRun.results);
 
     if (referenceRun.bench && artifactRun.bench) {
       const fmt = (n) => `${n.toFixed(2)} ms`;

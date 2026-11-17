@@ -103,15 +103,12 @@ export interface RuleSet {
     // 不再下发 `download_detour`：1.14.0 弃用、1.16.0 移除
 }
 
-export interface InlineRuleSet {
-    type: "inline";
-    tag: string;
-    rules: Array<Record<string, string[]>>;
-}
-
 export interface Route {
     rules: RoutingRule[];
-    rule_set?: Array<RuleSet | InlineRuleSet>;
+    // D-06：内联规则集的结构在此就地声明（原 `InlineRuleSet` 接口除本行外零引用，
+    // acl-template.ts 另写了一份同形字面量）。保留匿名形态是为了让 configs.ts 的
+    // 「远程规则集 + 内联规则集」合并结果仍可赋值，同时不再维护第二份具名声明。
+    rule_set?: Array<RuleSet | { type: "inline"; tag: string; rules: Array<Record<string, string[]>> }>;
     auto_detect_interface: true;
     final: string;
     /**

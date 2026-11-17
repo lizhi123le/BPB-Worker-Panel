@@ -124,6 +124,28 @@ function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array<ArrayBuffer> {
     return out;
 }
 
+/**
+ * B-17：从缓冲里切出所有**完整**的 `[2B len][payload]` 帧逐一交给 emit，返回没凑够的残片
+ * （半帧、或只有一个字节的长度前缀）。返回的残片可能是原缓冲的引用（未切出任何帧时零拷贝）。
+ *
+ * 为什么帧长含前缀本身：VLESS UDP 的长度字段只计 payload，帧的物理长度是 len + 2；
+ * 这样 `[lenHi][lenLo]` 与后续 payload 一起被写进 DNS 上游，不用再做一次拼装。
+ */
+async function drainUdpFrames(
+    buffer: Uint8Array,
+    emit: (frame: ArrayBuffer) => Promise<void>
+): Promise<Uint8Array> {
+    let offset = 0;
+    while (offset + 2 <= buffer.byteLength) {
+        const frameLength = ((buffer[offset] << 8) | buffer[offset + 1]) + 2;
+        if (offset + frameLength > buffer.byteLength) break;   // 半帧：等下一块
+        // slice 得到独立副本：emit 会持有它到写完，不能引用下一次拼接会替换掉的缓冲
+        await emit(buffer.slice(offset, offset + frameLength).buffer as ArrayBuffer);
+        offset += frameLength;
+    }
+    return offset ? buffer.slice(offset) : buffer;
+}
+
 function badRequest(): Response {
     return new Response('Bad Request', { status: 400 });
 }
@@ -160,7 +182,7 @@ function xpLimits(): {
  *   init() → initHttp() → 路径白名单 → initWs(env) → setSettings() → prepareWsRuntimeConfig()
  * 已执行，因此 globalThis.globalConfig / settings / wsConfig 都是本次请求的最新值。
  */
-export async function handleXp(request: Request, env: Env): Promise<Response> {
+export async function handleXp(request: Request, _env: Env): Promise<Response> {
     const limits = xpLimits();
     if (activeXpConnections >= limits.maxConnections) {
         console.log(`[xp] 已达并发上限 ${limits.maxConnections} 条，拒绝新连接`);
@@ -375,8 +397,10 @@ export async function handleXp(request: Request, env: Env): Promise<Response> {
                 'vless',
                 fetcher
             );
-            if (rawClientData.byteLength) await write(rawClientData);
-            void pumpUdpUplink(reader, write);
+            // B-17：首包残余（VLESS 头之后的字节）是第一条 UDP 帧的开头，可能只有半帧。
+            // 先切出其中**完整**的帧立即写（失败仍走本 try 的 500），残余交给上行泵与新字节一起重组。
+            const leftover = await drainUdpFrames(new Uint8Array(rawClientData), write);
+            void pumpUdpUplink(reader, write, leftover);
             startWatchdog();
             return new Response(readable, { headers: XP_RESPONSE_HEADERS });
         } catch (error) {
@@ -482,18 +506,34 @@ export async function handleXp(request: Request, env: Env): Promise<Response> {
         }
     }
 
-    /** 上行泵（UDP）：每条后续 body chunk 都是一条 VLESS UDP 帧，交给 WS 的 UDP 写入器 */
+    /** 上行泵（UDP）：按 [2B len][payload] 重组后逐帧交给 WS 的 UDP 写入器。
+     *
+     *  B-17：request body 是**字节流**，chunk 边界与 UDP 帧边界无关。原实现把每个 chunk 都当成
+     *  一整帧交给 write()（它会砍掉前 2 字节当长度前缀），于是「一帧被切开」时后半个 chunk 的
+     *  头两字节被当成新帧的长度前缀吃掉 → DNS 报文间歇性损坏且无日志。
+     *  这里做与 unified.ts 的 pumpTcpDnsMessages 同型的两字节长度前缀重组：不够一帧就缓存残余。
+     *  `initial` 是首包（VLESS 头之后）切完完整帧剩下的残余，可能非空。 */
     async function pumpUdpUplink(
         source: ReadableStreamDefaultReader<Uint8Array>,
-        write: (chunk: ArrayBuffer) => Promise<void>
+        write: (chunk: ArrayBuffer) => Promise<void>,
+        initial: Uint8Array
     ): Promise<void> {
+        let pending = initial;
         try {
             for (;;) {
                 const { done, value } = await source.read();
                 if (done) break;
                 if (!value?.byteLength) continue;
                 touch();
-                await write(toExactArrayBuffer(value));
+                // 无残余时不拼接（零拷贝直通），有残余才 concat —— 稳态下两条分支都不会反复复制
+                pending = pending.byteLength
+                    ? concatBytes(pending, new Uint8Array(toExactArrayBuffer(value)))
+                    : new Uint8Array(toExactArrayBuffer(value));
+                pending = await drainUdpFrames(pending, write);
+            }
+            if (pending.byteLength) {
+                // 客户端结束时留下残帧：只可能是被截断的查询，丢弃并留一条可检索的日志
+                log(`UDP uplink: ${pending.byteLength}B trailing bytes dropped`);
             }
         } catch (error) {
             log(`UDP uplink pipe error: ${safeErrorMessage(error)}`);

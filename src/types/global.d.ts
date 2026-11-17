@@ -62,6 +62,22 @@ declare global {
         readonly URL?: string;
         readonly DOH_URL: string;
         readonly kv: KVNamespace;
+        // ── 运行时可选的调参键（全部 ??? 语义：未设置即为默认行为，代码里一律按 `?.` 读）──
+        // H-10：这些键原先只能靠 `(globalThis as any).env` 绕过类型，现补声明以便逐处去掉 as any。
+        /** 伪装/兜底域（伪装页与兜底反代的目标域） */
+        readonly PUBLIC_PROXY_IP?: string;
+        /** 伪装反代缓存的时间戳归一总开关（'0' = 关闭，默认开启） */
+        readonly MASK_CACHE_TS_NORM?: string;
+        /** 运维追加的噪声 query 参数（逗号分隔），按名字从缓存键剔除 */
+        readonly MASK_CACHE_NOISE_EXTRA?: string;
+        /** 伪装图片形态（'data' = 回滚到 base64 内联） */
+        readonly MASK_IMG_MODE?: string;
+        /** 强制启用 HSTS（'1' / 'true'） */
+        readonly HSTS_ENABLE?: string;
+        /** 反代池缓存的调试日志开关 */
+        readonly DEBUG?: string;
+        /** 任意其它自定义键（反代池 / 前缀覆盖等），保持宽松以兼容既有部署 */
+        readonly [key: string]: unknown;
     }
 
     interface WarpAccount {
@@ -193,6 +209,14 @@ declare global {
     var globalConfig: GlobalConfig;
     var httpConfig: HttpConfig;
     var wsConfig: WsConfig;
+    // H-10：请求级运行时全局。worker.ts 在每个请求入口把 env / ctx 挂到 globalThis。
+    // 这两个声明让 `globalThis.env` / `globalThis.ctx` 可直读 —— 但**现存调用点仍写
+    // `(globalThis as any).env`**（camouflage / common / handlers / utils 共 15 处），
+    // 因为 Env 里原先缺一批「运行时可选的调参键」（见下面 Env 的 HSTS_ENABLE 等）。
+    // 那些键现已补进 Env：后续可逐处去掉 `as any`，本文件不再有「声明了却没人用」的死面。
+    // 注意：模块被非请求路径加载时 env 实际可能缺失，按可选语义使用的调用点仍须自行判空。
+    var env: Env;
+    var ctx: ExecutionContext;
     var __kvCache: {
         settings: Settings | null;
         timestamp: number;
@@ -230,13 +254,8 @@ declare global {
     const __SECRETS_HTML_CONTENT__: string;
     const __PROXY_IP_HTML_CONTENT__: string;
 
-    interface Array<T> {
-        concatIf<T>(condition: boolean, concat: T | T[]): T[];
-    }
-
-    interface Object {
-        omitEmpty<T>(): T | undefined;
-    }
+    // R-13：原 Array.prototype.concatIf / Object.prototype.omitEmpty 的声明已删除 ——
+    // 两个补丁改成 @utils 里的普通函数（concatIf / omitEmpty），不再污染内置原型。
 }
 
 export { };

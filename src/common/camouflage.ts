@@ -1,5 +1,6 @@
 import {
     evictOldest,
+    escapeHtml,
     fetchWithTimeout,
     withTimeout,
     hstsHeaders,
@@ -9,11 +10,15 @@ import {
     crossRequestSingleFlight,
     createSignatureGate
 } from "@common";
+// S-03：客户端 IP 的唯一取用点（含形态校验；本文件用它作令牌桶的每 IP 键）
+import { clientIp } from './client-ip';
 
 /**
  * URL 伪装 — 对齐 cfnew 的伪装首页全路径反代：
  *  - 伪装域名来源：env `homepage`/`HOMEPAGE`/`URL`/`FALLBACK`（支持 `a|b|c` 列表随机），
- *    特殊值 `nginx` 渲染内建欢迎页；未设置 → 内置 1101 伪装页（hostSniList 仅用于节点 HOST/SNI，不参与伪装页）。
+ *    特殊值 `nginx` 渲染内建欢迎页（hostSniList 仅用于节点 HOST/SNI，不参与伪装页）。
+ *    B-29：未设置**不会**落到 1101 页 —— init() 恒给 `fallbackDomain` 兜底一个域名，
+ *    真正的「未配置」行为是反代到那个兜底域；契约见 resolveMaskTarget。
  *  - 对非 / 且非管理路径的请求做反向代理，保留原路径与查询串。
  *  - 图片伪装：探测到图片 URL 时以 data URI 包装或流式直传，含假阳性保护（HTML 降级）。
  *  - 文本类（text/javascript/json/xml）且 <2MB 时缓冲并重写上游 host，内存缓存 5 分钟。
@@ -258,6 +263,14 @@ type CacheEntry = {
      * 首页缓存与图片缓存都按字节记账（图片另有张数上限），故为可选。
      */
     bytes?: number;
+    /**
+     * B-25：写入时的**完整安全响应头快照**（`filterResponseHeaders` 的结果）。
+     * 原实现只存 contentType，命中时重建的响应就丢了 Location / Content-Language /
+     * Last-Modified 等头 —— 「命中」与「未命中」的响应头集合系统性不同，本身就是
+     * 「这份页面来自 isolate 内存」的指纹；3xx 更会退化成「没有 Location 的 3xx」。
+     * 旧条目没有该字段 → 按 `?? []` 退化处理，自然完成结构迁移。
+     */
+    headers?: [string, string][];
 };
 
 /**
@@ -315,6 +328,12 @@ export async function nginxPage(): Promise<string> {
 
 /** 内置 1101 伪装页（对齐 cfnew html1101：Cloudflare Worker threw exception 错误页，随机 Ray ID） */
 export async function cf1101Page(host: string, accessIP: string): Promise<string> {
+    // S-03：两个入参都来自请求（host = URL 的 host，accessIP = `CF-Connecting-IP`），且都被直接
+    // 拼进 HTML 文本与 <title>。Host 头可伪造；CF-Connecting-IP 在「前面还挂了一层反代」的部署里
+    // 同样由调用方提供 —— 不转义就是反射型注入。渲染侧一律走 escapeHtml（本仓已有，此前未用）。
+    // （键侧即限流/黑名单用的 IP 形态校验在 firstCheck.ts，不在本文件范围，见交付报告。）
+    const safeHost = escapeHtml(host);
+    const safeIP = escapeHtml(accessIP);
     const now = new Date();
     const timestamp =
         now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0') +
@@ -326,7 +345,7 @@ export async function cf1101Page(host: string, accessIP: string): Promise<string
 <!--[if IE 8]>    <html class="no-js ie8 oldie" lang="en-US"> <![endif]-->
 <!--[if gt IE 8]><!--> <html class="no-js" lang="en-US"> <!--<![endif]-->
 <head>
-<title>Worker threw exception | ${host} | Cloudflare</title>
+<title>Worker threw exception | ${safeHost} | Cloudflare</title>
 <meta charset="UTF-8" />
 <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
 <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
@@ -365,11 +384,11 @@ export async function cf1101Page(host: string, accessIP: string): Promise<string
                 <div class="cf-columns two">
                     <div class="cf-column">
                         <h2 data-translate="what_happened">What happened?</h2>
-                            <p>You've requested a page on a website (${host}) that is on the <a href="https://www.cloudflare.com/5xx-error-landing?utm_source=error_100x" target="_blank">Cloudflare</a> network. An unknown error occurred while rendering the page.</p>
+                            <p>You've requested a page on a website (${safeHost}) that is on the <a href="https://www.cloudflare.com/5xx-error-landing?utm_source=error_100x" target="_blank">Cloudflare</a> network. An unknown error occurred while rendering the page.</p>
                     </div>
                     <div class="cf-column">
                         <h2 data-translate="what_can_i_do">What can I do?</h2>
-                            <p><strong>If you are the owner of this website:</strong><br />refer to <a href="https://developers.cloudflare.com/workers/observability/errors/" target="_blank">Workers - Errors and Exceptions</a> and check Workers Logs for ${host}.</p>
+                            <p><strong>If you are the owner of this website:</strong><br />refer to <a href="https://developers.cloudflare.com/workers/observability/errors/" target="_blank">Workers - Errors and Exceptions</a> and check Workers Logs for ${safeHost}.</p>
                     </div>
                 </div>
             </div><!-- /.section -->
@@ -380,7 +399,7 @@ export async function cf1101Page(host: string, accessIP: string): Promise<string
       <span id="cf-footer-item-ip" class="cf-footer-item hidden sm:block sm:mb-1">
         Your IP:
         <button type="button" id="cf-footer-ip-reveal" class="cf-footer-ip-reveal-btn">Click to reveal</button>
-        <span class="hidden" id="cf-footer-ip">${accessIP}</span>
+        <span class="hidden" id="cf-footer-ip">${safeIP}</span>
         <span class="cf-footer-separator sm:hidden">&bull;</span>
       </span>
       <span class="cf-footer-item sm:block sm:mb-1"><span>Performance &amp; security by</span> <a rel="noopener noreferrer" href="https://www.cloudflare.com/5xx-error-landing" id="brand_link" target="_blank">Cloudflare</a></span>
@@ -427,7 +446,7 @@ export async function cf1101RateLimitedResponse(host: string, accessIP: string):
 /**
  * 伪装地址来源（对齐 cfnew，面板 hostSniList 仅用于节点 HOST/SNI，不参与伪装页）：
  * env `homepage`/`HOMEPAGE`/`URL`/`FALLBACK`（支持 `a|b|c` 列表随机）；
- * 特殊值 `nginx` 渲染内建欢迎页；未设置 → 内置 1101 页。
+ * 特殊值 `nginx` 渲染内建欢迎页。**未设置不会落到 1101 页**（见 resolveMaskTarget 的契约说明）。
  */
 function maskSources(): string[] {
     const envVal = String(
@@ -451,8 +470,19 @@ function normalizeTarget(raw: string): string {
     return target.replace(/\/+$/, '');
 }
 
-/** 解析伪装配置：列表随机；未设置 env → 内置 1101 页；FALLBACK=nginx → 内建欢迎页。 */
-export function resolveMaskTarget(): { target: string; isNginx: boolean; is1101: boolean } {
+/**
+ * 解析伪装配置：列表随机；`FALLBACK=nginx` → 内建欢迎页。
+ *
+ * B-29（契约，二选一后选定「删死分支」这一侧，因为 init.ts 不在本次改动范围）：
+ * 本函数**不再产出**「未设置 → 1101 降级页」这个分支 —— 它在生产里不可达：`init()` 恒把
+ * `fallbackDomain` 填成至少 `www.hcaptcha.com`（init.ts 的 `homepage || HOMEPAGE || URL ||
+ * FALLBACK || 'www.hcaptcha.com'`），所以「未设置就不出站」这条运维假设根本不成立，
+ * 未配置时整站反代到 hcaptcha。1101 页只保留给**运行时降级**（额度/熔断，见 cf1101Response
+ * 与 cf1101RateLimitedResponse 的调用点），不再作为「未配置」的产物。
+ * 空源列表（`FALLBACK="|"` 这类）仍返回空 target，由 camouflageProxy 的 `new URL` 失败分支
+ * 兜到 nginx 欢迎页。**若要恢复「未配置 → 1101」，改的必须是 init.ts 的兜底域，不是这里。**
+ */
+export function resolveMaskTarget(): { target: string; isNginx: boolean } {
     const envRaw = String(
         (globalThis as any).env?.homepage ||
         (globalThis as any).env?.HOMEPAGE ||
@@ -462,13 +492,12 @@ export function resolveMaskTarget(): { target: string; isNginx: boolean; is1101:
         ''
     ).trim();
     if (envRaw.toLowerCase() === 'nginx') {
-        return { target: '', isNginx: true, is1101: false };
+        return { target: '', isNginx: true };
     }
-    if (!envRaw) return { target: '', isNginx: false, is1101: true };
     const sources = maskSources();
-    if (sources.length === 0) return { target: '', isNginx: false, is1101: true };
+    if (!envRaw || sources.length === 0) return { target: '', isNginx: false };
     const picked = sources[Math.floor(Math.random() * sources.length)];
-    return { target: normalizeTarget(picked), isNginx: false, is1101: false };
+    return { target: normalizeTarget(picked), isNginx: false };
 }
 
 /** 构造指纹随机化的出站头（清会话凭据与 CF 入站头、Sec-CH-UA，重写 Host/Referer/Origin） */
@@ -959,25 +988,30 @@ function findMaskURLByHash(value: string): URL | null {
 }
 
 /**
- * 未知哈希时的中性响应：一张 1×1 透明 PNG。
+ * 图片子请求的统一中性出口：一张 1×1 透明 PNG + 完整的图片头（见下）。
  *
- * 为什么不回 503：参数名可由 UUID 派生、值又是图地址哈希，回 503 会让
- * 「正确参数名 + 错值」与「任意路径」形成干净的**部署存在性 oracle**；
+ * 为什么不回裸状态码：参数名可由 UUID 派生、值又是图地址哈希，裸 4xx/5xx（无 Content-Type、
+ * 无 nosniff、无 HSTS）会让「正确参数名 + 错值」与「任意路径」形成干净的**部署存在性 oracle**；
  * 回一张合法图片则与真实图床行为一致（且 `<img>` 不会破图）。
+ *
+ * B-28：降级态（`status = 503`）也走这里而不是裸 `new Response(null, {status:503})` ——
+ * 「有 body、有类型」与「什么都没有」在响应头层面是可判定的差异，属于同一类指纹。
+ * 状态码保留 503 是刻意的：`<img>` 子请求被额度降级时不该被浏览器当成真图收下
+ * （tools/camouflage-cpu.test.mjs 也钉住了这个语义）。
  */
 const MASK_PLACEHOLDER_PNG = Uint8Array.from(
     atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='),
     (c) => c.charCodeAt(0)
 );
 
-function placeholderImageResponse(request: Request, env: any): Response {
+function placeholderImageResponse(request: Request, env: any, status = 200): Response {
     const headers = new Headers({
         'Content-Type': 'image/png',
         'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff'
     });
     return new Response(request.method === 'HEAD' ? null : MASK_PLACEHOLDER_PNG, {
-        status: 200,
+        status,
         headers: withHsts(headers, env) as Headers
     });
 }
@@ -995,7 +1029,9 @@ async function serveMaskedImage(paramValue: string, request: Request, env: any):
     const maskURL = findMaskURLByHash(paramValue);
     if (!maskURL) return placeholderImageResponse(request, env);
     const load = await fetchImageLoad(maskURL);
-    if (!load) return new Response(null, { status: 503 });
+    // B-28：取图失败也走中性占位图 —— 裸 503（无 Content-Type/nosniff/HSTS）与同文件其它
+    // 兜底响应的头策略不一致，而这正是「这台部署有没有在代理图片」的旁路指纹。
+    if (!load) return placeholderImageResponse(request, env);
 
     if (load.kind === 'stream') return streamImageResponse(load, request, env);
 
@@ -1016,7 +1052,9 @@ async function serveMaskedImage(paramValue: string, request: Request, env: any):
     // 单段 Range → 206。多段 Range 直接忽略（回 200 全长），浏览器取图不会发多段。
     const range = parseSingleRange(request.headers.get('Range'), size);
     if (range && !isHead) {
-        const slice = load.body.slice(range.start, range.end + 1);
+        // B-28：用 Uint8Array 视图切片，不再整段复制 ArrayBuffer（原写法每个 206 多一次全片拷贝）。
+        // 视图直接作为 Response body 是安全的：底层 ArrayBuffer 在响应被消费期间一定还活着。
+        const slice = new Uint8Array(load.body, range.start, range.end - range.start + 1);
         return new Response(slice, {
             status: 206,
             headers: imageBytesHeaders(load, etag, env, {
@@ -1059,12 +1097,16 @@ const NOISE_QUERY_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * 时间戳类参数名：**只有值看起来是"当前时刻附近的 epoch"时才剔除**。
+ * 时间戳类参数名：**只有在「值形态可自证是缓存破坏参数」时才从缓存键里剔除**。
  *
- * 为什么不能只按名字剔除：`t=` 可能是行情快照时间、`time=` 可能是视频抽帧定位、
- * `timestamp=` 可能是内容筛选参数 —— 剔错了就是缓存投毒（内容错误 + 固化 5 分钟）。
- * 因此这里加一道值形态门：10 位（秒）或 13 位（毫秒）纯数字，且落在 now ±1h 内。
- * `t=1700000000`（上一年的快照）会被保留，这一点在测试里显式钉住。
+ * B-26：判据选错了对象。原实现在**任意路径**上都把「落在 now±1h 的 10 位秒级时间戳」剔掉，
+ * 而「以当前时刻为内容键」的接口（行情、直播抽帧、实时榜单）恰好就是这个形状 ——
+ * 首个访客的快照被折叠成同一个缓存键，5 分钟内发给所有人。
+ * 现在秒级与毫秒级一样**只在静态资源路径**上归一（`STATIC_ASSET_PATH_RE`）：那里的 `?t=`/`?v=`
+ * 才是真·缓存破坏参数，归一不会改变内容；接口路径上的一律保留。
+ *
+ * ⚠️ 不要反向改成「剔远离 now 的值」：那会把 `t=1700000000`（上一年的 as-of 快照）这类
+ * 真正的语义参数折叠掉，撞上 camouflage-cpu.test.mjs 明确钉住的「历史时刻不归一」防投毒红线。
  *
  * 刻意不收 `r`/`rand`/`random`/`cb`/`nonce`：它们的值不是 epoch，无法用值形态自证无害。
  */
@@ -1072,8 +1114,8 @@ const TIMESTAMP_QUERY_KEYS: ReadonlySet<string> = new Set(['t', 'ts', '_t', '_ts
 const EPOCH_WINDOW_SEC = 3600;
 const EPOCH_WINDOW_MS = 3600 * 1000;
 const EMPTY_KEY_SET: ReadonlySet<string> = new Set();
-/** 静态资源路径：只有这类路径上的 13 位毫秒时间戳才当作缓存破坏参数（见 isNearNowEpoch） */
-const STATIC_ASSET_PATH_RE = /\.(?:js|mjs|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|json|map|txt)$/i;
+/** 静态资源路径：只有这类路径上的时间戳才当作缓存破坏参数（见 isNearNowEpoch） */
+export const STATIC_ASSET_PATH_RE = /\.(?:js|mjs|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|json|map|txt)$/i;
 /**
  * 出现这些参数名时**整条查询串都不做时间戳归一**：它们通常是对象 ID / 游标 / 签名，
  * 剔错就是缓存投毒（不同对象折叠成同一键 → 跨访客拿到同一份内容）。
@@ -1083,12 +1125,16 @@ const SEMANTIC_QUERY_KEYS: ReadonlySet<string> = new Set([
     'sign', 'signature', 'token', 'key', 'q', 'query', 'search', 'filter'
 ]);
 
-function isNearNowEpoch(value: string, now: number, allowMs: boolean): boolean {
+function isNearNowEpoch(value: string, now: number, allowStatic: boolean): boolean {
+    // B-26：`allowStatic` = 路径命中 STATIC_ASSET_PATH_RE。非静态资源路径一律不归一 ——
+    // 「值看起来像现在」并不能证明「值不影响内容」，行情/实时榜单正是反例。
+    // 契约（已同步落地）：tools/camouflage-cpu.test.mjs 里对应的两条用例已按本语义改写 ——
+    // 「接口路径上的 t= 保留」与「静态资源路径上的 t= 归一」各钉一条。
+    if (!allowStatic) return false;
     if (/^\d{10}$/.test(value)) return Math.abs(Number(value) - now / 1000) <= EPOCH_WINDOW_SEC;
-    // 13 位毫秒：只允许出现在**静态资源路径**上。日志/订单/消息这类以毫秒时间戳作对象 ID 的
+    // 13 位毫秒：同上，只允许出现在静态资源路径上。日志/订单/消息这类以毫秒时间戳作对象 ID 的
     // 接口路径上若也归一，最近 1 小时内的所有不同对象都会被折叠成一个缓存键。
-    if (allowMs && /^\d{13}$/.test(value)) return Math.abs(Number(value) - now) <= EPOCH_WINDOW_MS;
-    return false;
+    return /^\d{13}$/.test(value) && Math.abs(Number(value) - now) <= EPOCH_WINDOW_MS;
 }
 
 /** 运维追加的噪声参数（`MASK_CACHE_NOISE_EXTRA="k1,k2"`）：按名字无条件剔除，责任在运维 */
@@ -1123,7 +1169,7 @@ function normalizeCacheQuery(search: string, env: any, pathname: string): string
             break;
         }
     }
-    const allowMs = STATIC_ASSET_PATH_RE.test(pathname);
+    const allowStatic = STATIC_ASSET_PATH_RE.test(pathname);
 
     const kept: string[] = [];
     for (const pair of pairs) {
@@ -1132,11 +1178,39 @@ function normalizeCacheQuery(search: string, env: any, pathname: string): string
         if (NOISE_QUERY_KEYS.has(rawKey) || extra.has(rawKey)) continue;
         if (tsNorm && !hasSemantic && TIMESTAMP_QUERY_KEYS.has(rawKey)) {
             const value = eq === -1 ? '' : pair.slice(eq + 1);
-            if (isNearNowEpoch(value, now, allowMs)) continue;
+            if (isNearNowEpoch(value, now, allowStatic)) continue;
         }
         kept.push(pair);
     }
     return kept.length ? '?' + kept.join('&') : '';
+}
+
+/**
+ * S-02：查询串里出现噪声参数时**完全绕过首页缓存**。
+ *
+ * 原实现只是把 `utm_*` / `gclid` / `fbclid` 等从**缓存键**里剔掉（`normalizeCacheQuery`），
+ * 于是 `GET /?utm_source=<script>…` 得到的响应会以「无 query」的键被缓存 5 分钟、
+ * 发给之后所有访客。若上游把 utm_source 回显进 HTML（营销落地页极常见），
+ * 就等于在面板**同源**上执行任意脚本 —— 而这份代理响应没有任何 CSP。
+ *
+ * 绕过缓存后：带噪声参数的请求既不污染别人，也不会因为「每次 query 都不同」把缓存打散
+ * （那本来是剔除噪声参数的初衷）。代价只是这类请求多一次回源，且它们本来就是低频的。
+ */
+function hasNoiseQuery(search: string): boolean {
+    if (!search || search === '?') return false;
+    for (const [key] of new URLSearchParams(search)) {
+        if (NOISE_QUERY_KEYS.has(key.toLowerCase())) return true;
+    }
+    return false;
+}
+
+/**
+ * B-25：缓存条目的响应头快照。
+ * 必须剔掉 Set-Cookie —— 命中时原样回放会把「第一个访客的会话」发给之后 5 分钟内的所有人。
+ * 入参是 `filterResponseHeaders` 的产物（已按白名单过滤），HSTS 由命中侧 `withHsts` 重新追加。
+ */
+function snapshotCacheHeaders(headers: Headers): [string, string][] {
+    return [...headers].filter(([k]) => k.toLowerCase() !== 'set-cookie');
 }
 
 /**
@@ -1191,7 +1265,13 @@ function streamWithBudgetRewrite(
     contentType: string,
     env: any,
     budget: BudgetConfig,
-    reservation: TextReservation
+    reservation: TextReservation,
+    /**
+     * B-08/B-25：是否允许把这份响应写进首页缓存。
+     * 调用方传「GET + 2xx + 无噪声参数」。原实现没有这道门禁 —— 流式分支（上游不给
+     * content-length 时，gzip 响应正是这种）会把任意 method、任意状态码的响应都写进缓存。
+     */
+    cacheable: boolean
 ): Response {
     const source = resp.body;
     const filtered = filterResponseHeaders(resp.headers, maskURL, reqURL);
@@ -1243,13 +1323,14 @@ function streamWithBudgetRewrite(
             // 按「实际改写过的字节」结算退款（预留的是 TEXT_REWRITE_MAX 上限）
             settleTextReservation(budget, reservation, processed);
 
-            if (rewritable) {
+            if (rewritable && cacheable) {
                 cacheHomeEntry(cacheKey, {
                     body: collected,
                     status: resp.status,
                     contentType,
                     time: Date.now(),
-                    bytes: collected.length
+                    bytes: collected.length,
+                    headers: snapshotCacheHeaders(filtered)
                 });
             }
         }
@@ -1267,11 +1348,9 @@ function streamWithBudgetRewrite(
  * 请求路径/查询串原样转发到伪装域名。任何失败降级 nginx 页。
  */
 export async function camouflageProxy(request: Request, env: any): Promise<Response> {
-    const { target, isNginx, is1101 } = resolveMaskTarget();
-    if (is1101) {
-        const reqURL = new URL(request.url);
-        return await cf1101Response(reqURL.host, request.headers.get('CF-Connecting-IP') || '', env);
-    }
+    // B-29：不再有 is1101 分支 —— 「未配置伪装域名」在生产不可达（契约见 resolveMaskTarget）。
+    // 空 target 会落到下面的 `new URL` 失败分支，回 nginx 欢迎页。
+    const { target, isNginx } = resolveMaskTarget();
     if (isNginx) {
         return new Response(await nginxPage(), {
             status: 200,
@@ -1292,17 +1371,22 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
     const reqURL = new URL(request.url);
     const budget = readBudgetConfig(env);
     logBudgetOnce(env, budget);
-    const clientIP = request.headers.get('CF-Connecting-IP') || '';
+    // S-03：IP 一律取校验过的形态（非法头视为无 IP）。这里是**令牌桶的每 IP 键**，
+    // 原先直接读裸头 = 每请求换个假 IP 就能把每 IP 额度无限切分。
+    // 副作用须知：无法识别 IP 的请求会共用「空键」那一个桶 —— 与「该头缺失」的既有行为一致。
+    const clientIP = clientIp(request);
 
     // 准入额度（requests 桶）：每一次进入伪装链的请求都记 1，**含缓存命中** ——
     // 缓存命中仍要付头处理与分支判定的固定成本，而且这是"拿缓存当免费带宽"的唯一约束。
     // 放在最前面，保证图片分支 / 缓存分支 / 反代分支全部受约束（熔断必须覆盖全路径）。
     if (!maskRequestAllowed(budget, clientIP)) {
-        // `<img>` 子请求被降级时必须回空体（503），**绝不回 HTML**：
-        // 否则 <img> 收到 HTML = 坏图 + "图片地址返回 HTML" 这一强指纹（评审 MAJOR）
+        // `<img>` 子请求被降级时必须回**图片字节**（绝不是 HTML）：否则 `<img>` 收到 HTML = 破图 +
+        // 「图片地址返回 HTML」这一强指纹（评审 MAJOR）。
+        // B-28：与其它兜底统一走 placeholderImageResponse（完整图片头 + nosniff + HSTS），
+        // 只是状态码仍是 503 —— 额度降级不该让浏览器把占位图当成真图收下。
         if (IMAGE_EXT_RE.test(target) && reqURL.pathname === '/' && request.method !== 'POST'
             && reqURL.searchParams.has(maskImgParamName())) {
-            return new Response(null, { status: 503 });
+            return placeholderImageResponse(request, env, 503);
         }
         logMaskDegrade('req', budget);
         return await cf1101Response(reqURL.host, clientIP, env);
@@ -1325,15 +1409,28 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
 
     // 缓存键用「实际转发给上游的 path + query」按噪声参数归一化后拼成，
     // 保证「键」与「内容」严格对应：请求原样转发，只有键被归一化。
-    const cacheKey = maskURL.origin + reqURL.pathname + normalizeCacheQuery(reqURL.search, env, reqURL.pathname);
-    const cached = maskHomeCache.get(cacheKey);
+    //
+    // B-08 / S-01：键必须同时含 **method** 与 **访问 Host**（原实现只有 origin+path+query）：
+    //  · 缺 method → 流式分支会把 `POST /` 的上游响应写进「GET /」的键，任何人一条 POST
+    //    就能把首页占位 5 分钟（上游若回显 POST body，则是同源任意 HTML）；
+    //  · 缺 host → 同一 Worker 常绑多个入口（自定义域 + *.workers.dev + 多条 route），
+    //    A 域写入的正文（内部链接全是 A 域）会被 B 域访客命中，泄露部署的另一个主机名。
+    // maskURL.origin 仍保留：它区分上游站点（status / content-type 可能不同）。
+    const cacheKey = `${request.method} ${reqURL.host} ${maskURL.origin}${reqURL.pathname}${normalizeCacheQuery(reqURL.search, env, reqURL.pathname)}`;
+    // S-02：带噪声参数的请求完全绕过缓存（见 hasNoiseQuery）
+    const skipCache = hasNoiseQuery(reqURL.search);
+    const cached = skipCache ? undefined : maskHomeCache.get(cacheKey);
     if (cached && Date.now() - cached.time < MASK_HOME_CACHE_TTL) {
         // 命中即提升为「最近使用」，避免热点键在逐条淘汰时先被扔掉
         cacheHomeEntry(cacheKey, cached);
-        return new Response(cached.body, {
-            status: cached.status,
-            headers: withHsts({ 'Content-Type': cached.contentType, 'Cache-Control': 'no-store' }, env)
-        });
+        // B-25：用写入时的完整安全头快照重建，只补 Content-Type 兜底。
+        // 注意键必须小写：快照来自 Headers（键恒小写），若这里用 'Cache-Control' 再叠加，
+        // Record 里会出现两个大小写不同的同义键 → `new Response(body,{headers})` 会 append 两次，
+        // 得到 `no-store, no-store` —— 那正是本条要消灭的「命中/未命中头集合不同」。
+        const cachedHeaders: Record<string, string> = { 'cache-control': 'no-store' };
+        for (const [k, v] of cached.headers ?? []) cachedHeaders[k.toLowerCase()] = v;
+        if (cached.contentType && !cachedHeaders['content-type']) cachedHeaders['Content-Type'] = cached.contentType;
+        return new Response(cached.body, { status: cached.status, headers: withHsts(cachedHeaders, env) });
     }
 
     cacheCleansing();
@@ -1372,9 +1469,11 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
                 try { await resp.body?.cancel(); } catch { /* 已消费/已关闭 */ }
                 return await cf1101Response(reqURL.host, clientIP, env);
             }
-            const clone = resp.clone();
+            // P-04：**不再 clone()**。旧写法 clone 出第二条 body 分支，而原 resp.body 从头到尾
+            // 无人消费 —— 同一份响应在内存里存两份（clone 内部是 tee，未读分支还会把字节一路缓存），
+            // 常驻内存翻倍。这里直接读原 body：只有一份，读到的就是最终要用的那份。
             try {
-                const text = await withTimeout(clone.text(), 5000, '伪装页读取');
+                const text = await withTimeout(resp.text(), 5000, '伪装页读取');
                 const rewritten = text.replaceAll(maskURL.host, reqURL.host);
                 // 按**解压后**的实际字符数结算（上游 content-length 是压缩后字节，gzip 下会低估算 5~10 倍）
                 settleTextReservation(budget, reservation, text.length);
@@ -1382,21 +1481,31 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
                 // 改写后长度已变，且 body 已被 fetch 解压：沿用上游的帧头会让客户端二次解压/按旧长度读取
                 stripBodyFramingHeaders(filtered);
                 const headersFinal = withHsts(filtered, env);
-                // 只缓存 GET：HEAD 的上游通常回空体，写进缓存会让该键 5 分钟内全是空页面
-                if (request.method === 'GET') {
+                // 只缓存「GET + 2xx + 不带噪声参数」：
+                //  · HEAD 的上游通常回空体（原注释）；
+                //  · 非 2xx 被固化 5 分钟等于把「后端挂了」放大成全站可见（B-25）；
+                //  · 噪声参数见 hasNoiseQuery（S-02）。
+                if (request.method === 'GET' && resp.ok && !skipCache) {
                     cacheHomeEntry(cacheKey, {
                         body: rewritten,
                         status: resp.status,
                         contentType,
                         time: Date.now(),
-                        bytes: rewritten.length
+                        bytes: rewritten.length,
+                        headers: snapshotCacheHeaders(filtered)
                     });
                 }
                 return new Response(rewritten, { status: resp.status, headers: headersFinal });
             } catch (e) {
                 // 失败/超时：预留全额退回，避免一次失败就把额度吃掉
                 settleTextReservation(budget, reservation, 0);
-                console.warn('伪装页缓冲超时，改为流式转发');
+                // P-04：单份内存的代价 —— body 此刻已被 text() 读过（或被 withTimeout 超时打断
+                // 但读取仍在进行），**不可能**再退回流式转发（那只会拿到 locked/已消费的 body，
+                // 还会漏掉流式分支预留下的 TEXT_REWRITE_MAX 额度）。这里尽力取消，
+                // 然后交回外层统一兜底（首页根路径重试 → nginx 页），与其它抓取失败同一出口。
+                try { await resp.body?.cancel(); } catch { /* text() 仍持锁 / 已消费：无可取消 */ }
+                console.warn('伪装页缓冲读取失败，交由外层兜底:', (e as Error)?.message ?? String(e));
+                throw e;
             }
         }
         // 长度未知或 ≥1MB 的文本：边流边改写，超过预算立即停止改写、余下原样流出。
@@ -1409,7 +1518,7 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
                 try { await resp.body?.cancel(); } catch { /* 已消费/已关闭 */ }
                 return await cf1101Response(reqURL.host, clientIP, env);
             }
-            return streamWithBudgetRewrite(resp, maskURL, reqURL, cacheKey, contentType, env, budget, reservation);
+            return streamWithBudgetRewrite(resp, maskURL, reqURL, cacheKey, contentType, env, budget, reservation, request.method === 'GET' && resp.ok && !skipCache);
         }
         // 流式转发路径：过滤上游头，防止服务器信息泄露
         return new Response(resp.body, {

@@ -110,10 +110,18 @@ check('VLESS UDP/53 首包：被识别（进入拨号）且不判非法', r.conn
 //     连接由上行泵的取消路径关掉（无 1008、无 invalid first packet 日志）。
 //     本次合并**没有**改变这条路径（parse 调用刻意留在 try 之外，异常照旧冒泡），这里只做回归钉。
 r = await runFirstPacket(vlessPacket({ atyp: 3, addrBytes: [0x00], payload: [0x00, 0x00] }));
-check('截断 IPv6 首包：不误报为"非法协议"（走既有抛错取消路径）',
-    r.close1008.length === 0 && r.invalidLog === null && r.connectCalls === 0,
+// B-18（有意改动，非回归）：截断的 IPv6 地址头现在按**畸形首包**干净收口。
+// 旧行为是让 `DataView.getUint16` 抛出 RangeError，由上行泵的 catch 兜成 close(1006) +
+// "pipeTo error" 噪音 —— 与本文件 Trojan 侧（parseTrHeader 逐 ATYP 校验 byteLength）不一致。
+// 现在两条协议对同一类输入给出同一裁决：close(1008) + 固定文案（不泄露具体原因，无鉴权 oracle）。
+check('截断 IPv6 首包：按畸形首包干净收口（close 1008，不再走未捕获异常路径）',
+    r.close1008.length === 1 && r.invalidLog?.includes('invalid data') === true && r.connectCalls === 0,
     `closes=${JSON.stringify(r.closeAll)} log=${r.invalidLog} connectCalls=${r.connectCalls}`);
-check('截断 IPv6 首包：异常由上行泵接管（pipeTo error 日志）', r.pipeErrorLog !== null, String(r.pipeErrorLog));
+// 混合回归哨兵：上面那条只断言「有 invalid 日志」，测不出「既 close(1008) 又打一行 pipeTo error」
+// 这种两套收口同时生效的形态（B-18 之前的旧路径正是如此：RangeError 冒泡进上行泵的 catch）。
+// 一条正确的干净收口必须**只**留 invalid first packet 日志，管道层不能有噪音。
+check('截断 IPv6 首包：不走未捕获异常路径（无 pipeTo error 噪音）', r.pipeErrorLog === null, String(r.pipeErrorLog));
+check('截断 IPv6 首包：不进入拨号', r.connectCalls === 0, String(r.connectCalls));
 
 restore();
 out(failures() === 0 ? '\nws-firstpacket: OK' : `\nws-firstpacket: ${failures()} 项失败`);

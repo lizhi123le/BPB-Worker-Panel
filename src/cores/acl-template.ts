@@ -3,6 +3,7 @@
  * 因此它位于 `cores/`（两端共同的父目录），而不是 `cores/clash/`。
  *
  *   - 共享：模板解析与组展开 —— parseIniTemplateText / fetchAclTemplate / generateAclGroups / ACL_BUILTIN_GROUP_TAGS
+ *   - 共享小工具：splitRuleModifiers（B-47，规则值修饰符剥离）
  *   - Clash 专用：buildAclClash / buildAclProviders / CLASH_SUPPORTED_RULE_TYPES / isSupportedClashRuleType
  *   - sing-box 专用：buildAclSingbox / convertClashRulesToSingbox / AclSingboxResult / REJECT_OUTBOUND_TAG / SbBlockOutbound
  *
@@ -395,7 +396,6 @@ export function generateAclGroups(
                     const patterns = compileAllRegex(pg.proxies);
                     proxyList = nodeNames.filter(name => patterns.some(re => re.test(name)));
                 }
-                if (proxyList.length === 0) proxyList = fallbackNodes;
             }
         } else {
             proxyList = type === 'select' ? [directTag, ...fallbackNodes] : [...fallbackNodes];
@@ -412,8 +412,17 @@ export function generateAclGroups(
             blocking = proxyList.some(p => REJECT_POLICY_MEMBERS.has(p));
             // REJECT 保留（由 block 出站承载）；只滤掉 PASS/COMPATIBLE/GLOBAL 这类既无出站、又无语义等价物的名字
             proxyList = proxyList.filter(p => !SB_UNSUPPORTED_MEMBERS.has(p));
-            // 成员被滤空时（模板只写了 `[]PASS` 之类）退回节点清单，避免生成 outbounds 为空的组
-            if (proxyList.length === 0) proxyList = fallbackNodes;
+        }
+
+        // B-07：空分组兜底 —— 唯一归属地，两端共用。
+        // 此前只有「非 select」分支有空兜底（旧 :398）与 sing-box 分支的二次兜底（旧 :416），
+        // **Clash 的 select 分支没有**。而 aclEnabled 出厂为 true、默认模板是 ACL4SSR 全量模板，
+        // 其国别分组几乎都是 `select` + 纯正则（如 `(香港|HK|hk|Hongkong)`），本项目节点名是
+        // `IPv4优选_01` / `domain` 形态 → 一条都匹配不上 → `proxies: []`。
+        // mihomo 对空分组会拒载（新版本）或让该组不可选（旧版本），规则背后全部失效；
+        // 同一模板在 sing-box 端因 `+direct` 并集侥幸存活 —— 正是跨端口径不一致的典型。
+        if (proxyList.length === 0) {
+            proxyList = type === 'select' ? [directTag, ...fallbackNodes] : [...fallbackNodes];
         }
 
         const group: AclGroup = { name: pg.name, type, proxies: proxyList };
@@ -490,6 +499,33 @@ export const CLASH_SUPPORTED_RULE_TYPES: ReadonlySet<string> = new Set([
 /** 规则类型是否受 Clash/mihomo 支持（大小写不敏感；模板里 `[]Final` 之类的大小写差异不影响判定）。 */
 export function isSupportedClashRuleType(ruleType: string): boolean {
     return CLASH_SUPPORTED_RULE_TYPES.has(ruleType.trim().toUpperCase());
+}
+
+/* ------------------------- 规则值修饰符剥离（B-47，两端共用） ------------------------- */
+
+/**
+ * ACL 规则值末尾可以带修饰符（mihomo 的 `,no-resolve`，部分模板还会写 `,src`）。
+ * 它们属于「规则参数」而不是「规则值」，必须拆出来单独处理：
+ *   - 内联规则形如 `ruleset=🎯 全球直连,[]IP-CIDR,10.0.0.0/8,no-resolve`，解析后 ruleVal 会连修饰符
+ *     一起带上；原样拼成 `<type>,<val>,<policy>` 就变成 `IP-CIDR,10.0.0.0/8,no-resolve,<policy>`：
+ *     mihomo 把 no-resolve 当成策略名（策略不存在 → 整份配置拒载），sing-box 把
+ *     `10.0.0.0/8,no-resolve` 当成 CIDR 值（解析失败 → 启动期报错、整份配置不可用）。这是 B-47。
+ *   - URL 规则集路径（convertClashRulesToSingbox）也必须走这里 —— 此前只有该路径做了剥离，
+ *     内联路径没做，两条路径因此漂移。判据只留这一份。
+ * Clash 侧若要保留修饰符，必须放在**策略名之后**（`IP-CIDR,10.0.0.0/8,🎯 全球直连,no-resolve`），
+ * 见 buildAclClash。
+ */
+const RULE_VALUE_MODIFIERS: ReadonlySet<string> = new Set(['no-resolve', 'src']);
+
+/** 把 `10.0.0.0/8,no-resolve` 拆成 `{ value: '10.0.0.0/8', modifiers: ['no-resolve'] }`（修饰符保持原始书写顺序）。 */
+export function splitRuleModifiers(ruleVal: string): { value: string; modifiers: string[] } {
+    const parts = (ruleVal || '').split(',').map(part => part.trim());
+    const modifiers: string[] = [];
+    // 至少保留一段作为规则值：`no-resolve` 本身不能成为值
+    while (parts.length > 1 && RULE_VALUE_MODIFIERS.has(parts[parts.length - 1].toLowerCase())) {
+        modifiers.unshift(parts.pop()!);
+    }
+    return { value: parts.join(','), modifiers };
 }
 
 /* ------------------------- Clash 组装入口 ------------------------- */
@@ -569,17 +605,20 @@ export async function buildAclClash(
     // 3) 内联规则（模板中 `ruleset=` 的裸规则）仍作为普通规则带策略组
     for (const rule of inlineRules) {
         const isFinal = rule.ruleType.toUpperCase() === 'FINAL';
+        // B-47：先把修饰符拆出来。mihomo 允许保留 `no-resolve`，但只能放在**策略名之后**；
+        // 留在规则值里会让它占住策略名那一列（策略名不存在 → 整份配置拒载）。
+        const { value: ruleVal, modifiers } = splitRuleModifiers(rule.ruleVal);
         // C11：先按 Clash 支持的规则类型白名单过滤，未知类型原样下发会让 mihomo 拒绝整份配置。
         // 口径与 keepGroup 一致：丢弃该行并 warn，不猜替代规则（FINAL 走 MATCH，单独放行）。
         if (!isFinal && !isSupportedClashRuleType(rule.ruleType)) {
-            console.warn(`[ACL 规则] 跳过 Clash 不支持的规则类型 ${rule.ruleType},${rule.ruleVal}: ${rule.group}`);
+            console.warn(`[ACL 规则] 跳过 Clash 不支持的规则类型 ${rule.ruleType},${ruleVal}: ${rule.group}`);
             continue;
         }
-        if (!keepGroup(rule.group, isFinal ? 'MATCH' : `${rule.ruleType},${rule.ruleVal}`)) continue;
+        if (!keepGroup(rule.group, isFinal ? 'MATCH' : `${rule.ruleType},${ruleVal}`)) continue;
         if (isFinal) {
             rules.push(`MATCH,${rule.group}`);
         } else {
-            rules.push(`${rule.ruleType},${rule.ruleVal},${rule.group}`);
+            rules.push(`${rule.ruleType},${ruleVal},${rule.group}${modifiers.length ? `,${modifiers.join(',')}` : ''}`);
         }
     }
 
@@ -615,7 +654,8 @@ export function convertClashRulesToSingbox(
         if (parts.length < 2) continue;
         const field = SINGBOX_RULE_TYPE_MAP[parts[0].toUpperCase()];
         if (!field) continue;
-        const value = parts[1].replace(/,?\s*no-resolve$/i, '').trim();
+        // B-47：与内联规则共用同一份修饰符剥离（原先这里只用一条就地正则，判据与内联路径不一致）
+        const value = splitRuleModifiers(parts[1]).value;
         if (!value) continue;
         if (!ruleSet[field]) ruleSet[field] = new Set();
         ruleSet[field].add(value);
@@ -731,18 +771,21 @@ export async function buildAclSingbox(
             finalGroup = rule.group || finalGroup;
             continue;
         }
-        if (!keepGroup(rule.group, `${rule.ruleType},${rule.ruleVal}`)) continue;
+        // B-47：与 Clash 侧共用同一份修饰符剥离。`10.0.0.0/8,no-resolve` 若整串当 ip_cidr 值下发，
+        // sing-box 启动期解析失败、整份配置不可用（修饰符在 sing-box 无对应写法，只能丢弃）。
+        const { value: ruleVal } = splitRuleModifiers(rule.ruleVal);
+        if (!keepGroup(rule.group, `${rule.ruleType},${ruleVal}`)) continue;
         const type = rule.ruleType.toLowerCase();
         const ruleObj: RoutingRule = { outbound: rule.group };
-        if (type === 'domain') ruleObj.domain = [rule.ruleVal];
-        else if (type === 'domain-suffix') ruleObj.domain_suffix = [rule.ruleVal];
-        else if (type === 'domain-keyword') ruleObj.domain_keyword = [rule.ruleVal];
-        else if (type === 'ipcidr' || type === 'ip-cidr') ruleObj.ip_cidr = [rule.ruleVal];
+        if (type === 'domain') ruleObj.domain = [ruleVal];
+        else if (type === 'domain-suffix') ruleObj.domain_suffix = [ruleVal];
+        else if (type === 'domain-keyword') ruleObj.domain_keyword = [ruleVal];
+        else if (type === 'ipcidr' || type === 'ip-cidr') ruleObj.ip_cidr = [ruleVal];
         else if (type === 'geoip') {
             // sing-box 1.8 弃用、1.12 **删除** legacy `geoip` 字段（1.14 实测：`parse rule[N]: geoip database is
             // deprecated ... removed in sing-box 1.12.0` → 整份配置加载失败）。官方迁移口径：
             // `geoip:"private"/"lan"` → `ip_is_private: true`；`geoip:"xx"` → 引用 rule_set `geoip-xx`。
-            const cc = rule.ruleVal.trim().toLowerCase();
+            const cc = ruleVal.trim().toLowerCase();
             if (cc === 'lan' || cc === 'private') {
                 ruleObj.ip_is_private = true;
             } else {
@@ -760,12 +803,12 @@ export async function buildAclSingbox(
                 ruleObj.rule_set = [tag];
             }
         }
-        else if (type === 'process') ruleObj.process = [rule.ruleVal];
+        else if (type === 'process') ruleObj.process = [ruleVal];
         else {
             // C14：未命中已知类型时绝不能把规则类型名（如 `URL-REGEX`）当成 rule_set tag 下发 ——
             // configs.ts 只并入 blockBypass/acl 的 ruleSets，该 tag 从不定义，sing-box 启动期校验直接失败。
             // 口径：跳过该条并 warn（与上方 keepGroup / convertClashRulesToSingbox 的未知类型处理一致）。
-            console.warn(`[ACL 规则] 跳过 sing-box 不支持的规则类型 ${rule.ruleType},${rule.ruleVal}: ${rule.group}`);
+            console.warn(`[ACL 规则] 跳过 sing-box 不支持的规则类型 ${rule.ruleType},${ruleVal}: ${rule.group}`);
             continue;
         }
         inlineRouteRules.push(ruleObj);

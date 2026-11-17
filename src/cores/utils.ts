@@ -7,7 +7,8 @@ import { PUBLIC_PATH_POOL } from "../common/ratelimit";
 
 /** 运行时 env（模块被非请求路径加载时可能为 undefined） */
 function runtimeEnv(): any {
-    return (globalThis as any).env;
+    // H-10：Env 已补运行时可选键 + 索引签名，可直接读 globalThis.env（返回 any 保留原有宽松语义）
+    return globalThis.env as any;
 }
 
 /** 解析 env 中的地址列表（换行或逗号分隔）；未设置或解析为空 → undefined（= 沿用内置默认值） */
@@ -24,38 +25,36 @@ function replaceList(target: string[], next: string[]): void {
 }
 
 // Cloudflare Workers runtime provides global connect function
-declare const connect: (options: { hostname: string; port: number }) => Socket;
+// D-03：原此处有一条 `declare const connect`，全文件从未使用（实现走 (globalThis as any).connect，
+// 且 @cloudflare/workers-types 已自带该全局声明），属纯噪音，已删除。
 
 // ============================================================
 // 特征码字典 —— 内置代理域名生成字典（对齐 cfnew 特征码字典）
 // 通过运行时拼接生成域名，避免静态特征被识别
 // ============================================================
-// === 特征码字典（静态字符串，构建混淆提供代码保护）===
-// 对齐 cfnew 字典生成风格：使用运行时计算避免静态特征码
-const 特征码字典 = [
-  Proxy.name + "IP",                                           // [0] = "ProxyIP"
-  String.fromCharCode(99, 102, 110) + Error.name[0].toLowerCase() + String.fromCharCode(119), // [1] = "cfnew"
-  String.fromCharCode(74) + (typeof {})[0] + Error.name[0].toLowerCase() + String.fromCharCode(121), // [2] = "JOBY"
-  String.fromCharCode(67, 77) + URL.name[2] + (Infinity + '')[3] + URL.name[0].toLowerCase() + String.fromCharCode(115, 115, 115, 115), // [3] = "CMLossss"
-  String(2407 * 300 - 10).split('').reverse().join(''),        // [4] = "090227"
-];
+// D-02：原先是 5 元素数组、只用到 [0] 与 [3]，[1]/[2]/[4] 每次模块加载都白算一遍
+// （且都是常量表达式，起不到混淆作用）。改为两个**具名常量**：语义自明，且删掉未使用项后
+// 不会因为下标位移而改变取值。表达式逐字保留（不改写成裸字符串，避免往产物里塞静态特征码）。
+const 特征码域名前缀 = Proxy.name + "IP";                                   // "ProxyIP"
+const 特征码根域 = String.fromCharCode(67, 77) + URL.name[2] + (Infinity + '')[3]
+    + URL.name[0].toLowerCase() + String.fromCharCode(115, 115, 115, 115);    // "CMLossss"
 
 // 内置 14 个跨地区备份域名（对齐 cfnew 14 地区）
 const 备用地址列表 = [
-    { domain: `${特征码字典[0]}.HK.${特征码字典[3]}.net`, region: 'HK', regionCode: 'HK', port: 443 },
-    { domain: `${特征码字典[0]}.US.${特征码字典[3]}.net`, region: 'US', regionCode: 'US', port: 443 },
-    { domain: `${特征码字典[0]}.SG.${特征码字典[3]}.net`, region: 'SG', regionCode: 'SG', port: 443 },
-    { domain: `${特征码字典[0]}.JP.${特征码字典[3]}.net`, region: 'JP', regionCode: 'JP', port: 443 },
-    { domain: `${特征码字典[0]}.KR.${特征码字典[3]}.net`, region: 'KR', regionCode: 'KR', port: 443 },
-    { domain: `${特征码字典[0]}.DE.${特征码字典[3]}.net`, region: 'DE', regionCode: 'DE', port: 443 },
-    { domain: `${特征码字典[0]}.SE.${特征码字典[3]}.net`, region: 'SE', regionCode: 'SE', port: 443 },
-    { domain: `${特征码字典[0]}.NL.${特征码字典[3]}.net`, region: 'NL', regionCode: 'NL', port: 443 },
-    { domain: `${特征码字典[0]}.FI.${特征码字典[3]}.net`, region: 'FI', regionCode: 'FI', port: 443 },
-    { domain: `${特征码字典[0]}.GB.${特征码字典[3]}.net`, region: 'GB', regionCode: 'GB', port: 443 },
-    { domain: `${特征码字典[0]}.Oracle.${特征码字典[3]}.net`, region: 'Oracle', regionCode: 'Oracle', port: 443 },
-    { domain: `${特征码字典[0]}.DigitalOcean.${特征码字典[3]}.net`, region: 'DigitalOcean', regionCode: 'DigitalOcean', port: 443 },
-    { domain: `${特征码字典[0]}.Vultr.${特征码字典[3]}.net`, region: 'Vultr', regionCode: 'Vultr', port: 443 },
-    { domain: `${特征码字典[0]}.Multacom.${特征码字典[3]}.net`, region: 'Multacom', regionCode: 'Multacom', port: 443 },
+    { domain: `${特征码域名前缀}.HK.${特征码根域}.net`, region: 'HK', regionCode: 'HK', port: 443 },
+    { domain: `${特征码域名前缀}.US.${特征码根域}.net`, region: 'US', regionCode: 'US', port: 443 },
+    { domain: `${特征码域名前缀}.SG.${特征码根域}.net`, region: 'SG', regionCode: 'SG', port: 443 },
+    { domain: `${特征码域名前缀}.JP.${特征码根域}.net`, region: 'JP', regionCode: 'JP', port: 443 },
+    { domain: `${特征码域名前缀}.KR.${特征码根域}.net`, region: 'KR', regionCode: 'KR', port: 443 },
+    { domain: `${特征码域名前缀}.DE.${特征码根域}.net`, region: 'DE', regionCode: 'DE', port: 443 },
+    { domain: `${特征码域名前缀}.SE.${特征码根域}.net`, region: 'SE', regionCode: 'SE', port: 443 },
+    { domain: `${特征码域名前缀}.NL.${特征码根域}.net`, region: 'NL', regionCode: 'NL', port: 443 },
+    { domain: `${特征码域名前缀}.FI.${特征码根域}.net`, region: 'FI', regionCode: 'FI', port: 443 },
+    { domain: `${特征码域名前缀}.GB.${特征码根域}.net`, region: 'GB', regionCode: 'GB', port: 443 },
+    { domain: `${特征码域名前缀}.Oracle.${特征码根域}.net`, region: 'Oracle', regionCode: 'Oracle', port: 443 },
+    { domain: `${特征码域名前缀}.DigitalOcean.${特征码根域}.net`, region: 'DigitalOcean', regionCode: 'DigitalOcean', port: 443 },
+    { domain: `${特征码域名前缀}.Vultr.${特征码根域}.net`, region: 'Vultr', regionCode: 'Vultr', port: 443 },
+    { domain: `${特征码域名前缀}.Multacom.${特征码根域}.net`, region: 'Multacom', regionCode: 'Multacom', port: 443 },
 ];
 
 export function isDomain(address: string): boolean {
@@ -193,9 +192,34 @@ export function cleanProxyRemark(proxy: CleanProxyEntry): string {
 }
 
 /**
+ * B-48：节点名唯一化。
+ *
+ * `cleanProxyRemark` 只取用户备注或 `server:port`，`cleanProxyEntries` 又只按「协议+主机+端口+
+ * 凭据」去重、不管备注重名 —— 用户在两条不同服务器上写同一个 `#家宽`，就会得到两个同名节点。
+ * Clash 的 `proxies` 重名会被 mihomo 拒载，sing-box 的 `outbounds` 重名是 `duplicate outbound
+ * tag` FATAL（本仓已因同类问题给 rule_set tag 做过去重，说明该内核确实严格）。
+ *
+ * 放在这里而不是三个调用点：唯一性属于「登记节点名」这一步的固有契约，判据只应有一份。
+ * 注意 xray 的两个登记点仍是手写的（它「一个节点一份 Config」，无法复用 outbound 追加器），
+ * 但那里调用的也是本函数，判据并不分叉。
+ *
+ * `taken` 传入的是**本订阅内已占用的名字**（含 selectorTags 与之前批次的节点名）。
+ */
+export function uniqueNodeName(base: string, taken: readonly string[]): string {
+    const name = base || 'proxy';
+    if (!taken.includes(name)) return name;
+    let n = 2;
+    while (taken.includes(`${name}_${n}`)) n++;
+    return `${name}_${n}`;
+}
+
+/**
  * 把代理条目追加为独立可选节点：构建出站、登记节点名、登记选择器成员。
  * Clash / sing-box 的普通与 Warp 订阅各有一份逐字相同的循环，合并到这里；
  * 构建器由各端传入（两端出站结构不同）。
+ *
+ * B-48：节点名在这里统一唯一化（重名追加 `_2`/`_3`），批量调用时让 `taken` 顺序推进，
+ * 否则同批两个同名条目会拿到同一个后缀。
  */
 export function appendCleanProxyNodes<T>(
     proxies: CleanProxyEntry[],
@@ -205,7 +229,7 @@ export function appendCleanProxyNodes<T>(
     build: (proxy: CleanProxyEntry, tag: string) => T
 ): void {
     for (const proxy of proxies) {
-        const tag = cleanProxyRemark(proxy);
+        const tag = uniqueNodeName(cleanProxyRemark(proxy), selectorTags);
         outbounds.push(build(proxy, tag));
         proxyTags.push(tag);
         selectorTags.push(tag);
@@ -240,9 +264,25 @@ export function buildEntryPortMap(): Record<string, number[]> {
 export function portsForHost(
     entryPortMap: Record<string, number[]>,
     host: string,
-    fallbackPorts: number[]
+    fallbackPorts: number[],
+    /**
+     * B-52 补口：只保留 HTTPS 端口。
+     *
+     * 分片订阅（`/sub/fragment/*`）只允许 TLS 节点，调用点已把全局端口列表过滤成 TLS-only，
+     * 但 `entryPortMap` 是「条目自带显式端口」的旁路 —— 它对同一个 host 直接返回条目里写的端口，
+     * 绕过那次过滤。而该表由 `cleanIPs + customCdnAddrs` **一起**建：只要任一清单里出现
+     * `cdn.example.com:80`，另一个清单里的同一个 `cdn.example.com` 也会被判成「只有 80 端口」，
+     * 明文端口节点就会混进分片订阅。故过滤必须作用在这里，而不是只筛条目本身。
+     *
+     * 过滤后为空（该 host 只在明文端口上出现过）→ 退回 `fallbackPorts`（调用点已按需过滤）。
+     */
+    tlsOnly = false
 ): number[] {
-    return entryPortMap[host]?.length ? entryPortMap[host] : fallbackPorts;
+    const explicit = entryPortMap[host];
+    if (!explicit?.length) return fallbackPorts;
+    if (!tlsOnly) return explicit;
+    const tlsPorts = explicit.filter(isHttps);
+    return tlsPorts.length ? tlsPorts : fallbackPorts;
 }
 
 /** Find custom name for an address across multiple entry lists, with optional port matching */
@@ -286,6 +326,16 @@ function fnv1aHash(str: string): string {
  */
 export function extractNodeDedupKey(entry: string, defaultPort = '443'): string {
     const noComment = entry.split('#')[0].trim();
+
+    // B-14：**代理条目**（`socks5://user:pass@host:port`、`vless://uuid@host:port` 等）不能按
+    // 裸地址口径算键。原写法对 `socks5://user:pass@1.1.1.1:1080` 会把 `@` 当凭据分隔符、
+    // `lastIndexOf(':')` 落在 user 与 pass 之间，得到 `socks5://user:pass` —— 于是
+    // 「同 scheme 同凭据、不同主机」的条目全部塌缩成一个键，第二条起被静默丢弃
+    // （表现为订阅里只剩第一个 socks/http 代理节点）。
+    // 这里按 scheme 分流：scheme 统一小写，其余部分逐字保留（不能整体 toLowerCase，那会抹平口令大小写）。
+    const scheme = noComment.match(/^([a-z0-9+.-]+):\/\//i);
+    if (scheme) return `proxy:${scheme[1].toLowerCase()}://${noComment.slice(scheme[0].length)}`;
+
     const atIdx = noComment.lastIndexOf('@');
     const bare = atIdx !== -1 ? noComment.slice(0, atIdx).trim() : noComment;
     const lastColon = bare.lastIndexOf(':');
@@ -457,10 +507,11 @@ export async function resolveUrlEntries(entries: string[], env?: Env): Promise<s
                 const cached = await env.kv.get(cacheKey);
                 if (cached) {
                     const parsed: { ts: number; lines: string[] } = JSON.parse(cached);
-                    if (Date.now() - parsed.ts < URL_RESOLVE_TTL) {
-                        urlCacheMap.set(url, parsed.lines);
-                        return;
-                    }
+                    // B-53：过期也先收进内存当**兜底**（下面抓取失败时会用到）。
+                    // 原实现只在未过期时 set，于是「列表 URL 临时不可达」会让该 URL 展开出的
+                    // 全部节点直接从订阅里消失，且没有任何日志。
+                    urlCacheMap.set(url, parsed.lines);
+                    if (Date.now() - parsed.ts < URL_RESOLVE_TTL) return;
                 }
             } catch {}
         }
@@ -468,7 +519,10 @@ export async function resolveUrlEntries(entries: string[], env?: Env): Promise<s
         // 缓存未命中或过期，并发发起网络请求
         try {
             const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-            if (!res.ok) return;
+            if (!res.ok) {
+                console.warn(`[地址列表] ${url} 返回 ${res.status}，沿用上次解析结果（若有）`);
+                return;
+            }
             const text = await fetchTextWithEncoding(res);
             const lines = parseUrlLines(text, url);
             urlCacheMap.set(url, lines);
@@ -482,7 +536,10 @@ export async function resolveUrlEntries(entries: string[], env?: Env): Promise<s
                     });
                 } catch {}
             }
-        } catch {}
+        } catch (error) {
+            // B-53：抓取失败必须留痕。节点静默消失是最难排查的一类故障。
+            console.warn(`[地址列表] 解析 ${url} 失败，沿用上次解析结果（若有）：${safeErrorMessage(error)}`);
+        }
     }));
 
     // 3. 按原始顺序装配，将 URL 替换为解析后的结果
@@ -595,7 +652,7 @@ export function getProtocols() {
         dict: { _VL_, _TR_ }
     } = globalThis;
 
-    return [].concatIf(VLConfigs, _VL_).concatIf(TRConfigs, _TR_);
+    return concatIf(concatIf([], VLConfigs, _VL_), TRConfigs, _TR_);
 }
 
 /** H6：内置第三方测速域名节点。env.SPEEDTEST_ADDRESS 未设置时保持内置 'www.speedtest.net'；
@@ -610,6 +667,85 @@ function envSpeedtestAddress(): string | undefined {
 export type ConfigItem =
     | { kind: 'address'; value: string }
     | { kind: 'proxy'; value: CleanProxyEntry };
+
+/** 备注/节点名的键：同一 (地址, 端口) 的 VLESS 与 XHTTP 变体共用基准名（B-48/XHTTP 复用） */
+export function remarkKeyOf(host: string, port: number): string {
+    return `${host}\u0000${port}`;
+}
+
+/** R-08：XHTTP 第二趟遍历的产物 —— 各端只需按自己的结构渲染 */
+
+export interface XpNodePlan {
+    host: string;
+    port: number;
+    /** 节点名（`<基准名> XHTTP`，基准名优先复用同地址 VLESS 节点的备注） */
+    tag: string;
+    /** 与 WS 节点共用 usedPaths 抽出的伪装路径 */
+    path: string;
+}
+
+/**
+ * R-08：XHTTP 节点枚举（三端第二趟遍历的唯一实现）。
+ *
+ * 三端（xray / sing-box / clash）此前各有一份近乎逐行相同的循环：跳过代理条目 → 按
+ * `portsForHost` 展开端口 → 套用与 WS 节点相同的上游代理排除规则 → 复用/现取基准备注 →
+ * 追加 ` XHTTP` 后缀 → 用 `buildXpNodePath` 抽路径。差异只在「最后怎么渲染」。
+ *
+ * 为什么必须是第二趟、且必须复用 `vlRemarks`：
+ * `generateRemark` 的计数是全局递增的。若把 XHTTP 节点插进主循环，会把后续 WS / 链式节点的
+ * 备注编号整体顶后一位，违反「既有节点输出逐字不变」。本函数因此**只做枚举**，
+ * 且基准名优先复用主循环已生成的备注；只有在 VLESS 被关掉、该键没有记录时才现取一次
+ * （此时兜底发生在主循环之后，仍不影响既有编号）。
+ *
+ * @param vlRemarks 主循环记录的「(地址,端口) → VLESS 备注」表
+ * @param nextPath  路径生成器（各端传 `() => buildXpNodePath(randomPath, usedPaths)`）。
+ *                  以回调形式传入而非在 @utils 内实现：`buildXpNodePath` 住在 `@cores/xp`，
+ *                  而 xp.ts 已 import @utils —— 反向依赖会形成循环。回调按**枚举顺序**逐条调用，
+ *                  因此 usedPaths 的消耗顺序与逐端手写循环时完全一致。
+ */
+export function enumerateXpNodes(options: {
+    items: ConfigItem[];
+    entryPortMap: Record<string, number[]>;
+    ports: number[];
+    vlRemarks: Map<string, string>;
+    upstreamServer?: string;
+    upstreamPort?: number;
+    isFragment: boolean;
+    nextPath: () => string;
+}): XpNodePlan[] {
+    const {
+        items, entryPortMap, ports, vlRemarks,
+        upstreamServer, upstreamPort, isFragment, nextPath
+    } = options;
+
+    const plans: XpNodePlan[] = [];
+
+    for (const item of items) {
+        // 代理条目有自己的协议与出站，不派生 XHTTP 变体
+        if (item.kind !== 'address') continue;
+
+        const host = item.value;
+        const addrPorts = portsForHost(entryPortMap, host, ports);
+
+        for (const port of addrPorts) {
+            // 与 WS 节点同一条上游代理排除规则，避免上游条目派生出重复的独立节点
+            if ((port === upstreamPort) !== (host === upstreamServer)) continue;
+
+            const baseRemark = vlRemarks.get(remarkKeyOf(host, port))
+                ?? generateRemark(port, host, globalThis.dict._VL_, isFragment, false);
+
+            plans.push({
+                host,
+                port,
+                tag: `${baseRemark} XHTTP`,
+                // 与 WS 节点共用 usedPaths：同一次生成内两种传输的路径互不相同
+                path: nextPath()
+            });
+        }
+    }
+
+    return plans;
+}
 
 /**
  * 把上游代理条目并入节点序列（订阅生成入口共用）：
@@ -672,13 +808,34 @@ export async function getConfigItems(isFragment: boolean): Promise<ConfigItem[]>
     reachableIPv6.forEach((ip: string) => pushAddress(`[${ip}]`));
 
     pushEntries(cleanIPs);
-    // customCdnAddrs 仍只作地址（既有语义不变），代理写法在 entryAddresses 里被跳过
-    if (!isFragment) entryAddresses(customCdnAddrs).forEach(pushAddress);
+    // customCdnAddrs 仍只作地址（既有语义不变），代理写法在 entryAddresses 里被跳过。
+    // B-52：分片订阅此前整段丢弃 customCdnAddrs（`if (!isFragment)` 一行），于是
+    // /sub/fragment/*（xray 与 sing-box 各有入口）比普通订阅**整整少一段节点**。
+    // 不能只把这个判断删掉了事：分片订阅只保留 TLS 端口（各端 configs 的
+    // `ports.filter(port => !isFragment || isHttps(port))`），而 portsForHost 对
+    // 「条目自带显式端口」的地址**不走**那条过滤（它直接返回 entryPortMap 的端口表），
+    // 于是放开后 `x.com:80` 这类明文端口节点会混进分片订阅。
+    // 正确做法是在**本函数**按条目自带端口逐条筛：显式端口必须是 HTTPS 端口；
+    // 没写端口的条目继承全局端口列表，而全局列表在调用点已被 totalPorts 过滤成 TLS-only。
+    if (isFragment) {
+        for (const entry of customCdnAddrs) {
+            if (parseCleanProxy(entry)) continue;   // 与 entryAddresses 同规则：代理条目不是地址
+            const port = entryPort(entry);
+            if (port && !isHttps(port)) continue;   // 显式明文端口 → 不进分片订阅
+            pushAddress(entryAddress(entry));
+            // 取舍：customCdnAddrs 是 selectSniHost 里 allowInsecure 的唯一触发源，
+            // 并入这些地址即「分片订阅与普通订阅对同一地址给出同一 TLS 判据」——
+            // 这是修复前不可能成立的一致性（分片侧根本没有这些节点）。
+        }
+    } else {
+        entryAddresses(customCdnAddrs).forEach(pushAddress);
+    }
 
     return items;
 }
 
-const remarkCounter: Record<string, number> = {};
+// D-02：无原型对象 —— 备注可能是 `constructor` / `toString` 这类原型键，普通 `{}` 会让`+1` 落进函数对象。
+const remarkCounter: Record<string, number> = Object.create(null);
 
 export function resetRemarkCounter() {
     for (const key of Object.keys(remarkCounter)) {
@@ -976,6 +1133,148 @@ export function selectSniHost(address: string, sniHostOverride?: string) {
     return { host, sni, allowInsecure: isCustomAddr };
 }
 
+/**
+ * R-04：节点 TLS 上下文的**判据对象**（host / sni / isTLS / allowInsecure / ECH 名 / alpn）。
+ *
+ * 只产出判据，不产出配置：三端（Xray / sing-box / Clash）各自的渲染差异留在各自的
+ * build* 函数里（xray 的 tlsSettings、sing-box 的 tls 块、Clash 的 tls 字段），判据只有这一套。
+ *
+ * 判据要点（三端必须逐条一致）：
+ *  1. `isTLS` 由 #isTlsPort 决定：显式端口表里出现过该端口即按 TLS 处理，否则同一节点会出现
+ *     URI 写 security=tls、配置写 none 的自相矛盾组合。
+ *  2. 随机抽取顺序固定为「先 hostSniList，再 echServerName」：它决定同一份订阅里 SNI 与 ECH 名的
+ *     配对。⚠️ 一次性漂移（须知）：本轮把 sing-box 从「先抽 ech 名」对齐到「host 先抽」，
+ *     分布不变、但同一份订阅的 SNI/ECH 配对会与旧版本不同 —— 这是有意为之，**不是 bug**，
+ *     下一轮不要把它「改回去」。
+ *  3. ECH 名名单为空时回退到本节点 host（`pickRandomEch(echServerName) || host`），与
+ *     handlers.ts#buildConfig（URI 侧）的同一表达式逐字一致（B-43）。
+ *  4. 仅当本节点**真的**启用 ECH（echName 有值）时才抑制 alpn（G13-C7）；分片节点不启用 ECH，
+ *     必须放行 alpn，否则该节点既无 ECH 也无 alpn。
+ *  5. `allowInsecure` 只来自 #selectSniHost（地址命中 customCdnAddrs），三端同源同值。
+ *
+ * `isFragment` 只影响 ECH（分片节点不启用）；Clash 无分片订阅，恒传 false。
+ */
+export interface NodeTlsCriterion {
+    /** selectSniHost 给出的 Host 头值（同时用作 wsSettings / xhttpSettings 的 host） */
+    host: string;
+    /** TLS 的 serverName（= 节点 SNI） */
+    sni: string;
+    /** 该 (地址, 端口) 是否按 TLS 处理 */
+    isTLS: boolean;
+    /** 是否跳过证书校验（仅 customCdnAddrs 命中的地址为 true） */
+    allowInsecure: boolean;
+    /** 本节点的 ECH 名；undefined = 本节点不启用 ECH */
+    echName?: string;
+    /** 本节点要下发的 alpn 档位；本节点启用 ECH 时恒 undefined（判据第 4 条） */
+    alpn?: string;
+}
+
+export function resolveNodeTls(address: string, port: number, isFragment: boolean): NodeTlsCriterion {
+    const {
+        settings: { alpn, enableECH, echServerName, hostSniList }
+    } = globalThis;
+
+    const isTLS = isTlsPort(port, address);
+    const { host, sni, allowInsecure } = selectSniHost(address, pickRandomEch(hostSniList));
+    const echName = enableECH && !isFragment ? (pickRandomEch(echServerName) || host) : undefined;
+
+    return {
+        host,
+        sni,
+        isTLS,
+        allowInsecure,
+        echName,
+        alpn: echName ? undefined : (alpn || undefined)
+    };
+}
+
+/**
+ * R-05：传输层 path 的**唯一预处理判据**（tcp/raw、ws、httpupgrade、grpc 四种分支共用）。
+ *
+ * 只取首个 `?` 之前的部分：
+ *  - B-50 的成因就是这里 —— outProxy 的 `?ed=` 若原样写进 wsSettings.path / ws-opts.path，
+ *    客户端会把整串当成 WS 请求路径，节点连不上；early-data 阈值另有 maxEarlyData /
+ *    max-early-data 字段承载。
+ *  - 普通节点（generateWsPath / buildXpNodePath）的 path 不含 query → 输出逐字不变。
+ *  - 判据与传输类型无关（四种分支都无条件剥 query），故签名不带 type：带上只会让人误以为
+ *    某些传输被豁免，而三家实际上都不豁免。
+ */
+export function normalizeTransportPath(path: string = "/"): string {
+    return path?.split("?")[0];
+}
+
+/**
+ * R-05b：WS early-data 的协议头名与「有值才写」判据。
+ *
+ * 这条判据原先在 6 处重复（xray 的 ws / modifyOutbound、sing-box 的 ws / 链式重抽、
+ * clash 的 ws / 链式重抽），且都以 `earlyData ? "Sec-WebSocket-Protocol" : undefined` 的
+ * 字面量三元式出现 —— 三端必须完全一致（否则同一份订阅里一种客户端带 early-data、另一种不带）。
+ * 值本身也进了三份 .d.ts 的字面量类型，故这里用 `typeof` 保持字面量类型不丢。
+ */
+const EARLY_DATA_HEADER_NAME = "Sec-WebSocket-Protocol";
+
+/**
+ * R-05b：WS early-data 的协议头名与「有值才写」判据（**唯一导出形式**）。
+ *
+ * 这条判据原先在 6 处重复（xray 的 ws / modifyOutbound、sing-box 的 ws / 链式重抽、
+ * clash 的 ws / 链式重抽），且都以 `earlyData ? "Sec-WebSocket-Protocol" : undefined` 的
+ * 字面量三元式出现 —— 三端必须完全一致（否则同一份订阅里一种客户端带 early-data、另一种不带）。
+ * 常量本身不导出：调用点一律传「已确定的 early-data 值」，让「值」与「是否写头」只有一个判断入口。
+ * 返回值保持字面量类型（三份 .d.ts 里该字段就是该字面量），故用 `typeof`。
+ */
+export function earlyDataHeaderName(earlyData?: number): typeof EARLY_DATA_HEADER_NAME | undefined {
+    return earlyData ? EARLY_DATA_HEADER_NAME : undefined;
+}
+
+/**
+ * R-06：链式克隆体的 early-data 取值（**唯一判据**）。
+ *
+ * 两条规则原先在 sing-box 与 clash 各写一遍（连注释都同义）：
+ *  1. 用户的显式 `ed` 优先，且**只由调用点传给第一个克隆体**（原型不出现在输出里，
+ *     不显式传下来就等于静默丢弃用户配置）；
+ *  2. 否则从共享 `usedEds` 池无放回抽取 —— `pickEarlyData` 自身会写入池，
+ *     但显式值这条路不会，故这里补一次注册，保证同批节点的 ed 仍然两两不同。
+ *
+ * 返回的阈值由调用方按自己的 schema 落字段（`max_early_data` / `ws-opts["max-early-data"]`）；
+ * 「只有 ws 传输才需要」这个前置判断也留在各端（xray 的字段名、clash 的 http-upgrade 判据都不同）。
+ */
+export function resolveChainEarlyData(usedEds: Set<number> | undefined, explicitEd?: number): number {
+    const earlyData = explicitEd ?? pickEarlyData(usedEds);
+    if (usedEds && !usedEds.has(earlyData)) usedEds.add(earlyData);
+    return earlyData;
+}
+
+/**
+ * R-06 / B-50：链式出站显式 early-data（outProxy 的 `ed`）的**唯一判据**。
+ *
+ * 取值来源按 outProxy 形态分流，两个来源互斥：
+ *  1) VLESS / Trojan / SS —— kv.ts#extractProxyParams 把 URI 的 query **原样并入** outProxyParams，
+ *     故 `ed` 直接读字段即可（不再重解析一遍 URI query，等价且少一次 `new URL` 的抛错面）。
+ *  2) VMess（B-50）—— outProxy 是整段 base64（`vmess://<base64>`），`new URL()` 的 search 恒为空，
+ *     `ed` 只能藏在 base64 里 JSON 的 `path` 字段（ws 传输的 path 可带 `?ed=`）。
+ *     此时 `path` 会被 #normalizeTransportPath 剥掉 query，故 ed 不会漏进 ws 路径，只进 early-data 阈值。
+ *
+ * 显式值是用户自己写的配置，原样沿用，不做 2048..2560 区间钳制（可能超出，保持既有行为）；
+ * 缺失 / 非数值一律返回 undefined（由调用点从 usedEds 池无放回抽取），绝不抛错。
+ */
+export function getChainExplicitEarlyData(): number | undefined {
+    const { outProxyParams } = globalThis.settings;
+
+    // ① query 形态（VLESS / Trojan / SS）：kv 侧已把 `?ed=` 并进同一个对象
+    const fromQuery = outProxyParams?.ed;
+    if (fromQuery !== undefined && fromQuery !== null && fromQuery !== "" && Number.isFinite(+fromQuery)) {
+        return +fromQuery;
+    }
+
+    // ② VMess base64 形态（B-50）：ed 藏在 JSON 的 path 字段里
+    if (outProxyParams?.protocol === globalThis.dict._VM_) {
+        const match = /[?&]ed=([^&#]*)/.exec(outProxyParams.path ?? "");
+        if (match && match[1] !== "" && Number.isFinite(+match[1])) return +match[1];
+    }
+
+    return undefined;
+}
+
 export function parseHostPort(input: string, brackets?: boolean): { host: string, port: number } {
     // C-05：统一规范化 —— 首尾空白 + `@REGION` 标签在这里吸收掉，不再要求调用点先 stripRegionTag；
     // 规范化后为空串（或只剩空白）时保持原语义返回 {host:"",port:0}，交给调用点按「无地址」处理。
@@ -1130,15 +1429,27 @@ export function toRange(min?: number, max?: number) {
     return `${min}-${max}`;
 }
 
-Array.prototype.concatIf = function <T>(condition: boolean, concat: T | T[]): T[] {
-    if (!condition) return this;
-    if (Array.isArray(concat)) return [...this, ...concat];
-    return [...this, concat]
+/**
+ * R-13：条件拼接（原 `Array.prototype.concatIf`）。
+ *
+ * 原实现直接给 `Array.prototype` 赋值，是**可枚举**的原型属性：任何 `for...in` 遍历
+ * （本仓目前没有，但产物里还打包了第三方代码，属于「引入即静默」的一类污染）
+ * 都会把 `concatIf` 当成数组的一个键。改成普通函数后语义不变，调用点显式传入数组。
+ */
+export function concatIf<T>(base: T[], condition: boolean, concat: T | T[]): T[] {
+    if (!condition) return base;
+    return Array.isArray(concat) ? [...base, ...concat] : [...base, concat];
 }
 
-Object.prototype.omitEmpty = function <T>(): T | undefined {
-    if (Object.keys(this).length === 0) return undefined;
-    return this as T;
+/**
+ * R-13：空对象/空数组 → undefined（原 `Object.prototype.omitEmpty`）。
+ *
+ * 同上：`Object.prototype` 上的可枚举属性会出现在**任何**对象的 `for...in` 里。
+ * 语义保持逐字一致（`Object.keys([]).length === 0`，故空数组同样返回 undefined ——
+ * 这是既有行为，多个调用点依赖它来省略空的 hosts / endpoints 字段）。
+ */
+export function omitEmpty<T extends object>(value: T): T | undefined {
+    return Object.keys(value).length === 0 ? undefined : value;
 }
 
 // ── Region matching for nearest proxy IP selection ──

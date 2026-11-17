@@ -32,8 +32,11 @@ jobs:
           node-version: 'latest'
 
       - name: Install dependencies
+        # npm ci（而非 npm install）：按 package-lock.json 精确安装，避免每 3 小时一次的无锁
+        # 安装把上游次版本漂移带进发布产物。要求 package-lock.json 已入库且与 package.json 同步，
+        # 否则本步直接失败（有意 fail-fast）。
         run: |
-          npm install
+          npm ci
           sudo apt-get update
           sudo apt-get install -y jq
 

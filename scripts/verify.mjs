@@ -284,20 +284,138 @@ const unescape = (s) =>
     .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
     .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
 
-const bannedWords = readList('sensitive_words_auto.txt', 'bpb\nvless\ntrojan\n')
-  .split('\n')
-  .map((w) => w.trim())
-  .filter((w) => w && !w.startsWith('#'));
-
+// 明文扫描面：先把 \xNN / \uNNNN 转义还原（"拆成单字符转义"这种伪隐藏挡不住），
+// 再把上面已识别出的密文块挖空（随机 base64 不该被误判成明文）。
 let visibled = unescape(artifact);
 for (const literal of ciphertexts) {
   visibled = visibled.split(JSON.stringify(literal)).join('""');
 }
-const leaked = bannedWords.filter((word) => new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(visibled));
-if (leaked.length === 0) {
-  pass(`硬性禁止词无一以明文幸存（${bannedWords.join(', ')}）`);
+
+// 词表里混着两类词，判定必须分开：
+//   · 整词（bpb / vless / trojan / panel…）→ `\b词\b`；
+//   · 片段（xhtt ⊂ xhttp、ncrypt ⊂ encrypt、ipv ⊂ ipv4、port ⊂ upstreamPort…）→ 子串。
+// `\b` 要求两侧都是非单词字符，对片段而言**数学上不可能命中**，于是这些条目在旧实现里等于
+// 永久豁免；而混淆器一侧用的是 `lower.includes(word)`（scripts/obfuscate.mjs 的
+// isSensitiveString），两侧判据因此分叉：混淆器藏了、闸门却看不见。
+//
+// 数据驱动：词表里可以用 `~` 前缀显式声明「片段词」（`~xhtt`），便于人读与将来的数据文件；
+// 但判定不依赖这个前缀 —— **每个词两种模式都跑**，任一模式命中即失败，报告里写明哪种模式命中。
+// 这样不用改 sensitive_words_auto.txt（不在本次可改范围），现有词表立刻生效。
+//
+// 片段模式的唯一豁免是 JS/Web 平台内置名（PLATFORM_TOKENS）：`typeof` 里的 `type`、
+// `globalThis` 里的 `lobal`、`export` 里的 `port`、`toString` 里的 `ost`、
+// `MessageChannel` 里的 `ech`、`WebSocketPair` 里的 `sock` 都不是泄露 —— 它们必然出现在
+// 任何 ESM 产物里，算成泄露只会让这道闸门永远红。豁免只针对「命中位置所在的整个标识符恰好
+// 等于某个平台内置名」的情形，所以 `upstreamPort`、`xhttpConfigs` 这类仍然失败。
+const bannedSpecs = readList('sensitive_words_auto.txt', 'bpb\nvless\ntrojan\n')
+  .split('\n')
+  .map((line) => line.trim())
+  .filter((line) => line && !line.startsWith('#'))
+  .map((line) => {
+    const declaredSubstring = line.startsWith('~');
+    return { word: declaredSubstring ? line.slice(1).trim() : line, declaredSubstring };
+  })
+  .filter(({ word }) => word.length > 0);
+
+const bannedWords = bannedSpecs.map(({ word }) => word);
+
+/**
+ * 平台内置名白名单。新增条目必须同时满足：它是 JS / Web 平台自带的名字，且不是本仓库
+ * 源码自己的标识符或字符串 —— 否则就是在给泄露开后门。
+ */
+const PLATFORM_TOKENS = new Set([
+  // 语言 / 模块关键字形态
+  'typeof', 'instanceof', 'export', 'import', 'default', 'undefined', 'constructor', 'prototype',
+  // 全局对象与常见内建
+  'globalThis', 'global', 'window', 'self', 'Object', 'Function', 'Array', 'String', 'Number',
+  'Boolean', 'Symbol', 'BigInt', 'Promise', 'Proxy', 'Reflect', 'RegExp', 'JSON', 'Math', 'Date',
+  'Map', 'Set', 'WeakMap', 'WeakSet', 'ArrayBuffer', 'DataView', 'Uint8Array', 'Uint16Array',
+  'Uint32Array', 'Int8Array', 'Int16Array', 'Int32Array', 'Float32Array', 'Float64Array',
+  'TextEncoder', 'TextDecoder', 'TextEncoderStream', 'TextDecoderStream',
+  'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'EvalError', 'URIError',
+  'AggregateError',
+  'URL', 'URLSearchParams', 'Headers', 'Request', 'Response', 'AbortController', 'AbortSignal',
+  'Blob', 'File', 'FormData', 'ReadableStream', 'WritableStream', 'TransformStream',
+  'ByteLengthQueuingStrategy', 'CountQueuingStrategy', 'CompressionStream', 'DecompressionStream',
+  'WebSocket', 'WebSocketPair', 'MessageChannel', 'MessagePort', 'MessageEvent', 'postMessage',
+  'structuredClone', 'queueMicrotask', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
+  'crypto', 'performance', 'navigator', 'console', 'atob', 'btoa', 'fetch',
+  // 原型上的通用方法名（混淆器会把这些名字当字符串字面量保留下来）
+  'toString', 'valueOf', 'hasOwnProperty', 'propertyIsEnumerable', 'isPrototypeOf', 'toLocaleString'
+]);
+
+const TOKEN_CHAR = /[A-Za-z0-9_$]/;
+
+/** 取命中位置所在的完整标识符：向两侧扩到非标识符字符为止。 */
+function tokenAt(text, index, length) {
+  let start = index;
+  let end = index + length;
+  while (start > 0 && TOKEN_CHAR.test(text[start - 1])) start--;
+  while (end < text.length && TOKEN_CHAR.test(text[end])) end++;
+  return text.slice(start, end);
+}
+
+/** 失败信息里的上下文片段（命中点前后各 pad 字符）。 */
+function contextAround(text, index, length, pad = 32) {
+  const start = Math.max(0, index - pad);
+  const end = Math.min(text.length, index + length + pad);
+  return `${start > 0 ? '…' : ''}${text.slice(start, end)}${end < text.length ? '…' : ''}`;
+}
+
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// 片段模式先挖空残余的随机 base64：与上面挖空密文的理由相同 —— 一段随机 base64 里凑出
+// 'sub' / 'dns' 这类三四字母片段是常态，那不是泄露。
+const fragmentSurface = visibled
+  .replace(/"([A-Za-z0-9+/]{16,}={0,2})"/g, '""')
+  .replace(/'([A-Za-z0-9+/]{16,}={0,2})'/g, "''");
+
+const leaks = [];
+const exempted = new Set();
+for (const { word, declaredSubstring } of bannedSpecs) {
+  const matches = [];
+
+  // 模式一：整词。与旧实现逐字一致（大小写不敏感、词内正则元字符已转义）。
+  const whole = new RegExp(`\\b${escapeRegex(word)}\\b`, 'i').exec(visibled);
+  if (whole) matches.push({ mode: 'whole', text: visibled, index: whole.index });
+
+  // 模式二：子串。整标识符恰好是平台内置名时不算泄露，但要留痕（下面 warn 里列出）。
+  const fragment = new RegExp(escapeRegex(word), 'gi');
+  let hit;
+  while ((hit = fragment.exec(fragmentSurface)) !== null) {
+    const token = tokenAt(fragmentSurface, hit.index, word.length);
+    if (PLATFORM_TOKENS.has(token)) {
+      exempted.add(`${word} ⊂ ${token}`);
+      continue;
+    }
+    matches.push({ mode: 'substring', text: fragmentSurface, index: hit.index });
+    if (matches.length > 20) break;
+  }
+
+  if (matches.length > 0) leaks.push({ word, declaredSubstring, matches });
+}
+
+if (exempted.size > 0) {
+  const shown = [...exempted].slice(0, 8).join('、');
+  warn(
+    `片段词的命中全部落在平台内置名里，已豁免（不是泄露）：${shown}` +
+      (exempted.size > 8 ? ` 等 ${exempted.size} 处` : '')
+  );
+}
+
+if (leaks.length === 0) {
+  pass(`硬性禁止词无一以明文幸存（整词与子串双模式，${bannedWords.length} 个词）: ${bannedWords.join(', ')}`);
 } else {
-  fail(`禁止词以明文出现在产物里: ${leaked.join(', ')}`);
+  fail(`${leaks.length} 个禁止词以明文出现在产物里（整词/子串双模式判定，词表共 ${bannedWords.length} 个词）`);
+  for (const { word, declaredSubstring, matches } of leaks.slice(0, 6)) {
+    const modes = [...new Set(matches.map((m) => m.mode))].join('+');
+    const first = matches[0];
+    console.log(
+      `        命中「${word}」（模式 ${modes}${declaredSubstring ? '，词表标记为片段' : ''}，共 ${matches.length} 处）` +
+        `上下文: ${contextAround(first.text, first.index, word.length)}`
+    );
+  }
+  if (leaks.length > 6) console.log(`        另有 ${leaks.length - 6} 个禁止词省略`);
 }
 
 const manualTerms = readList('sensitive_words_manual.txt', '')

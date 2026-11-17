@@ -13,8 +13,23 @@ const [
     'input[type=checkbox]'
 ].map(query => form.querySelectorAll(query));
 
-const defaultHttpsPorts = [443, 8443, 2053, 2083, 2087, 2096];
-const defaultHttpPorts = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+// P-05（第三方 CDN 供应链）：本页原先还用 `<script type="module">` 从 `cdn.skypack.dev`
+// **无版本号**地动态 import country-flag-emoji-polyfill，那段已删除。
+// 全仓没有任何 `polyfillCountryFlagEmojis` 消费点：国旗在 fetchIPInfo 里用
+// `String.fromCodePoint(...)` 自己把两位区域码拼成区域指示符（见 updateUI 的 flag）。
+// 所以删掉它功能不受影响，唯一差别是：系统字体没有国旗 emoji 时（典型是 Windows）
+// 国旗会退化成两个字母的国家代码（IR / US），而不是彩旗 —— 可接受；
+// 而「CDN 被投毒即接管面板（可读订阅密钥、可改口令）」不可接受。
+// 仍依赖 CDN 的只剩：cdnjs 的 font-awesome + qrcodejs（现已带 SRI，见 index.html）、
+// Google Fonts（CSS 按 UA 动态生成，无法加 SRI）。
+// ⚠ R-12：这两张端口表的**集合**必须与 src/common/init.ts 的 DEFAULT_HTTP_PORTS /
+// DEFAULT_HTTPS_PORTS 逐字一致（顺序可以不同：服务端只用 includes 判成员，顺序不可观测）。
+// R-12：端口表由构建期从 src/common/ports.json **注入**（占位符替换），与 init.ts 读的是同一份，
+// 不再需要面板侧手工同步副本。顺序即本面板拼 settings.ports 的顺序 = 订阅节点端口顺序，
+// 改动顺序会改变订阅输出，非必要不要动（见 ports.json 的 _note）。
+// ⚠ 直接双击打开本文件时这两个标识符是 undefined —— 属预期：它只在构建产物里被替换。
+const defaultHttpsPorts = __DEFAULT_HTTPS_PORTS__;
+const defaultHttpPorts = __DEFAULT_HTTP_PORTS__;
 
 // 背景 iframe：URL 池随机（带随机 query 绕过 5 分钟缓存，每次刷新换背景）
 (function initFallbackBg() {
@@ -24,9 +39,96 @@ const defaultHttpPorts = [80, 8080, 8880, 2052, 2082, 2086, 2095];
     }
 })();
 
+// 纯 UI 事件与网络无关：先注册，保证下面任何一个提前 return / 跳转都不会把它们跳过。
+// （它们原先写在 fetch 的 finally 里，失败路径上语义上是「顺便」注册的，很容易被后来的
+// 提前 return 静默漏掉；这里独立出来。）
+window.onclick = (event) => {
+    const qrModal = document.getElementById('qrModal');
+    const qrcodeContainer = document.getElementById('qrcode-container');
+
+    if (event.target == qrModal) {
+        qrModal.style.display = "none";
+        qrcodeContainer.lastElementChild.remove();
+    }
+}
+
+document.querySelectorAll(".toggle-password").forEach(toggle => {
+    toggle.addEventListener("click", function () {
+        const input = this.previousElementSibling;
+        const isPassword = input.type === "password";
+        input.type = isPassword ? "text" : "password";
+        this.textContent = isPassword ? "visibility" : "visibility_off";
+    });
+});
+
+function redirectToLogin() {
+    window.location.href = '/login';
+}
+
+// 首屏加载失败时不能渲染空壳：给出可见提示，并整块禁用配置表单
+// （含 Apply / 重置 / 导出 / 导入），否则用户看到一个字段全空、
+// Apply 永远 disabled 却「看起来正常」的面板，还会以为是自己没填对。
+function showPanelLoadError(message) {
+    const configForm = document.getElementById('configForm');
+    if (!configForm) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'panel-load-error';
+    banner.setAttribute('role', 'alert');
+    banner.style.cssText = [
+        'margin: 0 0 16px',
+        'padding: 12px 16px',
+        'border: 1px solid rgba(200, 40, 40, 0.55)',
+        'border-radius: 8px',
+        'background: rgba(200, 40, 40, 0.15)',
+        'color: var(--color-text-primary, inherit)',
+        'line-height: 1.6',
+        'word-break: break-word'
+    ].join(';');
+    banner.textContent = `⛔ Failed to load panel settings — ${message}\n💡 Nothing on this page can be saved until it loads. Please reload, or login again if your session expired.`;
+
+    configForm.before(banner);
+    configForm.querySelectorAll('input, select, textarea, button').forEach(elm => elm.disabled = true);
+    document.getElementById('applyButton')?.classList.add('disabled');
+    document.body.style.cursor = 'default';
+
+    alert(
+        '⛔ Failed to load panel settings!\n' +
+        `💡 ${message}\n\n` +
+        'Please reload the page, or login again if your session expired.'
+    );
+}
+
+// 首屏 fetch：会话过期时后端会 302 到 /login，或者直接返回 200 的 HTML 登录页。
+// 旧代码直接 response.json()，两种情况都会抛错，而 catch 只打一行 console、
+// finally 仍然照常执行 -> 页面带着空表单看起来「正常」，并且 fetchSystemStatus()
+// 还会继续每 30 秒轮询一次 /panel/region。所以这里先判 response.ok /
+// redirected / content-type，失败即跳登录页或显式报错并禁用表单。
 fetch('/panel/settings')
-    .then(async response => response.json())
-    .then(({ success, status, message, body }) => {
+    .then(response => {
+        if (response.redirected || response.status === 401) {
+            redirectToLogin();
+            return null;
+        }
+
+        if (!response.ok) {
+            throw new Error(`status ${response.status} - ${response.statusText}`);
+        }
+
+        // 会话过期时后端也可能直接返回 HTML 登录页（200），json() 一样会抛错
+        const contentType = response.headers.get('content-type') || '';
+
+        if (!contentType.includes('application/json')) {
+            redirectToLogin();
+            return null;
+        }
+
+        return response.json();
+    })
+    .then(payload => {
+        if (!payload) return; // 已经跳转登录页，不再渲染
+
+        const { success, status, message, body } = payload;
 
         if (!success) {
             throw new Error(`status ${status} - ${message}`);
@@ -35,29 +137,13 @@ fetch('/panel/settings')
         const { subPath, proxySettings } = body;
         globalThis.subPath = encodeURIComponent(subPath);
         initiatePanel(proxySettings);
-    })
-    .catch(error => console.error("Data query error:", error.message || error))
-    .finally(() => {
-        window.onclick = (event) => {
-            const qrModal = document.getElementById('qrModal');
-            const qrcodeContainer = document.getElementById('qrcode-container');
-
-            if (event.target == qrModal) {
-                qrModal.style.display = "none";
-                qrcodeContainer.lastElementChild.remove();
-            }
-        }
-
-        document.querySelectorAll(".toggle-password").forEach(toggle => {
-            toggle.addEventListener("click", function () {
-                const input = this.previousElementSibling;
-                const isPassword = input.type === "password";
-                input.type = isPassword ? "text" : "password";
-                this.textContent = isPassword ? "visibility" : "visibility_off";
-            });
-        });
-
+        // 只有初始化成功后才需要状态轮询；会话失效时不再做无意义的 30s 轮询
+        globalThis.panelReady = true;
         fetchSystemStatus();
+    })
+    .catch(error => {
+        console.error("Data query error:", error.message || error);
+        showPanelLoadError(error.message || String(error));
     });
 
 function initiatePanel(proxySettings) {
@@ -272,6 +358,9 @@ function downloadJSON(data, fileName) {
 
 function exportSettings() {
     const form = validateSettings();
+    // validateSettings() 校验失败时返回 false（B-39 的防御性改造）。原先会一路
+    // JSON.stringify(false) → 导出一个内容为 `false` 的 .dat，看起来成功、导入时全空。
+    if (!form) return;
     const data = JSON.stringify(form, null, 4);
     const encodedData = btoa(unescape(encodeURIComponent(data)));
     downloadJSON(encodedData, `BPB-settings.dat`);
@@ -337,9 +426,6 @@ async function updateWarpConfigs() {
         const response = await fetch('/panel/update-warp', { method: 'POST', credentials: 'include' });
         const { success, status, message } = await response.json();
 
-        document.body.style.cursor = 'default';
-        refreshBtn.classList.remove('fa-spin');
-
         if (!success) {
             alert(
                 '⚠️ An error occured, Please try again!\n' +
@@ -352,6 +438,12 @@ async function updateWarpConfigs() {
         alert('✅ Warp configs updated successfully!');
     } catch (error) {
         console.error("Updating Warp configs error:", error.message || error)
+    } finally {
+        // 复位必须放在 finally：fetch 被拒（离线/被拦截）或返回的不是 JSON
+        // （会话过期 -> HTML）时，原来的复位语句根本执行不到，
+        // 页面会永久停在 cursor: wait + 转圈的图标上。
+        document.body.style.cursor = 'default';
+        refreshBtn.classList.remove('fa-spin');
     }
 }
 
@@ -449,9 +541,6 @@ function resetSettings() {
     })
         .then(response => response.json())
         .then(({ success, status, message, body }) => {
-            document.body.style.cursor = 'default';
-            resetBtn.classList.remove('fa-spin');
-
             if (!success) {
                 throw new Error(`status ${status} - ${message}`);
             }
@@ -459,7 +548,14 @@ function resetSettings() {
             initiatePanel(body);
             alert('✅ Panel settings reset to default successfully!\n💡 Please update your subscriptions.');
         })
-        .catch(error => console.error("Reseting settings error:", error.message || error));
+        .catch(error => console.error("Reseting settings error:", error.message || error))
+        .finally(() => {
+            // 复位必须在 finally 里：fetch 被拒或返回非 JSON（会话过期 -> HTML）时，
+            // 放在 .then 里的复位语句执行不到，页面会永久停在 cursor: wait + 转圈，
+            // 用户再点一次（reset 真的会重写 KV）就重复提交了。
+            document.body.style.cursor = 'default';
+            resetBtn.classList.remove('fa-spin');
+        });
 }
 
 function updateSettings(event, data) {
@@ -472,8 +568,15 @@ function updateSettings(event, data) {
     const form = data ? data : validatedForm;
     const applyButton = document.getElementById('applyButton');
     document.body.style.cursor = 'wait';
-    const applyButtonVal = applyButton.value;
-    applyButton.value = '⌛ Loading...';
+
+    // Apply 是 <button>（index.html 的 #applyButton），它的可见文本来自子节点，
+    // 而不是 .value（.value 只影响表单提交）—— 所以旧代码设置 value 用户什么都看不到，
+    // 事后的「恢复」也纯属摆设。这里改为替换可见内容并禁用按钮（请求期间禁止重复提交），
+    // 先备份原始 innerHTML 再改，恢复统一放在 finally 里。
+    const applyButtonHTML = applyButton.innerHTML;
+    applyButton.textContent = '⌛ Loading...';
+    applyButton.disabled = true;
+    applyButton.classList.add('disabled');
 
     fetch('/panel/update-settings', {
         method: 'PUT',
@@ -498,8 +601,11 @@ function updateSettings(event, data) {
         })
         .catch(error => console.error("Update settings error:", error.message || error))
         .finally(() => {
+            // 成功与失败都必须还原：恢复原始可见内容，并重新按「表单是否有改动」
+            // 决定禁用状态（成功时 initiatePanel 会刷新 initialFormData，按钮应再次变灰）
             document.body.style.cursor = 'default';
-            applyButton.value = applyButtonVal;
+            applyButton.innerHTML = applyButtonHTML;
+            enableApplyButton();
         });
 }
 
@@ -881,16 +987,47 @@ function validateChainProxy() {
         return false;
     }
 
-    const config = new URL(chainProxy);
-    let { protocol, username } = config;
-    let security = config.searchParams.get('security');
-    let type = config.searchParams.get('type');
+    // new URL() 对畸形输入会抛 TypeError；vmess 的 atob/JSON.parse 对损坏的
+    // base64/JSON 也会抛。异常会一路冲出 validateSettings -> updateSettings ->
+    // submit 监听器，结果是点击 Apply 完全没反应（连 alert 都没有、也不发请求），
+    // 面板从此无法保存。所以这两段解析必须在这里收敛成 false + 明确提示。
+    let protocol, username, security, type;
+
+    try {
+        const config = new URL(chainProxy);
+        ({ protocol, username } = config);
+        security = config.searchParams.get('security');
+        type = config.searchParams.get('type');
+    } catch (error) {
+        alert(
+            '⛔ Invalid chain proxy URL!\n' +
+            '💡 Standard formats are:\n\n' +
+            ' + (socks or socks5 or http)://user:pass@server:port\n' +
+            ' + (socks or socks5 or http)://base64@server:port\n' +
+            ' + vless://uuid@server:port...\n' +
+            ' + vmess://base64\n' +
+            ' + trojan://password@server:port...\n' +
+            ' + ss://base64@server:port...'
+        );
+
+        return false;
+    }
 
     if (isVMess) {
-        const vmConfig = JSON.parse(atob(config.host));
-        username = vmConfig.id;
-        security = vmConfig.tls;
-        type = vmConfig.net;
+        try {
+            // config.host 是 vmess:// 后面的整段 Base64，解出来应为一个 JSON 对象
+            const vmConfig = JSON.parse(atob(config.host));
+            username = vmConfig.id;
+            security = vmConfig.tls;
+            type = vmConfig.net;
+        } catch (error) {
+            alert(
+                '⛔ Invalid Config!\n' +
+                '💡 The vmess:// payload is not valid Base64 encoded JSON.'
+            );
+
+            return false;
+        }
     }
 
     if (['vless:', 'trojan:', 'vmess:'].includes(protocol)) {
@@ -1141,6 +1278,24 @@ function validateUpstreamProxy() {
 }
 
 function validateSettings() {
+    // 防御性兜底：校验里任何未预料的异常（比如将来某个校验函数抛错）都必须
+    // 收敛成本函数返回 false + 一次 alert，绝不能冲出 submit 监听器 ——
+    // 那会让 Apply 彻底静默失灵（没有 alert、也不发请求），只能刷新页面才能恢复。
+    // 具体逻辑放在 validateSettingsForm 里，避免为了包一层 try 重排上百行缩进。
+    try {
+        return validateSettingsForm();
+    } catch (error) {
+        console.error('Settings validation error:', error.message || error);
+        alert(
+            '⛔ Unexpected error while validating settings!\n' +
+            `💡 ${error.message || error}`
+        );
+
+        return false;
+    }
+}
+
+function validateSettingsForm() {
     const configForm = document.getElementById('configForm');
     const formData = new FormData(configForm);
 
@@ -1581,5 +1736,8 @@ async function fetchSystemStatus() {
     }
 }
 
-// Auto-refresh every 30 seconds
-setInterval(fetchSystemStatus, 30000);
+// Auto-refresh every 30 seconds：只有首屏初始化成功（globalThis.panelReady）才轮询，
+// 否则会话失效时会对着 /panel/region 每 30 秒白打一次请求
+setInterval(() => {
+    if (globalThis.panelReady) fetchSystemStatus();
+}, 30000);

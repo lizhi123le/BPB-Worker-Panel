@@ -6,7 +6,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>BPB Panel</title>
     <link rel="icon" href="/favicon.ico" />
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+    <!-- P-05：第三方资源带 SRI（sha384 实测自 CDN 响应体，勿手改） -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css"
+        integrity="sha384-wvfXpqpZZVQGK6TAh5PVlGOfQNHSoD2xbE+QkPxCAFlNEevoEH3Sl0sibVcOQVnN" crossorigin="anonymous">
     <link rel="stylesheet"
         href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=add_circle,autorenew,check_circle,content_copy,delete,dns,download,fingerprint,info,key_vertical,open_in_new,qr_code,settings,share,terminal,tune,verified,visibility,visibility_off&display=block" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -218,15 +220,21 @@
                         </div>
                     </div>
                     <div class="form-control">
-                        <label for="tls-ports">🔒 TLS Ports</label>
+                        <!-- label 只能标注 input/select/textarea/button；这里的容器是 div，
+                             for 属性只会产生「孤儿 label」。改成 span（.form-control>span
+                             与 .form-control label 的 CSS 完全一致，视觉不变）+ role=group
+                             + aria-labelledby，容器的 id 保持不变（script.js 会读它）。 -->
+                        <span id="tls-ports-label">🔒 TLS Ports</span>
                         <div>
-                            <div id="tls-ports" class="rules inner-container"></div>
+                            <div id="tls-ports" class="rules inner-container" role="group"
+                                aria-labelledby="tls-ports-label"></div>
                         </div>
                     </div>
                     <div id="none-tls" class="form-control" style="display: none;">
-                        <label for="non-tls-ports">🔓 non-TLS Ports</label>
+                        <span id="non-tls-ports-label">🔓 non-TLS Ports</span>
                         <div>
-                            <div id="non-tls-ports" class="rules inner-container"></div>
+                            <div id="non-tls-ports" class="rules inner-container" role="group"
+                                aria-labelledby="non-tls-ports-label"></div>
                         </div>
                     </div>
                     <div class="form-control">
@@ -529,7 +537,10 @@
                         </div>
                     </div>
                     <div class="form-control">
-                        <label for="refreshBtn">♻️ Warp Accounts</label>
+                        <!-- 同理：文档里没有 id="refreshBtn"（按钮本身也没 id），这是个指向不存在
+                             元素的孤儿 label。旁边只有单个按钮、没有可成组的控件，所以直接降级成
+                             span（.form-control>span 与 .form-control label 样式一致），不产生标签点击副作用。 -->
+                        <span>♻️ Warp Accounts</span>
                         <div>
                             <button type="button" class="button reverse" onclick="updateWarpConfigs()">
                                 Update<span id="warp-update" class="material-symbols-rounded">autorenew</span>
@@ -631,9 +642,11 @@
                     <div class="container">
                         <h4><span class="material-symbols-rounded">tune</span> Preset Rules</h4>
                         <div class="form-control">
-                            <label for="bypass-rules">🟩 Bypass rules</label>
+                            <!-- 同上：div 不可标注 -> span + role=group + aria-labelledby -->
+                            <span id="bypass-rules-label">🟩 Bypass rules</span>
                             <div>
-                                <div id="bypass-rules" class="rules inner-container">
+                                <div id="bypass-rules" class="rules inner-container" role="group"
+                                    aria-labelledby="bypass-rules-label">
                                     <div class="routing">
                                         <input type="checkbox" id="bypassIran" name="bypassIran" value="true">
                                         <label for="bypassIran">Iran</label>
@@ -650,9 +663,11 @@
                             </div>
                         </div>
                         <div class="form-control">
-                            <label for="block-rules">🟥 Block rules</label>
+                            <!-- 同上：div 不可标注 -> span + role=group + aria-labelledby -->
+                            <span id="block-rules-label">🟥 Block rules</span>
                             <div>
-                                <div id="block-rules" class="rules inner-container">
+                                <div id="block-rules" class="rules inner-container" role="group"
+                                    aria-labelledby="block-rules-label">
                                     <div class="routing">
                                         <input type="checkbox" id="blockAds" name="blockAds" value="true">
                                         <label for="blockAds">Ads.</label>
@@ -703,9 +718,11 @@
                     <div class="container">
                         <h4><span class="material-symbols-rounded">tune</span> Sanction Rules</h4>
                         <div class="form-control">
-                            <label for="bypass-sanction-rules">🟩 Bypass rules</label>
+                            <!-- 同上：div 不可标注 -> span + role=group + aria-labelledby -->
+                            <span id="bypass-sanction-rules-label">🟩 Bypass rules</span>
                             <div>
-                                <div id="bypass-sanction-rules" class="rules inner-container">
+                                <div id="bypass-sanction-rules" class="rules inner-container" role="group"
+                                    aria-labelledby="bypass-sanction-rules-label">
                                     <div class="routing">
                                         <input type="checkbox" id="bypassOpenAi" name="bypassOpenAi" value="true">
                                         <label for="bypassOpenAi">ChatGPT</label>
@@ -1345,7 +1362,7 @@
             </div>
         </div>
         <div id="qrModal" class="modalQR">
-            <div class="modal-content" class="modal-content">
+            <div class="modal-content">
                 <div class="modal-header">
                     <span id="closeQR" class="close" onclick="closeQR()">&times;</span>
                     <span id="qrcodeTitle" class="qr-title"></span>
@@ -1407,11 +1424,10 @@
     </div>
     </div>
 
-    <script type="module" defer>
-        import { polyfillCountryFlagEmojis } from "https://cdn.skypack.dev/country-flag-emoji-polyfill";
-        polyfillCountryFlagEmojis();
-    </script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <!-- P-05：无版本号的 cdn.skypack.dev polyfill 已删，理由与退化行为见 script.js 顶部 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"
+        integrity="sha384-3zSEDfvllQohrq0PHL1fOXJuC/jSOO34H46t6UQfobFOmxE5BpjjaIJY5F2/bMnU"
+        crossorigin="anonymous"></script>
     <script>__SCRIPT__</script>
 </body>
 

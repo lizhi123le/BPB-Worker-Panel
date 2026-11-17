@@ -1,6 +1,8 @@
 import { isPermanentBlacklisted, recordViolationAndMaybeBan } from "./blacklist";
 import { isPathInDictionary, checkRateLimit, checkRateLimitShared, recordRateLimit, writeRateLimitKV } from "./ratelimit";
-import { camouflageProxy, cf1101RateLimitedResponse } from "./camouflage";
+import { camouflageProxy, cf1101RateLimitedResponse, STATIC_ASSET_PATH_RE } from "./camouflage";
+// S-03：CF-Connecting-IP 的唯一取用点（含形态校验，非法即视为无 IP）
+import { clientIp } from "./client-ip";
 
 /**
  * 非内置路径守卫 — 对齐 cfnew 的安全三件套：
@@ -43,7 +45,7 @@ export async function guardPermanentBlacklist(
     env: any,
     segments?: string[]
 ): Promise<Response | null> {
-    const ip = request.headers.get('CF-Connecting-IP') || '';
+    const ip = clientIp(request);
     const kv = env?.kv as KVNamespace | undefined;
     if (!ip || !kv) return null;
 
@@ -68,8 +70,14 @@ export async function guardNonBuiltinPath(
     env: any,
     ctx: GuardContext
 ): Promise<Response | null> {
-    // cfnew 排除语义：POST、根路径、login、管理路径不进入伪装/限流
-    if (request.method === 'POST') return null;
+    // 排除语义（对齐 cfnew）：根路径、login、管理路径不进入伪装/限流。
+    //
+    // B-09：**POST 不再整条豁免**。原实现第一行 `if (request.method === 'POST') return null;`
+    // 让 POST /<任意路径> 同时绕过永久黑名单、限流与违规计数，被罚的 IP 换个 method 就继续畅通，
+    // 而且请求会被 worker.ts 无配额地转发到兜底域（一条免费的 POST 出口）。
+    // 现在 POST 与 GET 走同一套判据；内置路由（/panel、/login 等）在 worker.ts 的 switch 里
+    // 就已分流，根本到不了这里，XHTTP 的 POST 走的是公共伪装字典路径（字典内路径不限流），
+    // 因此这两条正常链路都不受影响。
     const reqURL = new URL(request.url);
     if (reqURL.pathname === '/') return null;
 
@@ -82,7 +90,7 @@ export async function guardNonBuiltinPath(
         .replace(/^\//, '');
     if (adminPath && segments[0].toLowerCase() === adminPath) return null;
 
-    const ip = request.headers.get('CF-Connecting-IP') || '';
+    const ip = clientIp(request);
     const kv = env?.kv as KVNamespace | undefined;
 
     // 1. 永久黑名单（与 WS 升级共用同一份守卫；传入已算好的 segments 避免重复判定）
@@ -97,7 +105,12 @@ export async function guardNonBuiltinPath(
         if (!checkRateLimit(ip) || !(await checkRateLimitShared(kv, ip))) {
             console.warn(`[速率限制] IP ${ip} 超过非管理员路径请求限制`);
             if (kv) await writeRateLimitKV(kv, ip, ctx);
-            if (ip && kv) ctx.waitUntil(recordViolationAndMaybeBan(ip, kv, ctx));
+            // B-10：只有「看着像扫描探测」的请求才推进违规计数（阈值 22 → 永久封禁，成员无 TTL）。
+            // 伪装站首页一次加载就能并发 6+ 个字典外静态资源，原本足够把一个**正常访客**
+            // （以及 CGNAT 后面的一整片用户）推到永久黑名单。静态资源、以及浏览器会带
+            // 真实 Referer 的资源请求，都不该算探测 —— 它们由限流挡住就够了。
+            const looksLikeProbe = !STATIC_ASSET_PATH_RE.test(reqURL.pathname);
+            if (ip && kv && looksLikeProbe) ctx.waitUntil(recordViolationAndMaybeBan(ip, kv, ctx));
             return await cf1101RateLimitedResponse(reqURL.host, ip);
         }
         recordRateLimit(ip);

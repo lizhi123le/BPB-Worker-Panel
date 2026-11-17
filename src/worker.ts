@@ -13,7 +13,9 @@ import {
 	handleProxyIPs
 } from '@handlers';
 import { guardNonBuiltinPath } from './common/firstCheck';
-import { isBuiltinRouteWord, isPathInDictionary, PUBLIC_PATH_POOL } from './common/ratelimit';
+import { checkDohRateLimit, isBuiltinRouteWord, isPathInDictionary, recordDohRequest, PUBLIC_PATH_POOL } from './common/ratelimit';
+// S-03：客户端 IP 的唯一取用点（含形态校验）
+import { clientIp } from './common/client-ip';
 import { camouflageProxy, cf1101RateLimitedResponse } from './common/camouflage';
 import { prepareWsRuntimeConfig } from './common/ws-runtime';
 import { handleXp } from '@protocols/xp/handler';
@@ -88,7 +90,8 @@ export default {
 					|| isPathInDictionary(wsSegments);
 				if (!wsPathAllowed) {
 					console.warn(`[路径字典] WS 升级路径 ${wsPathName} 不在公共路径字典内，按伪造探测拦截`);
-					return await cf1101RateLimitedResponse(new URL(request.url).host, request.headers.get('CF-Connecting-IP') || '');
+					// S-03：页面里的 IP 只取校验过的形态（非法头按空串渲染）
+					return await cf1101RateLimitedResponse(new URL(request.url).host, clientIp(request));
 				}
 
 				// C-13：与 HTTP 路径共用同一套必填凭据校验（此前 WS 完全跳过，缺凭据时静默鉴权失败）
@@ -147,8 +150,17 @@ export default {
 					case 'favicon.ico':
 						return await serveIcon();
 
-					case 'dns-query':
+					case 'dns-query': {
+						// S-07：DoH 是内置路由分支，不经过 guardNonBuiltinPath 的限流闸门，
+						// 而 subPath 随订阅分发 ⇒ 这里必须自带每 IP 频率限制（env 可关，见 ratelimit.ts）。
+						const dohIp = clientIp(request);
+						if (!checkDohRateLimit(dohIp)) {
+							console.warn('[DoH 限流] 该 IP 的 DNS 查询频率超限');
+							return new Response(null, { status: 429 });
+						}
+						recordDohRequest(dohIp);
 						return await handleDoH(request);
+					}
 
 					case 'proxy-ip':
 						return await handleProxyIPs(request, env);

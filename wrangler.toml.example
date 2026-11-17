@@ -1,0 +1,54 @@
+# wrangler.toml.example
+#
+# 这是**模板**，不是生效配置：wrangler 只读取 wrangler.toml / wrangler.json / wrangler.jsonc，
+# 不会读 `*.example`。确认没问题后复制为 wrangler.toml 再按需修改：
+#
+#   cp wrangler.toml.example wrangler.toml
+#
+# 真实的 wrangler.toml 在 .gitignore 的「全量否定」默认规则下不会入库（那是有意的：
+# 它通常含 KV namespace id / 账号相关路径）。
+#
+# ⚠️ compatibility_date 是本文件里唯一**不能省**的字段。它决定 Workers 运行时暴露哪些 API，
+#    而本仓的 WebSocket 数据面直接依赖 TCP socket API：
+#      src/protocols/websocket/common.ts → request.fetcher.connect()（缺失时回退全局 connect()）
+#    兼容日期太老会让这些 API 在运行时不存在，症状是「面板正常、订阅正常、所有节点连不上」，
+#    且日志里看不出原因。所以：显式写一个较新的日期，不要为了「稳妥」往回退。
+#    参考：https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/
+#         https://developers.cloudflare.com/workers/configuration/compatibility-dates/
+
+name = "bpb-panel"
+main = "dist/worker.js"
+compatibility_date = "2026-01-20"
+
+# Worker 名（name）决定 *.workers.dev 域名与 dashboard 里的脚本名；与已部署的 Worker 不一致时
+# `wrangler deploy` 会当成另一个 Worker 新建。
+
+# ── KV 绑定 ────────────────────────────────────────────────────────────────────
+# 绑定名必须是 "kv"（全小写）：整个代码库都写死读 env.kv（src/kv.ts、src/auth.ts、
+# src/kv-cache.ts、src/common/handlers.ts …）。写成 KV / kv-store 之类会在运行时报
+# env.kv 为 undefined，表现为全站 500 或「首访设置口令」反复出现。
+#
+# id 用 `wrangler kv namespace create bpb-kv` 的输出（或 dashboard → Workers KV 里复制）。
+# preview_id 只有本机 `wrangler dev` 需要，可留空/删除。
+[[kv_namespaces]]
+binding = "kv"
+id = "<REPLACE_WITH_YOUR_KV_NAMESPACE_ID>"
+# preview_id = "<REPLACE_WITH_YOUR_PREVIEW_KV_NAMESPACE_ID>"
+
+# ── 变量（可选） ───────────────────────────────────────────────────────────────
+# 这些是 src/common/init.ts 会读取的环境变量；不写就用面板里的设置 / 内置默认。
+# UUID / SUB_PATH 这类半秘密值建议改用 `wrangler secret put`（或 dashboard 的 Secrets），
+# 不要提交到仓库。
+#
+# [vars]
+# UUID = "11111111-2222-4333-8444-555555555555"   # 需为合法 UUID，大小写均被接受
+# SUB_PATH = "your-secret-sub-path"
+# FALLBACK = "www.example.com"
+# PREFIX = ""
+# PROXY_IP = "1.2.3.4"
+# PUBLIC_PROXY_IP = "2.3.4.5"
+
+# ── 部署 ───────────────────────────────────────────────────────────────────────
+# 1) npm ci && npm run build          # 产出 dist/worker.js（混淆后）与 dist/worker.zip
+# 2) npx wrangler deploy             # 上传 dist/worker.js
+# 3) 若 KV 是新建的：先在面板完成首访初始化（签发口令/密钥），再分发给用户。

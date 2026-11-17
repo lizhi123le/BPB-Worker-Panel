@@ -1,4 +1,4 @@
-import { isTlsPort, parseHostPort, pickEarlyData, pickRandomEch, selectSniHost, isBareIPv4, isBareIPv6, getXPaddingIdentifier, type CleanProxyEntry } from '@utils';
+import { parseHostPort, isBareIPv4, isBareIPv6, getXPaddingIdentifier, resolveNodeTls, normalizeTransportPath, getChainExplicitEarlyData, earlyDataHeaderName, resolveChainEarlyData, type CleanProxyEntry, type NodeTlsCriterion } from '@utils';
 
 // XHTTP 的路径 / 填充约定与 raw URI、Xray JSON 共用同一份实现（单一来源，避免三端漂移）
 import { XP_MODE } from '@cores/xp';
@@ -57,44 +57,21 @@ function buildOutbound<T>(
 }
 
 /**
- * 地址型节点（WS / XHTTP）共用的 TLS 装配。
- *
- * 抽出来是为了让同一 (地址, 端口) 的两种传输永远给出同一套 sni / ECH / alpn / 证书校验判定；
- * 分叉的后果是同一份订阅里 WS 节点与 XHTTP 节点各按一套规则走，行为无从对照。
- * 随机抽取顺序（先 hostSniList 再 echServerName）必须保持不变，否则既有节点会漂移。
+ * R-04 的 Clash 侧渲染：判据对象 → tls 字段（Partial<TLS>，非 TLS 节点返回空对象）。
+ * `protocol` 只影响 servername / sni 的键名选择（Trojan 用 sni），属本端 schema 差异。
  */
-function buildAddressNodeTls(
-    protocol: string,
-    address: string,
-    port: number
-): { host: string; tls: Partial<TLS> } {
-    const {
-        settings: { fingerprint, alpn, enableECH, echServerName, hostSniList }
-    } = globalThis;
-
-    const isTLS = isTlsPort(port, address);
-    const { host, sni, allowInsecure } = selectSniHost(address, pickRandomEch(hostSniList));
-    // G13-C10：ECH 启用而 `echServerName` 为空时的名称回退，与 handlers.ts#buildConfig（URI 侧）
-    // `${pickRandomEch(echServerName) || host}` 逐字一致——原先 Clash 侧空名单会把
-    // `query-server-name` 落成 undefined（等价关闭 ECH），与其余两端及 URI 侧不一致。
-    // 名称取该节点的 host（selectSniHost 的 Host 头值，同 handlers.ts 的 host）。
-    const pickedEch = enableECH ? (pickRandomEch(echServerName) || host) : undefined;
-    // G13-C7：抑制 alpn 的条件必须与「该节点真的启用了 ECH」一致，而不是只看全局 enableECH。
-    // Clash 无分片支持（handlers.ts 的 /sub/fragment 对 clash 走 fallback，isFragment 恒 false），
-    // pickedEch 因此等价于 enableECH；这里仍写成 !pickedEch，以便与 Xray/sing-box 端
-    // 「分片分支 ECH 关闭 → 放行 alpn」的修法保持同一语义，也不给 Clash 加无意义的分片门槛。
-    const tls = isTLS ? buildTLS(
+function buildNodeTls(protocol: string, criterion: NodeTlsCriterion): Partial<TLS> {
+    if (!criterion.isTLS) return {};
+    return buildTLS(
         protocol,
         "tls",
-        allowInsecure,
-        sni,
-        !!pickedEch,
-        pickedEch,
-        pickedEch ? undefined : (alpn || undefined),
-        fingerprint
-    ) : {};
-
-    return { host, tls };
+        criterion.allowInsecure,
+        criterion.sni,
+        !!criterion.echName,
+        criterion.echName,
+        criterion.alpn,
+        globalThis.settings.fingerprint
+    );
 }
 
 export function buildWebsocketOutbound(
@@ -104,9 +81,9 @@ export function buildWebsocketOutbound(
     port: number,
     path: string,
     earlyData?: number,
-): VlessOutbound | TrojanOutbound | null {
+): VlessOutbound | TrojanOutbound {
     const {
-        dict: { _VL_, _TR_ },
+        dict: { _VL_ },
         globalConfig: { userID, TrPass },
         settings: { enableTFO, enableIPv6 }
     } = globalThis;
@@ -114,16 +91,22 @@ export function buildWebsocketOutbound(
     // 与 handlers.ts 的 URI 侧判定对齐：任一地址的显式端口表里出现过该端口也视为 TLS，
     // 否则同一节点会出现 URI 写 security=tls、JSON 无 tls 字段的自相矛盾组合。
     // 判据（含 entryPortMap 的按调用求值）统一由 @utils 的 isTlsPort 维护。
-    // Trojan 无 TLS 时不生成节点（明文 Trojan 无意义），且必须在抽 SNI / ECH 之前短路，
-    // 以保持既有节点的随机抽取顺序不变。
-    const isTLS = isTlsPort(port, address);
-    if (protocol === _TR_ && !isTLS) return null;
-    const { host, tls } = buildAddressNodeTls(protocol, address, port);
+    // B-45：非 TLS 端口的 Trojan **不再静默丢弃**。原实现 `if (protocol === _TR_ && !isTLS) return null`
+    // 让同一份订阅在 Clash 少节点（Xray/sing-box 照常下发明文节点，raw URI 侧也只是在备注上标
+    // `⚠️明文(无TLS)`）。取舍（风险更小的一侧）：保留 —— 丢节点会让「服务端本来就是明文」的用户
+    // 彻底失去该节点，保留最坏只是一个连不上的节点。Clash 的 trojan 出站无法表达「不带 TLS」，
+    // 缺省按 TLS 处理（sni 取 server），这一点无法在本端对齐；备注告警同样只能在 raw URI 侧表达
+    // （在本端给节点名加后缀会改变节点名，进而影响分组正则与既有节点匹配）。
+    // 判据只求值一次：resolveNodeTls 内含两次随机抽取（hostSniList 与 echServerName），
+    // 求值两次会得到两套互不配对的 SNI / ECH 名，必须复用同一个对象。
+    // isFragment 恒 false：Clash 无分片订阅（/sub/fragment 对 clash 走 fallback）。
+    const criterion = resolveNodeTls(address, port, false);
 
     // early-data 阈值由调用点从无放回池中抽取（见 pickEarlyData）：2048..2560（513 个取值），
     // 同一份订阅内任意两个节点的 ed 两两不同，消除「固定长度」这一常量特征（不做模块级缓存）。
     // 下限不再取更低：ed 是「首包长度阈值」，首包超过它会直接不启用 Early Data（丢 0-RTT）。
-    const transport = buildTransport("ws", undefined, path, host, undefined, earlyData);
+    const transport = buildTransport("ws", undefined, path, criterion.host, undefined, earlyData);
+    const tls = buildNodeTls(protocol, criterion);
 
     if (protocol === _VL_) return buildOutbound<VlessOutbound>(remark, protocol, address, port, enableIPv6, enableTFO, tls, transport, {
         "uuid": userID,
@@ -158,14 +141,15 @@ export function buildXpOutbound(
         settings: { enableTFO, enableIPv6 }
     } = globalThis;
 
-    const { host, tls } = buildAddressNodeTls(_VL_, address, port);
+    // isFragment 恒 false：Clash 无分片订阅；与同地址的 WS 节点共用同一套 R-04 判据
+    const criterion = resolveNodeTls(address, port, false);
     const { header, key } = getXPaddingIdentifier(userID);
 
-    return buildOutbound<VlessOutbound>(remark, _VL_, address, port, enableIPv6, enableTFO, tls, {
+    return buildOutbound<VlessOutbound>(remark, _VL_, address, port, enableIPv6, enableTFO, buildNodeTls(_VL_, criterion), {
         "network": "xhttp",
         "xhttp-opts": {
             "path": path,
-            "host": host,
+            "host": criterion.host,
             "mode": XP_MODE,
             "x-padding-obfs-mode": true,
             "x-padding-method": "tokenish",
@@ -235,36 +219,7 @@ export function buildWarpOutbound(
     };
 }
 
-/**
- * 只读读取 outProxy URI 显式给出的 `ed`（不抽随机、不改池），供调用点在链式循环外取一次。
- * 未给出或非法（含 outProxy 缺失 / URL 非法）时返回 undefined，绝不抛错。
- * 显式值属用户配置，原样沿用，不做 2048..2560 区间钳制（可能超出该区间）。
- */
-export function getChainExplicitEarlyData(): number | undefined {
-    const { outProxy } = globalThis.settings;
 
-    try {
-        const ed = outProxy ? new URL(outProxy).searchParams.get("ed") : null;
-        if (ed === null) return undefined;
-
-        return Number.isFinite(+ed) ? +ed : undefined;
-    } catch {
-        return undefined;
-    }
-}
-
-/**
- * 取链式出站的 early-data 阈值：用户 outProxy 显式给出的 `ed` 优先（尊重用户配置），
- * 未给出时从无放回池中抽取；结果登记进 usedEds，避免与其它节点（含链式克隆体）撞值。
- */
-function resolveChainEarlyData(usedEds?: Set<number>): number {
-    const { outProxy } = globalThis.settings;
-    const ed = outProxy ? new URL(outProxy).searchParams.get("ed") : null;
-    const earlyData = ed ? +ed : pickEarlyData(usedEds);
-    if (usedEds && !usedEds.has(earlyData)) usedEds.add(earlyData);
-
-    return earlyData;
-}
 
 /** Clean IPs / Domains 里的 socks / socks5 / http(s) 代理条目 → 独立可选节点 */
 export function buildCleanProxyOutbound(proxy: CleanProxyEntry, name: string): HttpOutbound | SocksOutbound {
@@ -304,7 +259,8 @@ export function buildChainOutbound(usedEds?: Set<number>): ChainOutbound | undef
     } = globalThis;
 
     // 链式出站同样启用 early-data：用户显式给出的 ed 优先，未给出时无放回抽取（不再是 undefined）
-    const earlyData = resolveChainEarlyData(usedEds);
+    // R-06：与 sing-box 同一写法（判据在 @utils）。
+    const earlyData = resolveChainEarlyData(usedEds, getChainExplicitEarlyData());
 
     const tls = buildTLS(protocol, security, false, sni || server, false, undefined, alpn, fp, pbk, sid);
     const transport = buildTransport(type, headerType, path, host, serviceName, earlyData);
@@ -367,10 +323,10 @@ export function redrawChainEarlyData(
     // 仅纯 ws 传输需要：http-upgrade 走 fast-open，本身不带 early-data 语义
     if (!wsOpts || wsOpts["v2ray-http-upgrade"]) return;
 
-    const earlyData = explicitEd ?? pickEarlyData(usedEds);
-    if (usedEds && !usedEds.has(earlyData)) usedEds.add(earlyData);
+    // R-06：取值判据在 @utils（显式值优先 + 只消费一次 + 无放回注册）
+    const earlyData = resolveChainEarlyData(usedEds, explicitEd);
     wsOpts["max-early-data"] = earlyData;
-    wsOpts["early-data-header-name"] = earlyData ? "Sec-WebSocket-Protocol" : undefined;
+    wsOpts["early-data-header-name"] = earlyDataHeaderName(earlyData);
 }
 
 export function buildUrlTest(
@@ -447,7 +403,7 @@ function buildTransport(
     serviceName?: string,
     earlyData?: number
 ): Partial<Transport> {
-    path = path?.split("?")[0];
+    path = normalizeTransportPath(path);
 
     switch (type) {
         case 'tcp':
@@ -472,7 +428,7 @@ function buildTransport(
                 "ws-opts": {
                     "path": path,
                     "max-early-data": earlyData,
-                    "early-data-header-name": earlyData ? "Sec-WebSocket-Protocol" : undefined,
+                    "early-data-header-name": earlyDataHeaderName(earlyData),
                     "headers": {
                         "Host": host
                     }

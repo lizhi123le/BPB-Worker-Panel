@@ -62,7 +62,12 @@ export async function prepareWsRuntimeConfig(request: Request, env: Env): Promis
     const reqUrl = new URL(request.url);
     const queryWk = (reqUrl.searchParams.get('wk') || '').toUpperCase();
     const queryRm = reqUrl.searchParams.get('rm');
-    const queryQj = (reqUrl.searchParams.get('qj') || '').toLowerCase();
+    // S-05：只保留 qj 的**收紧**方向（only），拒绝放松方向（no）。
+    // 原实现两个方向都认，而 URL 参数不需要任何凭据 —— 客户端在订阅 URL 后加一个 `?qj=no`
+    // 就能把运维设置的「仅走代理」（防 IP 泄漏）单方面关掉、改成直连目标。
+    // 「防 IP 泄漏」是服务端策略，客户端只能让它更严格、不能让它失效：
+    // `qj=only` 仍生效（测试与既有用法都靠它强制首跳走代理池），`qj=no` 被忽略。
+    const queryOnlyMode = (reqUrl.searchParams.get('qj') || '').toLowerCase() === 'only';
 
     const {
         regionMatch: kvRegionMatch,
@@ -78,17 +83,15 @@ export async function prepareWsRuntimeConfig(request: Request, env: Env): Promis
     const effectiveWkRegion = queryWk || kvWkRegion || '';
 
     // 2. regionMatch：URL query rm(no=关闭) > KV regionMatch > 默认开启
+    //    wk/rm 只影响「从哪个池挑 IP」，不触碰反泄漏策略，故保留为无凭据的兼容开关。
     const effectiveRegionMatch = queryRm !== null
         ? queryRm.toLowerCase() !== 'no'
         : (kvRegionMatch ?? true);
 
-    // 3. proxyMode：URL query qj(only=仅走代理/no=直连目标) > KV proxyOnly/proxyDegrade > 默认两者皆 false
-    const effectiveProxyOnly = queryQj === 'only'
-        ? true
-        : (queryQj === 'no' ? false : (kvProxyOnly ?? false));
-    const effectiveProxyDegrade = queryQj === 'only'
-        ? false
-        : (queryQj === 'no' ? true : (kvProxyDegrade ?? false));
+    // 3. proxyMode：qj=only（收紧）> KV proxyOnly/proxyDegrade > 默认两者皆 false
+    //    与改动前的唯一差别：`qj=no` 不再能把已开启的「仅走代理」关掉（见上方 S-05 说明）。
+    const effectiveProxyOnly = queryOnlyMode ? true : (kvProxyOnly ?? false);
+    const effectiveProxyDegrade = queryOnlyMode ? false : (kvProxyDegrade ?? false);
 
     // 3. proxyIPs：KV proxyIPs > envProxyIPs > DEFAULT_PROXY_IPS（对齐 cfnew 备用地址列表）
     const envFallbackIPs = globalThis.wsConfig?.envProxyIPs

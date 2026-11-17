@@ -1,12 +1,12 @@
 import { getDataset } from '@kv';
 import { buildDNS, retargetDnsDetour } from './dns';
 import { buildRoutingRules, buildBaseRoutingRules, buildRuleProviders, buildBlockRules, buildBypassRules } from './routing';
-import { buildChainOutbound, buildCleanProxyOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound, buildXpOutbound, getChainExplicitEarlyData, redrawChainEarlyData } from './outbounds';
-
+import { buildChainOutbound, buildCleanProxyOutbound, buildUrlTest, buildWarpOutbound, buildWebsocketOutbound, buildXpOutbound, redrawChainEarlyData } from './outbounds';
 // XHTTP 节点路径与 raw URI / Xray 侧共用同一份实现（随机路径规则只允许有一个来源）
 import { buildXpNodePath } from '@cores/xp';
 import type { WireguardOutbound, Config, Outbound } from '#types/clash';
-import { buildEntryPortMap, getConfigItems, cleanProxyEntries, generateRemark, generateWsPath, getProtocols, pickEarlyData, resetRemarkCounter, prependUpstreamItem, portsForHost, appendCleanProxyNodes } from '@utils';
+// R-06：显式 early-data 判据与其余共享判据同一来源（原先三端各复制一份）
+import { buildEntryPortMap, getConfigItems, cleanProxyEntries, generateRemark, generateWsPath, getProtocols, pickEarlyData, resetRemarkCounter, prependUpstreamItem, portsForHost, appendCleanProxyNodes, concatIf, enumerateXpNodes, remarkKeyOf, getChainExplicitEarlyData } from '@utils';
 import { configJsonResponse } from '@common';
 import { sniffer, tun } from './inbounds';
 import { buildAclClash, ACL_BUILTIN_GROUP_TAGS, loadAclTemplateWithFallback } from '../acl-template';
@@ -21,7 +21,7 @@ async function buildConfig(
     isWarp: boolean,
     isPro: boolean
 ): Promise<Config> {
-    const { logLevel, allowLANConnection } = globalThis.settings;
+    const { logLevel, allowLANConnection, enableIPv6 } = globalThis.settings;
     const tcpSettings = isWarp ? {} : {
         "disable-keep-alive": false,
         "keep-alive-idle": 10,
@@ -31,7 +31,10 @@ async function buildConfig(
 
     const config: Config = {
         "mixed-port": 7890,
-        "ipv6": true,
+        // B-49：原先是硬编码 true，与 dns.ipv6（跟随 enableIPv6）不一致 ——
+        // 用户关掉 IPv6 时，Clash 只停了 DNS 的 AAAA，连接层仍可走 IPv6 字面量，
+        // 而 Xray（UseIPv4 / queryStrategy）与 sing-box（ipv4_only）在全局层面都已禁用。
+        "ipv6": enableIPv6,
         "allow-lan": allowLANConnection,
         "unified-delay": false,
         "log-level": logLevel.replace("none", "silent"),
@@ -116,11 +119,12 @@ export async function getClNormalConfig(): Promise<Response> {
     // 即不参与「最佳延迟」url-test —— 两种传输混进同一个延迟采样组会改变既有 WS 节点组的切换行为。
     const xpTags: string[] = [];
     const outbounds: Outbound[] = [];
-    const selectorTags = ["最佳延迟 🚀"].concatIf(isChain, "🔗 最佳延迟 🚀");
+    const selectorTags = concatIf(["最佳延迟 🚀"], isChain, "🔗 最佳延迟 🚀");
     // 每个 (地址, 端口) 的 VLESS 节点备注：XHTTP 节点复用同一个基准名（与 raw URI 侧
     // `${wsRemark} XHTTP` 一致），因此不额外消耗 generateRemark 的编号，既有节点输出逐字不变。
     const vlRemarks = new Map<string, string>();
-    const remarkKey = (host: string, port: number) => `${host}\u0000${port}`;
+
+
 
     // 按 cleanIPs 的输入顺序遍历：普通地址生成 VLESS/Trojan 节点，代理条目生成独立 socks/http(s) 节点
     //（只做节点：不设 dialer-proxy、不进链式分支）
@@ -139,27 +143,27 @@ export async function getClNormalConfig(): Promise<Response> {
 
                 const tag = generateRemark(port, host, protocol, false, false);
                 // 记下 VLESS 的备注供第二趟 XHTTP 节点复用（协议可能只有 Trojan，故按协议判定）
-                if (protocol === _VL_) vlRemarks.set(remarkKey(host, port), tag);
+                if (protocol === _VL_) vlRemarks.set(remarkKeyOf(host, port), tag);
                 const outbound = buildWebsocketOutbound(protocol, tag, host, port, generateWsPath(usedPaths), pickEarlyData(usedEds));
 
-                if (outbound) {
-                    proxyTags.push(tag);
-                    selectorTags.push(tag);
-                    outbounds.push(outbound);
+                // B-45 之后 buildWebsocketOutbound 不再返回 null（非 TLS 端口的 Trojan 也保留），
+                // 故这里不再需要 if (outbound) 守卫。
+                proxyTags.push(tag);
+                selectorTags.push(tag);
+                outbounds.push(outbound);
 
-                    if (isChain) {
-                        const chainTag = generateRemark(port, host, protocol, false, true);
-                        let chain = structuredClone(chainProxy);
-                        // 克隆体不得继承源节点的 early-data：显式 ed 恰好给第一个克隆体，其余无放回重抽
-                        redrawChainEarlyData(chain, usedEds, pendingChainEd);
-                        pendingChainEd = undefined; // 只消费一次
-                        chain['name'] = chainTag;
-                        chain['dialer-proxy'] = tag;
-                        outbounds.push(chain);
+                if (isChain) {
+                    const chainTag = generateRemark(port, host, protocol, false, true);
+                    let chain = structuredClone(chainProxy);
+                    // 克隆体不得继承源节点的 early-data：显式 ed 恰好给第一个克隆体，其余无放回重抽
+                    redrawChainEarlyData(chain, usedEds, pendingChainEd);
+                    pendingChainEd = undefined; // 只消费一次
+                    chain['name'] = chainTag;
+                    chain['dialer-proxy'] = tag;
+                    outbounds.push(chain);
 
-                        chainTags.push(chainTag);
-                        selectorTags.push(chainTag);
-                    }
+                    chainTags.push(chainTag);
+                    selectorTags.push(chainTag);
                 }
             }
         }
@@ -169,27 +173,16 @@ export async function getClNormalConfig(): Promise<Response> {
     // 且备注复用 vlRemarks，因此不会移动既有节点的编号。
     // 取舍：只承载 VLESS（worker 入站无 Trojan 分支）、不生成链式（outProxy 链只作用于 WS 节点）、
     // 不进 proxyTags（不参与「最佳延迟」url-test）。
+    // R-08：枚举逻辑统一走 @utils#enumerateXpNodes，本端只负责渲染成 clash 出站。
     if (xpConfigs === true) {
-        for (const item of items) {
-            // 代理条目有自己的协议与出站，不派生 XHTTP 变体
-            if (item.kind !== 'address') continue;
-
-            const host = item.value;
-            const addrPorts = portsForHost(entryPortMap, host, ports);
-
-            for (const port of addrPorts) {
-                // 与 WS 节点同一条上游代理排除规则
-                if ((port === upstreamPort) !== (host === upstreamServer)) continue;
-
-                const baseTag = vlRemarks.get(remarkKey(host, port))
-                    ?? generateRemark(port, host, _VL_, false, false);
-                const tag = `${baseTag} XHTTP`;
-                // 与 WS 节点共用 usedPaths：同一次生成内两种传输的路径互不相同
-                const outbound = buildXpOutbound(tag, host, port, buildXpNodePath(randomPath, usedPaths));
-                outbounds.push(outbound);
-                xpTags.push(tag);
-                selectorTags.push(tag);
-            }
+        for (const plan of enumerateXpNodes({
+            items, entryPortMap, ports, vlRemarks,
+            upstreamServer, upstreamPort, isFragment: false,
+            nextPath: () => buildXpNodePath(randomPath, usedPaths)
+        })) {
+            outbounds.push(buildXpOutbound(plan.tag, plan.host, plan.port, plan.path));
+            xpTags.push(plan.tag);
+            selectorTags.push(plan.tag);
         }
     }
 

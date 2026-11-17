@@ -1,5 +1,5 @@
 import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes, isBareIPv4 } from '@utils';
-import { evictOldest, safeErrorMessage, randomUserAgent, createSessionWatchdog, createSignatureGate, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
+import { evictOldest, safeErrorMessage, randomUserAgent, base64EncodeUtf8, createSessionWatchdog, createSignatureGate, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
 // 核心修复：原写法 `export const connectSocket = getConnect()` 在模块加载期立即执行，
@@ -17,6 +17,12 @@ export const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 const DIRECT_DIAL_TIMEOUT = 5000; // 直连竞速与兜底直连连接超时（对齐 cfnew 连接超时值 = 5000）
 const PROXY_DIAL_TIMEOUT = 5000; // 代理竞速连接超时（对齐 cfnew 连接超时值 = 5000）
+/**
+ * B-12：上游代理**握手**总超时（建连之后、首包之前）。
+ * 竞速拨号的 5s 只覆盖 `socket.opened`，覆盖不到「accept 了但永不复 SOCKS5 应答 /
+ * 永不回 `\r\n\r\n`」这类黑洞上游 —— 那种情况下 read() 会永久挂起。
+ */
+const UPSTREAM_HANDSHAKE_TIMEOUT = 8000;
 const RACE_DIAL_CONCURRENCY = 3; // 并发拨号数量，参考 cfnew
 const RACE_DIAL_MAX_BATCHES = 5; // 最大重试批次
 const RACE_PROBE_COUNT = 8; // 每连接从缓存池抽取参与 2 秒可达性探测的候选数（抽取在探测前、按黑名单过滤后进行）
@@ -195,64 +201,77 @@ async function connectWithRaceDial(
 
         log(`race dialing batch ${batch + 1}: ${batchEntries.map(([h, p]) => `${h}:${p}`).join(', ')}`);
 
-        // 并发拨号，取最快成功的（黑名单预检跳过已知不通的 IP:port，对齐 edgetunnel 5782-5786）
+        // 并发拨号，取**最快**成功的（黑名单预检跳过已知不通的 IP:port，对齐 edgetunnel 5782-5786）
+        // B-11：batchWinnerClaimed 是本批的「先到先得」闸门 —— 只有第一条成功连上的候选会认领，
+        // 之后连上的候选立即关闭并抛 'lost race'，因此不会有无人认领的 socket 残留。
+        // R-03：单候选的「拨号 + 等建立 + 写首包 + 失败回收」由 dialCandidate 统一提供。
+        let batchWinnerClaimed = false;
         const dialPromises = batchEntries.map(async ([ip, entryPort], j) => {
             const cleanIp = ip.replace(/^\[|\]$/g, '');
             const key = blacklistKey(cleanIp, entryPort);
             // 抽取阶段已按黑名单过滤过；这里只兜住「抽取 → 拨号」之间被并发连接新拉黑的键。
             // blacklistBypass（全池退避中）时不跳过，保证最后兜底仍真的会拨号。
-            if (!blacklistBypass && blacklistCheck(key)) return { socket: null, ip: cleanIp, port: entryPort, index: batchIndexes[j] };
-            const socket = connectSocket({ hostname: cleanIp, port: entryPort }, fetcher);
-            // 立刻登记：竞速是"先写首包再返回"，写卡住时上层拿不到 socket，teardown 就没人关它
-            onSocket?.(socket);
-            // 等待连接建立
-            try {
-                await Promise.race([
-                    socket.opened,
-                    new Promise<never>((_, reject) =>
-                        setTimeout(() => reject(new Error('timeout')), PROXY_DIAL_TIMEOUT)
-                    )
-                ]);
-            } catch (dialError) {
-                // F-09：超时/reject 分支创建的 socket 同样要回收。allSettled 的 rejected 分支不再携带
-                // socket，若不在此关闭，每次竞速失败都会残留 2-3 条半开连接。
+            // 用 throw 而不是返回 socket:null —— Promise.any 只该在「真的拿到了 socket」时才 settle。
+            if (!blacklistBypass && blacklistCheck(key)) throw new Error('candidate blacklisted');
+
+            // 先到先得闸门与黑名单记账留在本路径；拨号与写首包的收口见 dialCandidate
+            const socket = await dialCandidate(
+                { hostname: cleanIp, port: entryPort },
+                rawClientData,
+                PROXY_DIAL_TIMEOUT,
+                fetcher,
+                {
+                    onSocket,
+                    // 保持原语义：只有「连上了但首包写不出去」的候选才记黑名单
+                    // （连不上的不算，那由抽取阶段的可达性探测与批量回退负责）
+                    onWriteFailure: (error) => {
+                        log(`race dial write failed for ${cleanIp}:${entryPort}: ${safeErrorMessage(error)}`);
+                        blacklistRecord(key);
+                    }
+                }
+            );
+
+            // B-11：晚到的候选（本批已经有人连上）自行关闭并出局
+            if (batchWinnerClaimed) {
                 try { socket.close(); } catch {}
-                throw dialError;
+                throw new Error('lost race');
             }
+            batchWinnerClaimed = true;
             return { socket, ip: cleanIp, port: entryPort, index: batchIndexes[j] };
         });
 
-        const results = await Promise.allSettled(dialPromises);
+        // B-11：取**最快成功**的候选（Promise.any），不再 `await Promise.allSettled`。
+        // 原实现有两个问题：① 单条候选最多等 PROXY_DIAL_TIMEOUT(5s)，于是「1 条 10ms 连上 +
+        // 2 条黑洞」也要白等 5s 才写首包（批次上限 5 → 单跳最坏 25s，再叠加回退阶梯最坏 75s）；
+        // ② allSettled 的结果数组按**入参顺序**排列，for 取到的是「池序第一个成功者」而不是最快者 ——
+        // 与注释「取最快成功的」以及同文件 connectWithDirectRaceDial 的 Promise.any 语义都不一致。
+        // 败者由 dial 内的 batchWinnerClaimed 分支自行关闭，不会留下无人认领的 socket。
+        let winner: { socket: Socket; ip: string; port: number; index: number } | null = null;
+        try {
+            winner = await Promise.any(dialPromises);
+        } catch {
+            // AggregateError：本批所有候选都失败（各自已在 dial 内关 socket 并记黑名单）
+            winner = null;
+        }
 
-        // 找第一个竞速成功的 socket，直接写载荷（对齐 cfnew 连接值发送直连路径 L4732-4768）：
-        // 备用地址（CMLosss 等）是直连中继，竞速拨号建立 TCP 后无需 SOCKS5 握手，
-        // 直接通过写入器把剥离 VLESS 头后的载荷写入即可。写入失败视同该候选不通，
-        // 继续尝试本批下一个候选。
-        for (const result of results) {
-            if (result.status !== 'fulfilled' || !result.value || !result.value.socket) continue;
-            const { socket, ip, port: entryPort, index } = result.value;
+        if (winner) {
+            const { socket, ip: winnerIp, port: winnerPort, index } = winner;
             try {
-                // 先写首包再关闭其余候选，避免连接被重置（对齐 cfnew 连接值发送 L4766-4768：
+                // 先写首包再返回，避免连接被重置（对齐 cfnew 连接值发送 L4766-4768：
                 // if (值数据378.byteLength) await 写入器.write(值数据378)）
                 const writer = socket.writable.getWriter();
                 if (rawClientData && rawClientData.byteLength) {
                     await writer.write(rawClientData);
                 }
                 writer.releaseLock();
-                // 关闭其余已建立的候选 socket，避免泄漏（对齐 cfnew 连接值套接字 Promise.any 关闭败者）
-                for (const other of results) {
-                    if (other.status === 'fulfilled' && other.value && other.value.socket && other.value.socket !== socket) {
-                        try { other.value.socket.close(); } catch {}
-                    }
-                }
                 // 成功：清除黑名单 + 游标推进到成功候选（对齐 edgetunnel 5799-5800）
-                blacklistClear(blacklistKey(ip, entryPort));
+                blacklistClear(blacklistKey(winnerIp, winnerPort));
                 proxyIpPoolCursor = index;
-                log(`race dial winner: ${ip}:${entryPort} (proxy: ${proxyAddr})`);
-                return { socket, usedIp: ip };
+                log(`race dial winner: ${winnerIp}:${winnerPort} (proxy: ${proxyAddr})`);
+                return { socket, usedIp: winnerIp };
             } catch (writeError) {
-                log(`race dial write failed for ${ip}:${entryPort}: ${safeErrorMessage(writeError)}`);
-                blacklistRecord(blacklistKey(ip, entryPort));
+                log(`race dial write failed for ${winnerIp}:${winnerPort}: ${safeErrorMessage(writeError)}`);
+                blacklistRecord(blacklistKey(winnerIp, winnerPort));
                 try { socket.close(); } catch {}
             }
         }
@@ -356,34 +375,21 @@ async function connectWithDirectRaceDial(
         log(`direct race dialing batch ${attemptedBatches}: ${batchCandidates.map(c => c.key).join(', ')}`);
 
         // 并发拨号，取最快成功的（对齐 cfnew 并发连接候选 Promise.any）
+        // 并发拨号，取最快成功的（对齐 cfnew 并发连接候选 Promise.any）
+        // R-03：单候选的拨号/写首包/失败回收全在 dialCandidate（其注释是这条不变式的唯一出处）
         const dialPromises = batchCandidates.map(async (candidate) => {
-            const socket = connectSocket({ hostname: candidate.hostname, port: candidate.port }, fetcher);
-            // 立刻登记：本函数**先写首包再返回**，若写卡住（后端 accept 但永不消费），
-            // 上层拿不到 socket，teardown 时就没人关它（评审 MAJOR：资源不释放）。
-            onSocket?.(socket);
-            try {
-                await Promise.race([
-                    socket.opened,
-                    new Promise<never>((_, reject) =>
-                        setTimeout(() => reject(new Error('timeout')), DIRECT_DIAL_TIMEOUT)
-                    )
-                ]);
-            } catch (dialError) {
-                // F-09：Promise.any 只处理 fulfilled 的败者，reject 分支的 socket 必须在这里就地回收
-                try { socket.close(); } catch {}
-                throw dialError;
-            }
+            const socket = await dialCandidate(
+                { hostname: candidate.hostname, port: candidate.port },
+                rawClientData,
+                DIRECT_DIAL_TIMEOUT,
+                fetcher,
+                { onSocket }
+            );
             return { socket, candidate };
         });
 
         try {
             const { socket, candidate } = await Promise.any(dialPromises);
-            // 写入首包载荷（对齐 cfnew L4759: if (值数据.byteLength) await 写入器.write(值数据)）
-            const writer = socket.writable.getWriter();
-            if (rawClientData && rawClientData.byteLength) {
-                await writer.write(rawClientData);
-            }
-            writer.releaseLock();
 
             // 关闭其余候选 socket（对齐 cfnew 并发连接候选关闭败者）
             for (const p of dialPromises) {
@@ -410,16 +416,80 @@ async function connectWithDirectRaceDial(
     throw new Error(`All direct race dial attempts failed for ${targetAddress}:${targetPort}`);
 }
 
-/** 工具函数：模块级，供 connectWithPrefixFallback 等使用 */
+/**
+ * 工具函数：模块级，供 connectWithPrefixFallback 等使用 */
 const getRandomValue = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
 const parseIPs = (value: string) => value ? value.split(',').map(val => val.trim()).filter(Boolean) : undefined;
 
 /**
- * 拨号 + 写首包的共用实现：模块级调用方与 handleWebsocket 内的 connectAndWriteLocal 共用这一份。
- * hooks 的回调时机是语义的一部分，不能挪：
- *  - onSocket：connectSocket 之后、`await opened` **之前**。本地版靠它把 socket 登记进 remoteSocket.value，
- *    必须早于等待 —— 否则超时/失败时 teardown 关不到这条半开连接（F-09 同一约束）。
- *  - onOpened：连接建立之后、取 writer **之前**。本地版在这里打「connected to」日志，保持既有日志顺序。
+ * R-03：**单个候选的「拨号 + 等建立 + 写首包」**，三条拨号路径（反代池竞速 / 直连池竞速 /
+ * 单条拨号）共用的唯一实现。
+ *
+ * 之所以必须只有一份：这一段里藏着三条彼此独立、且每条都曾经是真实缺陷的不变式，
+ * 复制三遍时必然漏掉其中一条（历史证据：P-03 定时器不清理只修了一处、B-19 超时不关连接
+ * 只修了一处、F-09 失败分支 socket 泄漏只在两处修过）。
+ *  1. `onSocket` 必须在 `await opened` **之前**回调 —— 竞速路径「先写首包再返回」，
+ *     写卡住时上层拿不到 socket，teardown 只能靠这个登记把它关掉；
+ *  2. `opened` 超时或 reject 时**就地关闭** socket（竞速的败者分支不携带 socket 引用）；
+ *  3. 写首包失败时先 `releaseLock` 再关闭 —— 否则锁死的 writable 会让上层再次 getWriter 抛错，
+ *     把整条上行泵打死（现象是「管道错误」而非真实原因）。
+ * 定时器在 `finally` 里清掉：`Promise.race` 的 setTimeout 不会自动取消，长连接下会堆积成
+ * 「每连接数个必然空跑的悬空定时器」。
+ *
+ * 出错时本函数**已经**完成回收并抛出，调用方只需决定「要不要记黑名单」，不需要再关 socket。
+ */
+async function dialCandidate(
+    target: { hostname: string; port: number },
+    rawClientData: ArrayBuffer | undefined,
+    timeoutMs: number,
+    fetcher?: any,
+    hooks?: {
+        onSocket?: (socket: Socket) => void;
+        onOpened?: () => void;
+        /** 首包写失败时的回调（socket 已解锁并关闭）。只有需要「按失败阶段记账」的调用方才传。 */
+        onWriteFailure?: (error: unknown) => void;
+    }
+): Promise<Socket> {
+    const socket = connectSocket(target, fetcher);
+
+    hooks?.onSocket?.(socket);
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+        await Promise.race([
+            socket.opened,
+            new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`连接超时 (${target.hostname}:${target.port})`)), timeoutMs);
+            })
+        ]);
+    } catch (dialError) {
+        try { socket.close(); } catch { /* 已关闭 */ }
+        throw dialError;
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+
+    hooks?.onOpened?.();
+
+    // F-19：rawClientData 可能为 undefined（首包剥离后无残余载荷），直接 write(undefined) 会抛 TypeError
+    const writer = socket.writable.getWriter();
+    try {
+        if (rawClientData && rawClientData.byteLength) await writer.write(rawClientData);
+    } catch (writeError) {
+        try { writer.releaseLock(); } catch { /* 有未决写时释放会抛 */ }
+        try { socket.close(); } catch { /* 已关闭 */ }
+        // 首包写失败与「连不上」是两种失败：反代池只对前者记黑名单（后者由可达性探测负责）。
+        // 需要区分的调用方自己传 onWriteFailure —— 不在异常对象上打标记，省掉一套类型与两个辅助函数。
+        hooks?.onWriteFailure?.(writeError);
+        throw writeError;
+    }
+    writer.releaseLock();
+    return socket;
+}
+
+/**
+ * 拨号 + 写首包的对外形态（保留原签名供既有调用点使用）。
+ * 语义等价于直接调用 dialCandidate（hooks 的回调时机见其注释，不能挪）。
  */
 async function dialAndWrite(
     address: string,
@@ -428,30 +498,7 @@ async function dialAndWrite(
     fetcher?: any,
     hooks?: { onSocket?: (socket: Socket) => void; onOpened?: () => void }
 ): Promise<Socket> {
-    // if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(address)) address = `${atob('d3d3Lg==')}${address}${atob('LnNzbGlwLmlv')}`;
-    const tcpSocket = connectSocket({
-        hostname: address,
-        port: port,
-    }, fetcher);
-
-    hooks?.onSocket?.(tcpSocket);
-
-    // 连接超时保护：防止连到不通的 IP 时卡死
-    await Promise.race([
-        tcpSocket.opened,
-        new Promise<void>((_, reject) =>
-            setTimeout(() => reject(new Error(`连接超时 (${address}:${port})`)), DIRECT_DIAL_TIMEOUT)
-        )
-    ]);
-
-    hooks?.onOpened?.();
-
-    // log(`connected to ${address}:${port}`);
-    const writer = tcpSocket.writable.getWriter();
-    // F-19：rawClientData 可能为 undefined（首包剥离后无残余载荷），直接 write(undefined) 会抛 TypeError
-    if (rawClientData && rawClientData.byteLength) await writer.write(rawClientData);
-    writer.releaseLock();
-    return tcpSocket;
+    return await dialCandidate({ hostname: address, port }, rawClientData, DIRECT_DIAL_TIMEOUT, fetcher, hooks);
 }
 
 /** NAT64 prefix 模式：将目标域名解析为 IPv4，转换为 IPv6 NAT64 地址连接 */
@@ -600,21 +647,35 @@ function normalizeTargetAddress(addr: string): string {
     return /^\[.*\]$/.test(s) ? s.slice(1, -1) : s;
 }
 
-/** Wrap leftover bytes from handshake response back into readable stream head — cfnew 包装残留套接字 L5662-5684 */
+/**
+ * Wrap leftover bytes from handshake response back into readable stream head — cfnew 包装残留套接字 L5662-5684
+ *
+ * B-24：必须是 **byte stream**（`type:'bytes'`）。旧实现产出的普通 ReadableStream 让下游
+ * `remoteSocketToWS` 的 `getReader({ mode: 'byob' })` 直接抛错 → 静默退回非 BYOB 路径：
+ * 每块都新分配一枚 ArrayBuffer（真正零化）再打包一次，而这条包装流**只在「配了上游 SOCKS5 /
+ * HTTP CONNECT」时**才出现 —— 也就是配了上游代理的用户全程乘着最贵的读路径，且没有任何降级日志。
+ * byte stream 的 `enqueue` 同样接受 Uint8Array，残留字节仍排在后续 chunk 之前（见下方 pull）。
+ */
 function wrapLeftoverSocket(socket: Socket, leftover: Uint8Array): Socket {
     let upstreamReader: ReadableStreamDefaultReader<any> | null = null;
     const newReadable = new ReadableStream({
-        start(controller) {
+        type: 'bytes',
+        start(controller: ReadableByteStreamController) {
+            // 先塞残留：byte stream 的 enqueue 会把这段字节排在队列头，BYOB 读到的第一块必然是它
             controller.enqueue(leftover);
             upstreamReader = socket.readable.getReader();
         },
-        async pull(controller) {
+        async pull(controller: ReadableByteStreamController) {
             const { value, done } = await upstreamReader!.read();
             if (done) { controller.close(); return; }
-            controller.enqueue(value);
+            controller.enqueue(toUint8Array(value));
         },
-        cancel(reason) {
+        cancel(reason: any) {
             try { upstreamReader?.cancel(reason); } catch {}
+            // B-24：cancel 不会释放 reader 的锁，而这里持有的是**上游 socket 的** readable ——
+            // 不释放的话，teardown 路径再去 getReader() 会抛「stream is locked」（旧实现同样漏了这步）。
+            // 有未决读时 releaseLock 会抛，故与同文件其它位置一样包 try。
+            try { upstreamReader?.releaseLock(); } catch { /* 有未决读时释放会抛 */ }
         }
     });
     return {
@@ -642,13 +703,38 @@ async function socks5Connect(
     const writer = socket.writable.getWriter();
     const reader = socket.readable.getReader();
 
+    /**
+     * B-12：握手失败必须回收 socket。
+     *
+     * 原实现从建连到握手结束**没有 try/catch**，也没有 deadline：上游代理若「TCP accept 但
+     * 永不复 SOCKS5 应答」，`readAtLeast` 会永久挂起（`PROXY_DIAL_TIMEOUT` 只用于竞速拨号，
+     * 覆盖不到这里）；而 `no acceptable methods` / `fail to auth` / `invalid proxy response`
+     * 这些分支直接 `throw`，既没 close 也没走 `remoteSocket.track` —— 每次失败泄漏一条半开 TCP
+     * 与一对锁死的 reader/writer，长 isolate 中累积到句柄耗尽。
+     *
+     * 这里用 `fail()` 把「收口 + 抛错」绑在一起，避免再出现「新增了一个 throw 但忘了关 socket」。
+     */
+    function fail(message: string): never {
+        // P-03/B-12：失败路径也要清掉握手 deadline，否则每次握手失败都会留下一个
+        // 8 秒后必定空跑、且会去 close 一个已关闭 socket 的定时器。
+        clearTimeout(handshakeDeadline);
+        try { writer.releaseLock(); } catch { /* 有未决写时释放会抛 */ }
+        try { reader.releaseLock(); } catch { /* 同上 */ }
+        try { socket.close(); } catch { /* 已关闭 */ }
+        throw new Error(message);
+    }
+    // 握手总 deadline：超时直接关 socket → 挂起的 read() 随即失败 → 由上方 fail 的 catch 收口
+    const handshakeDeadline = setTimeout(() => {
+        try { socket.close(); } catch { /* 已关闭 */ }
+    }, UPSTREAM_HANDSHAKE_TIMEOUT);
+
     // Accumulated leftover bytes across reads — aligned with cfnew 残留字节 L5533
     let leftover: Uint8Array<ArrayBuffer> = new Uint8Array(0);
 
     async function readAtLeast(need: number): Promise<Uint8Array<ArrayBuffer>> {
         while (leftover.length < need) {
             const { value, done } = await reader.read();
-            if (done || !value) throw new Error('fail to open socks connection');
+            if (done || !value) fail('fail to open socks connection');
             leftover = concatUint8Arrays(leftover, toUint8Array(value)) as Uint8Array<ArrayBuffer>;
         }
         return leftover;
@@ -665,13 +751,13 @@ async function socks5Connect(
 
     // Step 2: Method selection response — cfnew L5547-5550
     let response = await readAtLeast(2);
-    if (response[0] !== 5 || response[1] === 255) throw new Error('no acceptable methods');
+    if (response[0] !== 5 || response[1] === 255) fail('no acceptable methods');
     const selectedMethod = response[1];
     take(2);
 
     // Step 3: Username/password auth (method 2) — cfnew L5551-5558
     if (selectedMethod === 2) {
-        if (!username || !password) throw new Error('socks server needs auth');
+        if (!username || !password) fail('socks server needs auth');
         const encoder = new TextEncoder();
         // F-20：SOCKS5 认证长度字段是 UTF-8 字节数，非 ASCII 账号/口令用 .length（字符数）会少算 → 认证报文非法
         const usernameBytes = encoder.encode(username);
@@ -682,7 +768,7 @@ async function socks5Connect(
         ]);
         await writer.write(authRequest);
         response = await readAtLeast(2);
-        if (response[0] !== 1 || response[1] !== 0) throw new Error('fail to auth socks server');
+        if (response[0] !== 1 || response[1] !== 0) fail('fail to auth socks server');
         take(2);
     }
 
@@ -711,7 +797,7 @@ async function socks5Connect(
 
     // Step 5: Read CONNECT response — cfnew L5567-5581
     response = await readAtLeast(4);
-    if (response[1] !== 0) throw new Error('fail to open socks connection');
+    if (response[1] !== 0) fail('fail to open socks connection');
     const bindAddrType = response[3];
     let replyLen: number;
     if (bindAddrType === 1) {
@@ -721,13 +807,14 @@ async function socks5Connect(
     } else if (bindAddrType === 3) {
         replyLen = 7 + (await readAtLeast(5))[4]; // Domain: 4 header + 1 len + domain + 2 port
     } else {
-        throw new Error('invalid proxy response');
+        fail('invalid proxy response');
     }
     await readAtLeast(replyLen);
     take(replyLen);
 
     // Step 6: Write first packet before releasing writer — cfnew L5582-5584
     if (rawClientData && rawClientData.byteLength) await writer.write(rawClientData);
+    clearTimeout(handshakeDeadline);
     writer.releaseLock();
     reader.releaseLock();
 
@@ -755,7 +842,15 @@ async function httpConnectTunnel(
         ? (connectOpts ? fetcher.connect(target, connectOpts) : fetcher.connect(target))
         : (connectOpts ? (globalThis as any).connect(target, connectOpts) : (globalThis as any).connect(target));
 
-    if (socket.opened) await socket.opened;
+    if (socket.opened) {
+        // B-12：这条 await 原先在 try 之外 —— opened 被拒时 socket 无人关闭（清理只覆盖 try 之后）
+        try {
+            await socket.opened;
+        } catch (error) {
+            try { socket.close(); } catch { /* 已关闭 */ }
+            throw error;
+        }
+    }
 
     // IPv6 targets need brackets in request line — cfnew L5615
     const targetHost = targetAddress.includes(':') && !/^\[.*\]$/.test(targetAddress) ? `[${targetAddress}]` : targetAddress;
@@ -768,12 +863,19 @@ async function httpConnectTunnel(
         + `User-Agent: ${randomUserAgent()}\r\n`
         + `Proxy-Connection: Keep-Alive\r\n`;
     if (username) {
-        requestText += `Proxy-Authorization: Basic ${btoa(`${username}:${password || ''}`)}\r\n`;
+        // B-20：Basic 凭据必须是 **UTF-8 字节** 再 base64（RFC 7617）。
+        // 原实现用 btoa(`${user}:${pass}`)：① 只接受 ≤0xFF 的码点，中文/emoji 口令直接抛
+        // InvalidCharacterError（且抛点在 try 之外 → socket 泄漏）；② 即使不抛也只是 Latin-1。
+        requestText += `Proxy-Authorization: Basic ${base64EncodeUtf8(`${username}:${password || ''}`)}\r\n`;
     }
     requestText += '\r\n';
 
     const writer = socket.writable.getWriter();
     const reader = socket.readable.getReader();
+    // B-12：tunnel 握手总 deadline（黑洞上游会让下面的 while 永久挂起）
+    const tunnelDeadline = setTimeout(() => {
+        try { socket.close(); } catch { /* 已关闭 */ }
+    }, UPSTREAM_HANDSHAKE_TIMEOUT);
 
     try {
         await writer.write(new TextEncoder().encode(requestText));
@@ -807,6 +909,7 @@ async function httpConnectTunnel(
 
         // Write first packet before releasing writer — cfnew L5648-5649
         if (rawClientData && rawClientData.byteLength) await writer.write(rawClientData);
+        clearTimeout(tunnelDeadline);
         writer.releaseLock();
         reader.releaseLock();
 
@@ -815,6 +918,7 @@ async function httpConnectTunnel(
         return socket;
     } catch (err) {
         // Clean up on error — cfnew L5654-5658
+        clearTimeout(tunnelDeadline);
         try { writer.releaseLock(); } catch {}
         try { reader.releaseLock(); } catch {}
         try { socket.close(); } catch {}
@@ -877,7 +981,7 @@ export async function handleTCPOutBound(
     //     且非仅走代理/直连目标」时才拿它们做首跳；其余情况池一律留在回退阶梯里兜底。
     //     首跳失败后统一按 上游代理 → 反代池 → 官方池 → 直连 回退（跳过已试级别）。
     // 注：proxyIPMode === 'prefix'（NAT64）在上方分支已提前返回，不参与本决策。
-    const { proxyMode, proxyOnly, proxyDegrade, hasCustomProxyIPs, workerRegion } = globalThis.wsConfig as WsConfig;
+    const { proxyMode, proxyOnly, proxyDegrade, workerRegion } = globalThis.wsConfig as WsConfig;
     const hasUpstreamProxy = Boolean(globalThis.settings?.upstreamProxy);
     // 用户显式配置的反代池实体（handlers.ts 已剔除内置 DEFAULT_PROXY_IPS 与 CF 模式的官方直连池）
     const customProxyPool = globalThis.wsConfig?.customProxyPool?.length ? globalThis.wsConfig.customProxyPool : [];
@@ -1221,7 +1325,7 @@ const FIRST_BYTE_TIMEOUT = 6000;          // 首字节超时 ms（触发 retry �
  * 一次调用 —— 长会话迟早把额度耗光，超限时平台返回 1102 并**连带打死整个 isolate**
  * （同 isolate 上的其它连接一起断）。按字节主动收口，把「不可控的 isolate 崩溃」换成
  * 「单条连接可控断开 + 客户端自动重连」。
- * 900MB 的量级：按 10MB/s 上限约 90 秒（客户端真能跑满时）；按 4K 真实码率（≈3.1MB/s）
+ * 900MB 的量级：按默认速率上限约 45 秒（客户端真能跑满时）；按 4K 真实码率（≈3.1MB/s）
  * 约 5 分钟；1080p（≈0.8MB/s）约 19 分钟。断一次只是一次干净重连，不丢会话状态。
  *
  * env `WS_SESSION_MAX_MB` 可覆盖；**显式设为 0 表示关闭该保护**（回滚开关），
@@ -1230,22 +1334,25 @@ const FIRST_BYTE_TIMEOUT = 6000;          // 首字节超时 ms（触发 retry �
 const WS_SESSION_MAX_MB_DEFAULT = 900;
 
 /**
- * 下行速率上限的默认值（字节/秒，10MB/s ≈ 80Mbps）：**默认开启**。
+ * 下行速率上限的默认值（字节/秒）：**默认开启**，具体取值见下方 WS_DOWNLINK_BPS_DEFAULT。
  * 依据见 downlinkByteRate 的注释（平台没有发送侧背压）。
  *
- * 10MB/s 对 4K（25~50Mbps）仍有 1.6~3 倍余量，正常播放不会咬到它；它的作用是**兜底**：
+ * 默认值对 4K（25~50Mbps）有数倍余量，正常播放不会咬到它；它的作用是**兜底**：
  * 一旦客户端链路远低于这个值，无界排队就会被压成稳定速率，而不是一直涨到 isolate 被打死。
  * 链路更快（>80Mbps）的部署在跑大文件下载时会被这个上限压住，需要时上调或设 `0` 关闭。
  *
- * 为什么从 20MB/s 下调：旧实现的令牌桶容量 = 本速率，于是这个值同时决定了「单次突发额度」。
- * 20MB/s 对常见客户端（3~6MB/s）等于**令牌永远够用 → 节流从不等待 → 流控实际不生效**，
- * isolate 发送队列继续无界堆积，最终被平台以 `internal error; reference = …` 收口
- * （同 isolate 上的在途请求一并失败）。10MB/s 既能保住 4K 余量，又能让节流在真实链路上咬住；
- * 突发额度已由 `WS_DOWNLINK_BURST_KB` 单独控制（见 downlinkBurstBytes），不再随速率一起放大。
+ * ⚠️ 现默认 20MB/s（按业主指定）。**这是本仓有过实机结论的一个值，务必读懂再改**：
+ * `docs/analysis/worker-internal-error-1101-2026-11-15.md` §9/§9.3 记录，20MB/s 曾经让
+ * 「令牌永远够用 → 节流从不等待 → isolate 发送队列无界堆积」，被平台以
+ * `internal error; reference = …` 收口；降到 10MB/s 后同类报错在 10 分钟内明显减少。
+ * 与当时不同的是，突发额度现在是**独立的**（见 `WS_DOWNLINK_BURST_KB`），不再等于速率 ——
+ * 单次尖峰被封在下面那个常量里，但**长期平均速率仍高于常见客户端（3~6MB/s）**，
+ * 所以「节流咬不住」这一条依然成立。若线上复现上述报错，把 env 调回 `10000000` 即可，无需改代码。
+ * 校准时看 debug 日志的 `capWait`：≈0 说明上限没咬住（应调低），接近窗口长度说明它是瓶颈（可调高）。
  *
  * ⚠️ 它是**全量下行**的上限，不分协议。
  */
-const WS_DOWNLINK_BPS_DEFAULT = 10 * 1000 * 1000;
+const WS_DOWNLINK_BPS_DEFAULT = 20 * 1000 * 1000;
 
 function sessionByteBudget(): number {
     return Math.floor(envNumber('WS_SESSION_MAX_MB', WS_SESSION_MAX_MB_DEFAULT, true) * 1024 * 1024);
@@ -1267,7 +1374,7 @@ function sessionByteBudget(): number {
  * socket 接收缓冲填满 → TCP 窗口关闭 → 上游源站自然停顿。平台没有给我们发送侧信号，
  * 但接收侧（不读就不收）是真实的。
  *
- * env `WS_DOWNLINK_BPS`（字节/秒）：未设取 `WS_DOWNLINK_BPS_DEFAULT`（10MB/s），
+ * env `WS_DOWNLINK_BPS`（字节/秒）：未设取 `WS_DOWNLINK_BPS_DEFAULT`（见该常量），
  * **显式设 0 = 关闭**。取值建议略高于客户端实际下行能力，再用 debug 日志里的 `capWait`
  * 校准：`capWait≈0` 说明上限没咬住（客户端比你设的更慢，应调低）；`capWait` 接近
  * 窗口长度说明上限才是瓶颈（可调高）。
@@ -1280,16 +1387,20 @@ function downlinkByteRate(): number {
  * 下行「突发额度」（字节）：令牌桶**容量**，与速率解耦。
  *
  * 为什么必须解耦：桶容量决定了「一条连接在开始被限速之前能灌多少字节进运行时队列」。
- * 旧实现容量 = 速率，于是 `WS_DOWNLINK_BPS=10MB/s` 意味着**每条连接可瞬时灌 10MB**；
+ * 旧实现容量 = 速率，于是速率设多大就意味着**每条连接可瞬时灌多少**；
  * 现场测速场景同时开 8 条 → 瞬时额度 80MB，128MB 的 isolate 直接被顶到平台回收
  * （表现仍是 `internal error; reference = …`，而不是 1102）。速率与突发是两件事：
  * 前者是长期平均，后者是单次尖峰的内存风险，必须分开设。
  *
- * env `WS_DOWNLINK_BURST_KB`（KB）：未设取 2048（2MB）；**显式 0 = 沿用旧行为（容量 = 速率）**，
+ * env `WS_DOWNLINK_BURST_KB`（KB）：未设取 `WS_DOWNLINK_BURST_KB_DEFAULT`（3MiB）；**显式 0 = 沿用旧行为（容量 = 速率）**，
  * 作为回滚开关。本函数只算「策略」，`4 × 读块` 这个下界由 createByteGovernor 单独兜（唯一一处），
  * 避免两处各写一遍同一条不变式。
+ *
+ * ⚠️ 容量 × 连接上限就是**单次尖峰的上界**：3MiB × `WS_MAX_CONNECTIONS`(256) = 768MiB，
+ * 是 isolate 128MB 上限的 6 倍。这个乘积只会在「所有连接同时被灌满且都发不出去」时成立，
+ * 但它正是本保护要防的那种场景 —— 调大这三者中任意一个都要重新算这个乘积。
  */
-const WS_DOWNLINK_BURST_KB_DEFAULT = 2048;
+const WS_DOWNLINK_BURST_KB_DEFAULT = 3072;
 
 function downlinkBurstBytes(bytesPerSec: number): number {
     const kb = envNumber('WS_DOWNLINK_BURST_KB', WS_DOWNLINK_BURST_KB_DEFAULT, true);
@@ -1375,7 +1486,7 @@ export function envConnectionLimit(name: string, fallback: number): { raw: numbe
  *   - **显式 0** → `zeroMeansOff` 时返回 0（关闭），否则仍是 `fallback`；
  *   - 正数 → 原值。
  *
- * 为什么必须区分「未设」与「显式 0」：默认值一旦不是 0（如 10MB/s、900MB），
+ * 为什么必须区分「未设」与「显式 0」：默认值一旦不是 0（如下行速率、会话预算），
  * `?? 0` 的写法会把"没设"也当成 0 —— 默认值就永远不生效（本仓库踩过这个坑）。
  * 同时保留显式 0 = 关闭，否则"改默认值"等于"永久失去回滚开关"。
  * 三处（会话字节预算、下行速率、上行 isolate 预算）共用这一份实现。
@@ -1505,6 +1616,39 @@ function createDownloadBatcher(webSocket: WebSocket) {
     };
 }
 
+/**
+ * B-13：WS **会话级**下行记账。
+ *
+ * 回退阶梯（上游代理 → 反代池 → 官方池 → 直连）每换一条 socket 都会重新调用
+ * `remoteSocketToWS`。预算 / 令牌桶 / 累计字节原本是函数局部变量 —— **每换一次就重置一次**，
+ * 于是客户端只要让首字节超时发生一次，就能在同一条 WS 上把 900MiB 预算与
+ * `WS_DOWNLINK_BURST_KB` 的突发额度重复兑现，恰好绕过这条保护要防的「isolate 被打死」场景。
+ *
+ * 以 WebSocket 为键：一条会话只有一个 WS，连接结束后随 WS 一起被 GC，无需手工清理。
+ * `budgetExceeded` 刻意**不**放进来 —— 它表示「本次挂载已收口」，必须保持 per-mount，
+ * 否则第二次重挂会立刻把刚建立的会话关掉（客户端表现为抖动重连）。
+ */
+interface DownlinkSessionState {
+    budget: number;
+    sent: number;
+    governor: ReturnType<typeof createByteGovernor> | null;
+}
+
+const downlinkSessionStates = new WeakMap<WebSocket, DownlinkSessionState>();
+
+function getDownlinkSessionState(webSocket: WebSocket, rate: number): DownlinkSessionState {
+    let state = downlinkSessionStates.get(webSocket);
+    if (!state) {
+        state = {
+            budget: sessionByteBudget(),
+            sent: 0,
+            governor: rate ? createByteGovernor(rate, downlinkBurstBytes(rate)) : null
+        };
+        downlinkSessionStates.set(webSocket, state);
+    }
+    return state;
+}
+
 // --- Rewritten remoteSocketToWS with BYOB reader + download batching ---
 // (aligned with cfnew 连接值279 L5256-5331)
 async function remoteSocketToWS(
@@ -1560,13 +1704,13 @@ async function remoteSocketToWS(
             : new ArrayBuffer(DOWNLOAD_BLOCK_SIZE);
     };
     const rotateBlock = (): void => { byobIndex = (byobIndex + 1) % 3; };
-    // 会话级下行字节预算（默认关闭，见 sessionByteBudget 注释）
-    const byteBudget = sessionByteBudget();
-    let sentBytes = 0;
-    let budgetExceeded = false;
-    // 下行速率上限（默认关闭，见 downlinkByteRate 注释）：平台没有发送侧背压，这是唯一流控点
+    // 会话级下行字节预算 / 速率上限（均可在 env 里关闭或调参）。
+    // B-13：三者都取会话级实例（见 getDownlinkSessionState），回退重挂时复用同一份。
     const downlinkRate = downlinkByteRate();
-    const governor = downlinkRate ? createByteGovernor(downlinkRate, downlinkBurstBytes(downlinkRate)) : null;
+    const session = getDownlinkSessionState(webSocket, downlinkRate);
+    const byteBudget = session.budget;
+    const governor = session.governor;
+    let budgetExceeded = false;
     // 1 秒粒度仪表：默认跟随面板 Log Level=debug；`WS_DOWNLINK_STATS=1` 可单独打开
     // （运维只想快照一行吞吐、不想为此改面板设置；测试也用它，避免依赖 KV 里的 settings）
     const statsOn = (globalThis as any).settings?.logLevel === 'debug'
@@ -1582,7 +1726,7 @@ async function remoteSocketToWS(
         if (elapsed < 1000) return;
         const secs = elapsed / 1000;
         log(`downlink ${(statBytes / secs / 1024).toFixed(0)}KiB/s frames=${statFrames}`
-            + ` maxBlock=${statMaxBlock}B total=${(sentBytes / 1048576).toFixed(1)}MiB`
+            + ` maxBlock=${statMaxBlock}B total=${(session.sent / 1048576).toFixed(1)}MiB`
             + (governor ? ` cap=${downlinkRate}B/s capWait=${governor.takeWaited()}ms/${elapsed}ms` : ' cap=off')
             + (byteBudget ? ` budget=${byteBudget}B` : ' budget=off'));
         statAt = now;
@@ -1631,15 +1775,16 @@ async function remoteSocketToWS(
                 vlHeader = null;
             }
 
-            // 会话字节预算：超限即主动收口（默认关闭）。放在发送之前，保证不越界。
-            sentBytes += chunk.byteLength;
-            if (byteBudget && sentBytes > byteBudget) {
+            // 会话字节预算：超限即主动收口。计数是**会话级**的（B-13），回退重挂不清零。
+            session.sent += chunk.byteLength;
+            if (byteBudget && session.sent > byteBudget) {
                 log(`session downlink budget ${(byteBudget / 1048576).toFixed(0)}MiB reached, closing (client reconnects)`);
                 budgetExceeded = true;
                 break;
             }
 
-            // 速率上限：令牌不足就让出事件循环（默认关闭 → 零开销）
+            // 速率上限：令牌不足就让出事件循环。**默认开启**（见 downlinkByteRate），
+            // 只有 env `WS_DOWNLINK_BPS=0` 时 governor 才为 null —— 那时这里是一条空判，零开销
             if (governor) await governor.take(chunk.byteLength);
 
             if (statsOn) {
@@ -1665,6 +1810,12 @@ async function remoteSocketToWS(
 
         batcher.flush();
     } catch (error) {
+        // B-23：这里原先是 `catch (error)` 但 error 从未被使用 —— 下行泵把**所有**上游读错误
+        // 静默压成「关 WS」，客户端看到 1005 正常关闭、日志里一片空白。
+        // 「播放中途断流」这类问题因此完全无法从服务端定位。已有流量之后才报的错才值得记一行。
+        if (hasIncomingData && !budgetExceeded) {
+            log(`downlink error after ${(session.sent / 1024).toFixed(0)}KiB: ${safeErrorMessage(error)}`);
+        }
         // Don't close WS if retry is about to re-mount a new socket
         if (!hasRetryFired) safeCloseWebSocket(webSocket);
     } finally {
@@ -1840,7 +1991,19 @@ export function makeReadableWebSocketStream(
                 // 上行有真实流量 → 刷新会话空闲计时（空闲超时按"双向"判，纯上传的连接不该被误杀）
                 touchWsSession(webSocketServer);
                 // WebSocket binaryType='arraybuffer' ensures event.data is always ArrayBuffer
-                controller.enqueue(event.data);
+                //
+                // B-21：这句注释只对**二进制帧**成立。text 帧仍以 string 投递，而
+                // ByteLengthQueuingStrategy 对 string 取 `byteLength → undefined` → enqueue 抛 RangeError
+                // （异常在事件监听器里，属未捕获，表现为「莫名管道异常」）。
+                // B-22：close/error 之后迟到的 message 同样会对已关闭/已 error 的 controller 抛 TypeError。
+                // 两处都在这里收口：过滤 text 帧，enqueue 失败即丢帧（不需要为此关掉整条会话）。
+                if (typeof event.data === 'string') {
+                    log('ignoring text frame on uplink');
+                    return;
+                }
+                try {
+                    controller.enqueue(event.data);
+                } catch { /* 流已关闭/已 error：丢弃该帧 */ }
             });
 
             webSocketServer.addEventListener("close", () => {

@@ -1,0 +1,45 @@
+/**
+ * R-10：四个页面（panel / login / secrets / proxy-ip）与 error 页共用的「伪装背景」样式。
+ *
+ * 为什么单独成文件：这段 30 行此前被**逐字复制 5 份**（4 个 style.css + error/index.html 的内联
+ * style），改一处忘四处的后果是页面间遮罩浓度/层级不一致 —— 那本身就是「某页被替换了」的指纹。
+ * 现在只此一份，由 scripts/build.js 在构建期注入：
+ *   · 目录页（dir !== 'error'）：拼在各自 style.css **之前**（各页可覆盖，故放前）；
+ *   · error 页：走构建期占位符注入（它没有独立的 style.css/script.js）。
+ *
+ * ⚠ 本文件里**不要**写出那个占位符字面量：它会被注入进页面，而 build.js 的
+ * 「占位符不得残留」断言按子串匹配，写进注释就会让构建失败（与 smoke.mjs 那句注释里
+ * 带 `*` + `/` 把块注释提前闭合是同一类坑）。
+ *
+ * 依赖的 CSS 变量（--color-bg-main）由各页 :root 定义；error 页自带一份。
+ */
+body.has-fallback {
+    background: transparent;
+}
+
+body.has-fallback > * {
+    position: relative;
+    z-index: 2;
+}
+
+body.has-fallback::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+    background: var(--color-bg-main);
+    opacity: 0.35;
+}
+
+#fallback-bg {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    width: 100vw;
+    height: 100vh;
+    border: 0;
+    pointer-events: none;
+    object-fit: fill;
+    background: var(--color-bg-main);
+}

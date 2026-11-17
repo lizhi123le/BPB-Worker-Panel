@@ -102,8 +102,11 @@ export function probePrivacyPadding(chunk: ArrayBuffer, state: PrivacyProbe): Ar
 //   2. 101 响应回写 UUID 派生头会把 UUID 的 12 个 hex 字符泄露给未认证调用方。
 
 // 从 UUID 派生隐蔽的头名/键名，与订阅侧 extra 约定一致。
-// 实现已下沉到 @utils（xray JSON / raw URI / XHTTP 入站共用同一份派生规则），此处保留再导出以兼容既有 import。
-export { getXPaddingIdentifier } from '@utils';
+// 实现已下沉到 @utils（xray JSON / raw URI / XHTTP 入站共用同一份派生规则）。
+// D-08：此处原有的 `export { getXPaddingIdentifier } from '@utils'` 再导出已删除 ——
+// 全仓（含 tools/ 测试）对 `@unified#getXPaddingIdentifier` 零引用，真正的消费方
+// （cores/xp.ts、clash/outbounds.ts）都直接从 @utils 导入。保留再导出等于给
+// 「派生规则只有一份」这条约定开了第二个入口。
 
 /**
  * 每 isolate 的活动 WS 连接上限。
@@ -114,15 +117,16 @@ export { getXPaddingIdentifier } from '@utils';
  * + 下行合批缓冲 1~2 × 24~40KiB（首次 flush 才分配第二块）
  * + 上行合批缓冲 1~2 × 32KiB
  * 典型 ≈ 136KiB，最坏 ≈ 336KiB（三条都吃满）；128 条即 17MiB ~ 43MiB，256 条即 34MiB ~ 86MiB。
- * 上行积压另有 isolate 级预算（WS_UPLINK_ISOLATE_MB = 16，按建连时的活动连接数折算），
+ * 上行积压另有 isolate 级预算（见下方 WS_UPLINK_ISOLATE_MB_DEFAULT，按建连时的活动连接数折算），
  * 因此"每连接有界、整体无界"这个漏洞已经堵住（注意：折算是**建连时一次性的**，
  * 不是实时总账，见 uplinkIsolateCap 的说明）；剩下的是缓冲本身。
  *
- * 这个值**可用 env `WS_MAX_CONNECTIONS` 调整**（默认 128，钳制到 1~1024）：
- * 128 是"留足余量"的取值（伪装缓存也吃满 12MB 时仍安全）；自用可以再降到 32~64；
- * 确实需要更多并发可以调高，但要同步观察 Memory 指标（Workers 的 exceededMemory 不会提前告警）。
+ * 这个值**可用 env `WS_MAX_CONNECTIONS` 调整**（默认 256，钳制到 1~1024）：
+ * 256 是按业主指定放开的取值 —— 它已把「每连接缓冲最坏 336KiB」推到 86MiB，
+ * 只剩约 42MiB 给伪装缓存（12MB）与其余运行时开销，**余量比 128 时明显更薄**；
+ * 若只自用，降到 32~64 更稳。确实需要更多并发时请同步观察 Memory 指标
+ * （Workers 的 exceededMemory 不会提前告警）。
  * 高于默认值会打一条 warn（**只在 env 变化时打一次**），因为上限写错一个零就是把 isolate 打死。
- * 反过来，正常自用场景几条到几十条足够，128 已经是相当宽松的余量。
  *
  * 超限时直接 429，不 accept 服务端 socket、不分配任何缓冲 —— 成本几乎为零。
  * 批量开 WS 是常见探测手法，上限把它的内存占用钉死（对齐 XHTTP 的 XP_MAX_CONNECTIONS 思路）。
@@ -132,7 +136,7 @@ export { getXPaddingIdentifier } from '@utils';
  * 注意口径：计数是**每 isolate** 的（同一 isolate 内共享，不同 isolate 各自记账），
  * 所以它不是全局并发上限；env 设 `0` 或非法值都回退默认值（永不表示"禁止连接"）。
  */
-const WS_MAX_CONNECTIONS_DEFAULT = 128;
+const WS_MAX_CONNECTIONS_DEFAULT = 256;
 /** 「连接上限只在 env 变化时打一条」的闸门（与伪装熔断预算、会话看门狗共用同一实现） */
 const connLimitGate = createSignatureGate();
 
@@ -151,15 +155,17 @@ function wsMaxConnections(): number {
  * 测试也用它把阈值压到可触发的小值。非法值回退默认，绝不放行成无上限。
  *
  * ⚠️ 已知近似（不是实时总账）：折算发生在**建连那一刻**，之后每个连接按自己的静态上限运行。
- * 因此「16MiB 总预算」只在建连瞬间成立 —— 早建的连接保留较大额度，且每连接下限 256KiB
- * 会让并发超过 64 条后总额度超出 16MiB（上限仍被 WS_MAX_CONNECTIONS × 256KiB 钉死）。
+ * 因此「N MiB 总预算」只在建连瞬间成立 —— 早建的连接保留较大额度，且每连接下限 256KiB
+ * 会让并发超过 `N × 4` 条后总额度超出预算。默认 32MiB + 默认 256 条连接时，
+ * **下限 256KiB 全程生效**（32MiB/256 = 128KiB < 下限），实际可达 256 × 256KiB = 64MiB，
+ * 即「32MiB 预算」此时并不成立，真正的天花板是 `WS_MAX_CONNECTIONS × 256KiB`。
  * 要真正做成 isolate 总账，得改成按帧共享计数器计费/退还。
  */
-const WS_UPLINK_ISOLATE_MB = 16;
+const WS_UPLINK_ISOLATE_MB_DEFAULT = 32;
 const WS_UPLINK_PER_CONN_FLOOR = 256 * 1024;
 
 function uplinkIsolateCap(): number {
-    const raw = envNumber('WS_UPLINK_ISOLATE_MB', WS_UPLINK_ISOLATE_MB);
+    const raw = envNumber('WS_UPLINK_ISOLATE_MB', WS_UPLINK_ISOLATE_MB_DEFAULT);
     return Math.max(WS_UPLINK_PER_CONN_FLOOR, Math.floor(raw * 1024 * 1024));
 }
 let activeWsConnections = 0;
@@ -178,19 +184,26 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
     }
     activeWsConnections++;
     // 名额随连接生命周期释放；release 幂等（清理钩子只跑一次，且计数不会降到负）
-    registerWsCleanup(webSocket, () => {
+    let slotReleased = false;
+    const releaseSlot = () => {
+        if (slotReleased) return;
+        slotReleased = true;
         if (activeWsConnections > 0) activeWsConnections--;
-    });
-
-    webSocket.accept();
-    webSocket.binaryType = 'arraybuffer';
+    };
+    registerWsCleanup(webSocket, releaseSlot);
 
     let address = "";
     let portWithRandomLog = "";
     let protocolType: 'vless' | 'trojan' | null = null;
 
     const log = (info: string, event?: string) => {
-        console.log(`[${address}:${portWithRandomLog}] ${info}`, event || "");
+        // S-04：默认（logLevel=warning）**不**打 `[目标主机:端口]` 前缀 —— 那是用户的浏览历史，
+        // 而这条 log 被 handleTCPOutBound / 反代拨号等路径复用，等于把「谁在什么时间访问了哪个域名」
+        // 逐连接写进 Workers Logs。只有在面板 Log Level = debug 时才带前缀（排障正需要它）。
+        const prefix = globalThis.settings?.logLevel === 'debug'
+            ? `[${address}:${portWithRandomLog}] `
+            : '[WS] ';
+        console.log(`${prefix}${info}`, event || "");
     };
 
     // 诊断日志：仅当面板「Log Level」设为 debug 时才输出。
@@ -200,17 +213,31 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
         if (globalThis.settings?.logLevel === 'debug') log(info);
     };
 
-    // 空闲超时 / 最长存活看门狗：比平台的 ~20 分钟 loadShed 窗口更早、更可控地换连接
-    //（现场依据见 common.ts 的 startWsSessionGuard 注释与 §10）
-    startWsSessionGuard(webSocket, log);
+    // B-15：额度释放只挂在 WS 清理钩子上，而钩子要到 makeReadableWebSocketStream 里才注册
+    // （message/close/error/cancel 四条路径）。`accept()` 到那之前若抛异常（101 永不交付），
+    // 计数就只增不减 —— 本 isolate 内会一直少一条额度，累计到上限后全部 429 且不会自愈。
+    // 触发窗口很窄（accept/binaryType/看门狗/流构造几乎不抛），但后果不可逆，所以用 try 兜住。
+    let readableWebSocketStream: ReturnType<typeof makeReadableWebSocketStream>;
 
-    const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
-    // 上行积压上限按 isolate 预算折算：N 条连接各 8MiB 会让"每连接有界、整体无界"
-    const perConnUplinkCap = Math.max(
-        WS_UPLINK_PER_CONN_FLOOR,
-        Math.floor(uplinkIsolateCap() / Math.max(1, activeWsConnections))
-    );
-    const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log, perConnUplinkCap);
+    try {
+        webSocket.accept();
+        webSocket.binaryType = 'arraybuffer';
+
+        // 空闲超时 / 最长存活看门狗：比平台的 ~20 分钟 loadShed 窗口更早、更可控地换连接
+        //（现场依据见 common.ts 的 startWsSessionGuard 注释与 §10）
+        startWsSessionGuard(webSocket, log);
+
+        const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
+        // 上行积压上限按 isolate 预算折算：N 条连接各 8MiB 会让"每连接有界、整体无界"
+        const perConnUplinkCap = Math.max(
+            WS_UPLINK_PER_CONN_FLOOR,
+            Math.floor(uplinkIsolateCap() / Math.max(1, activeWsConnections))
+        );
+        readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log, perConnUplinkCap);
+    } catch (error) {
+        releaseSlot();
+        throw error;
+    }
 
     // 后端 socket 的纳管容器：**赋值即注册关闭钩子**。
     //
@@ -356,7 +383,12 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
 
             if (hasError) {
                 onInvalid?.(`vless header: ${String(message)}`);
-                throw new Error(message);
+                // 只有「无人负责收口」时才抛（协议已锁定那条路径）—— 由上行泵的取消/中止路径关掉。
+                // 探测路径已把 onInvalid 传进来（close 1008 + 一行 invalid first packet），此时再抛
+                // 会让同一次畸形首包在上行泵里**再**记一行 "pipeTo error: <原因>"：
+                // 运维看到的是「管道异常」，与「首包畸形」这个真实原因对不上（B-18 的收口本意就是去掉这条噪音）。
+                if (!onInvalid) throw new Error(message);
+                return;
             }
 
             const VLResponseHeader = new Uint8Array([VLVersion[0], 0]);
@@ -408,7 +440,9 @@ export async function UnifiedWSHandler(request: Request): Promise<Response> {
 
         if (hasError) {
             onInvalid?.(`trojan header: ${String(message)}`);
-            throw new Error(message);
+            // 同 VLESS 侧：带了 onInvalid 就已干净收口，不再往上报成「管道异常」
+            if (!onInvalid) throw new Error(message);
+            return;
         }
 
         if (isUDP) {
@@ -700,14 +734,14 @@ export function parseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
 
     const optLength = new Uint8Array(VLBuffer.slice(17, 18))[0];
     const command = new Uint8Array(VLBuffer.slice(18 + optLength, 18 + optLength + 1))[0];
-    let isUDP = false;
 
-    if (command === 1) {
-    } else if (command === 2) {
-        isUDP = true;
-    } else {
+    // D-08：原来写成 `if (command === 1) {} else if (command === 2) {…} else {…}`，那个空分支
+    // 极易被读成「TCP 的处理被删掉了」。改成前置否定判断，判据与拒绝文案逐字不变
+    // （与 tryParseVlHeader 的 `command !== 1 && command !== 2` 现在完全同形）。
+    if (command !== 1 && command !== 2) {
         return { hasError: true, message: `command ${command} is not supported, command 01-tcp,02-udp,03-mux` };
     }
+    const isUDP = command === 2;
 
     const portIndex = 18 + optLength + 1;
     // F-17：optLength 可达 255，读端口前必须校验边界，否则 DataView.getUint16 抛 RangeError
@@ -725,6 +759,19 @@ export function parseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
     let addressValueIndex = addressIndex + 1;
     let addressValue = "";
 
+    // B-18：地址段边界校验。端口处已有校验（见上方 F-17），地址段此前**一条都没有**：
+    //  · ATYP=3（16 字节 IPv6）截断时 `DataView.getUint16` 抛 RangeError（未捕获 → close(1006)
+    //    加一行 "pipeTo error"，而不是既有的 1008 收口）；
+    //  · ATYP=1/2 截断则把残字节拼成 "9.9" 这类伪地址，直接交给拨号。
+    // 与 parseTrHeader 的逐 ATYP 校验对齐。前提：能走到这里说明 UUID 已通过（见 :695-699）。
+    if (addressType < 1 || addressType > 3) {
+        return { hasError: true, message: `invalid addressType is ${addressType}` };
+    }
+    const minAddressBytes = addressType === 1 ? 4 : addressType === 2 ? 1 : 16;
+    if (VLBuffer.byteLength < addressValueIndex + minAddressBytes) {
+        return { hasError: true, message: "invalid data" };
+    }
+
     switch (addressType) {
         case 1:
             addressLength = 4;
@@ -734,6 +781,10 @@ export function parseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
         case 2:
             addressLength = new Uint8Array(VLBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
             addressValueIndex += 1;
+            // 长度前缀之后还得真的有这么多字节，否则 slice 会静默截短
+            if (VLBuffer.byteLength < addressValueIndex + addressLength) {
+                return { hasError: true, message: "invalid data" };
+            }
             addressValue = new TextDecoder().decode(VLBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
             break;
 
@@ -747,8 +798,9 @@ export function parseVlHeader(VLBuffer: ArrayBuffer, userID: string) {
             addressValue = ipv6.join(":");
             break;
         }
-        default:
-            return { hasError: true, message: `invalid addressType is ${addressType}` };
+        // 这里刻意没有 default：ATYP 越界已在上方（B-18 的前置范围检查）连同文案一起拒绝，
+        // 再写一条 `default: return invalid addressType` 是一个**不可达**分支，
+        // 只会让读者以为「范围检查之外还有一条兜底」。判据只有一处，改动时也只改那一处。
     }
 
     if (!addressValue) {
@@ -799,6 +851,8 @@ function tryParseVlHeader(VLBuffer: ArrayBuffer, userID: string): ReturnType<typ
     return parseVlHeader(VLBuffer, userID);
 }
 
+// D-08：`offset` 形参是死参数（全仓唯一调用点 parseVlHeader 恒传 0）。删掉它要连带改下面
+// 16 处 `arr[offset + n]`，改动面与收益不成比例，故**保留并在此注明**，不要再当它是活参数。
 function stringify(arr: Uint8Array, offset = 0) {
     const byteToHex: string[] = [];
     for (let i = 0; i < 256; ++i) {
@@ -1155,6 +1209,29 @@ function getDNSCache(dnsQueryPacket: Uint8Array): Uint8Array | null {
 }
 
 /**
+ * 建立 DNS-over-TCP 上游（8.8.4.4:53），含 5s 建连超时。
+ *
+ * B-16：抽成函数是为了让「socket 被上游关掉后重建」复用同一段建连+超时+失败清理逻辑 ——
+ * 否则 VLESS/Trojan × 首次/重建 = 四份逐字重复的建连代码。失败时先就地关闭再抛：
+ * 此时这条 socket 还没登记清理钩子（WS 也没关），不关就是半开残留（F-11）。
+ */
+async function connectDnsUpstream(label: 'VLESS' | 'Trojan', log: Function, fetcher?: any): Promise<Socket> {
+    const socket = connectSocket({ hostname: '8.8.4.4', port: 53 }, fetcher);
+    try {
+        await Promise.race([
+            socket.opened,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('DNS connect timeout')), 5000))
+        ]);
+    } catch (connectError) {
+        // F-11：建连超时/失败时这条 socket 还没登记清理钩子（WS 也没关），必须就地关闭，否则残留半开连接
+        safeCloseTcpSocket(socket);
+        throw connectError;
+    }
+    log(`${label} DNS TCP connected to 8.8.4.4:53`);
+    return socket;
+}
+
+/**
  * DNS-over-TCP 响应泵（VLESS / Trojan 共用）：按 2 字节大端长度前缀拆包 → 交 onMessage 构造响应帧 →
  * 写全局 DNS 缓存 → 裁剪残余缓冲。协议差异（帧格式、是否首次带 VL 头）全部由 onMessage 承担。
  *
@@ -1164,12 +1241,14 @@ function getDNSCache(dnsQueryPacket: Uint8Array): Uint8Array | null {
  *  - onMessage 在写缓存**之前**调用 —— 帧发送顺序与缓存写入顺序维持原样；
  *  - reader 由调用方取得并传入（两侧获取时机不同，保持在原处）；
  *  - 全程 fire-and-forget（调用方不 await），异常只记日志，finally 里 releaseLock。
+ *  - `onClosed` 是 B-16 的挂点：上游 `done` 时回调一次，调用方据此打「socket 已死」标记。
  */
 async function pumpTcpDnsMessages(
     reader: ReadableStreamDefaultReader<Uint8Array>,
     label: 'VLESS' | 'Trojan',
     log: Function,
-    onMessage: (dnsPayload: Uint8Array) => void
+    onMessage: (dnsPayload: Uint8Array) => void,
+    onClosed?: () => void
 ): Promise<void> {
     let dnsBuffer = new Uint8Array(0);
     const DNS_MAX_BUF = 65536;
@@ -1177,11 +1256,21 @@ async function pumpTcpDnsMessages(
     try {
         while (true) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done) {
+                // B-16：上游 idle 超时/重置会把这条 DNS TCP 连接关掉。改动前这里静默 break，
+                // 于是下一次 write 直接抛「不可写」并被上行泵当成隧道级失败 → 整条 WS 被杀。
+                // 这行日志是「为什么下一个查询会重新建连」的唯一线索。
+                log(`${label} DNS upstream closed by peer`);
+                onClosed?.();
+                break;
+            }
 
             const chunk = value as Uint8Array;
             if (dnsBuffer.length + chunk.length > DNS_MAX_BUF) {
                 log(`${label} DNS buffer overflow`);
+                // B-16：泵就此退出、socket 却还活着 —— 后续查询会被静默黑洞（写成功、永无响应）。
+                // 标死它，让下一次写触发重建，而不是留一条「能写不能读」的上游。
+                onClosed?.();
                 break;
             }
 
@@ -1218,11 +1307,86 @@ async function pumpTcpDnsMessages(
             }
         }
     } catch (e) {
+        // B-16：读错误（RST / 半开）与干净 EOF 一样让上游 socket 失效。原实现只记一行日志 →
+        // 下一次 write 会抛进上行泵，被当成**隧道级**错误把整条 WS 杀掉 —— 正是本条要消灭的现象，
+        // 而 RST 并不比空闲 EOF 少见。标记失效后下一次查询会自动重建（见 openDnsUpstream）。
         log(`${label} DNS response error: ` + e);
+        onClosed?.();
     } finally {
         // F-11：teardown 由外部 close 驱动，此时 reader 已无未决读；仍包 try/catch 以防重复释放
         try { reader.releaseLock(); } catch { /* already released */ }
     }
+}
+
+/**
+ * R-09：UDP-DNS 上游（TCP 8.8.4.4:53）的**唯一**一份生命周期管理。
+ *
+ * VLESS 与 Trojan 两个分支此前各写一份「holder + dnsSocketDead + 清理钩子 + openDnsUpstream 外壳」，
+ * 12 行逐字相同、只有 label 与响应帧格式不同 —— 于是 B-16 那套「上游关闭 → 置失效标记 →
+ * 写入口重建」必须在两处**同时**正确，任何一侧漂移都会退化成「一次空闲期上游关闭打死整条 WS」。
+ * 现在两侧只提供帧工厂（onFrame），其余都在这里：
+ *  - 清理钩子**只登记一次**：registerWsCleanup 按函数引用去重，若每次重建换新闭包，
+ *    钩子表会随重连次数增长；钩子里取的是 holder 的**当前**值，所以重建后只关最新那条；
+ *  - 重建失败直接向上抛 —— 由调用方走上行泵的隧道级收口，与「写失败」同一条路径
+ *    （只有一次重建失败就整条 WS 收口，不在这里做重试）；
+ *  - B-16 的 onClosed 语义（含 catch 与 overflow 两处）原样透传给 pumpTcpDnsMessages。
+ */
+function createDnsUpstream(
+    webSocket: WebSocket,
+    label: 'VLESS' | 'Trojan',
+    log: Function,
+    onFrame: (dnsPayload: Uint8Array) => void,
+    fetcher?: any
+) {
+    const holder: { socket: Socket | null; writer: WritableStreamDefaultWriter<Uint8Array> | null } = {
+        socket: null,
+        writer: null
+    };
+    let dead = false;
+
+    /** 建连 + writer + 响应泵（首次与重建共用同一段） */
+    const open = async () => {
+        const socket = await connectDnsUpstream(label, log, fetcher);
+        const writer = socket.writable.getWriter();
+        holder.socket = socket;
+        holder.writer = writer;
+        dead = false;
+        pumpTcpDnsMessages(socket.readable.getReader(), label, log, onFrame, () => {
+            // 上游已关：置「已死」标记 + 就地关掉这条半死 socket。**不在这里重连** ——
+            // 重建要换 socket + writer + 响应泵，放在 write() 入口才有调用方在等结果，
+            // 失败也才能按上行泵的既有路径收口。
+            dead = true;
+            if (holder.socket === socket) {
+                holder.socket = null;
+                holder.writer = null;
+            }
+            safeCloseTcpSocket(socket);
+        });
+    };
+
+    // F-11：UDP DNS 复用的 TCP socket 不在 remoteSocketWrapper 纳管范围内（WS 关闭时无人关它），
+    // 在此登记到 WS teardown 钩子：关闭后读循环因 done/error 退出并释放 reader 锁。
+    registerWsCleanup(webSocket, () => {
+        const writer = holder.writer;
+        const socket = holder.socket;
+        holder.writer = null;
+        holder.socket = null;
+        try { writer?.releaseLock(); } catch { /* 有未决写时释放会抛，忽略（socket 即将关闭） */ }
+        safeCloseTcpSocket(socket);
+    });
+
+    return {
+        open,
+        /**
+         * 写一帧 TCP-DNS 报文（调用方已带上 2 字节长度前缀）。
+         * B-16：上游已死就先重建（socket + writer + 响应泵）；重建失败在这里向上抛 ——
+         * 与改动前的「写失败」同一条收口路径，只是不再因为一次空闲期的上游关闭而误杀隧道。
+         */
+        async write(frame: Uint8Array) {
+            if (dead || !holder.writer) await open();
+            await holder.writer!.write(frame);
+        }
+    };
 }
 
 // 导出给 XHTTP 入站复用：UDP(DNS) 帧的拆包/缓存/回填只有这一份实现（含 F-12 兼容形态与全局 DNS 缓存），
@@ -1232,31 +1396,10 @@ export async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: 
         // VLESS UDP DNS: TCP socket to 8.8.4.4:53 with caching (cfnew style)
         let isVLHeaderSent = false;
 
-        const socket = connectSocket({ hostname: '8.8.4.4', port: 53 }, fetcher);
-        try {
-            await Promise.race([
-                socket.opened,
-                new Promise((_, reject) => setTimeout(() => reject(new Error('DNS connect timeout')), 5000))
-            ]);
-        } catch (connectError) {
-            // F-11：建连超时/失败时这条 socket 还没登记清理钩子（WS 也没关），必须就地关闭，否则残留半开连接
-            safeCloseTcpSocket(socket);
-            throw connectError;
-        }
-        log('VLESS DNS TCP connected to 8.8.4.4:53');
-
-        const writer = socket.writable.getWriter();
-        // F-11：UDP DNS 复用的 TCP socket 不在 remoteSocketWrapper 纳管范围内（WS 关闭时无人关它），
-        // 在此登记到 WS teardown 钩子：关闭后读循环因 done/error 退出并释放 reader 锁。
-        registerWsCleanup(webSocket, () => {
-            try { writer.releaseLock(); } catch { /* 有未决写时释放会抛，忽略（socket 即将关闭） */ }
-            safeCloseTcpSocket(socket);
-        });
-        
-        // Response handling with caching
-        const responseReader = socket.readable.getReader();
-
-        pumpTcpDnsMessages(responseReader, 'VLESS', log, (dnsPayload) => {
+        // R-09：建连/重建/清理钩子统一由 createDnsUpstream 承担，这里只给「响应帧怎么拼」。
+        // B-16：上游把这条 DNS TCP socket 关掉后必须重建 —— 失效的只是 DNS 上游，而「写失败」
+        // 在上行泵里是隧道级错误（整条 WS 被 teardown）。
+        const dnsUpstream = createDnsUpstream(webSocket, 'VLESS', log, (dnsPayload) => {
             // Build VLESS UDP frame: VLResponseHeader (first only) + [2B length BE] + raw DNS payload
             const lenHi = (dnsPayload.length >> 8) & 0xff;
             const lenLo = dnsPayload.length & 0xff;
@@ -1280,13 +1423,17 @@ export async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: 
                 }
                 isVLHeaderSent = true;
             }
-        });
+        }, fetcher);
+
+        await dnsUpstream.open();
 
         return {
             async write(chunk: ArrayBuffer) {
                 const data = new Uint8Array(chunk);
                 // data = [2B length BE][DNS message] (VLESS UDP payload). Strip the 2-byte
                 // length prefix so parseDNSQueryInfo parses the DNS header at offset 0.
+                // B-17：调用方保证一次 write 正好是一整帧（不以 chunk 边界为准），见 xp/handler.ts
+                // 的 pumpUdpUplink 与 WS 上行泵。
                 const dnsPacket = data.length >= 2 ? data.subarray(2) : data;
                 // Cache lookup: parse DNS query to get domain|qtype|qclass
                 const cachedResp = getDNSCache(dnsPacket);
@@ -1317,56 +1464,34 @@ export async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: 
                 }
                 // Cache miss: forward to DNS socket. data already carries the 2-byte
                 // TCP DNS length prefix (VLESS UDP payload), so write it directly (align cfnew L5506).
-                await writer.write(data);
+                // B-16：上游已死由 dnsUpstream.write 内部先重建（见 createDnsUpstream）。
+                await dnsUpstream.write(data);
             },
         };
     } else {
         // Trojan UDP DNS: Parse Trojan UDP packets, forward to 8.8.4.4:53 via TCP, reconstruct responses
         let currentRequestHeader: Uint8Array | null = null; // Stores addrType + addr + port from request
 
-        function handleTrojanUDPResponse(socket: Socket) {
-            pumpTcpDnsMessages(socket.readable.getReader(), 'Trojan', log, (dnsPayload) => {
-                // Build Trojan UDP response frame:
-                // [addrType + addr + port] + [2B length BE] + [0x0d, 0x0a] + [payload]
-                if (currentRequestHeader) {
-                    const frame = new Uint8Array(
-                        currentRequestHeader.length + 4 + dnsPayload.length
-                    );
-                    frame.set(currentRequestHeader, 0);
-                    frame[currentRequestHeader.length] = (dnsPayload.length >> 8) & 0xff;
-                    frame[currentRequestHeader.length + 1] = dnsPayload.length & 0xff;
-                    frame[currentRequestHeader.length + 2] = 0x0d;
-                    frame[currentRequestHeader.length + 3] = 0x0a;
-                    frame.set(dnsPayload, currentRequestHeader.length + 4);
-                    if (webSocket.readyState === WS_READY_STATE_OPEN) {
-                        webSocket.send(frame.buffer);
-                    }
+        // R-09：同 VLESS —— 建连/重建/清理钩子共用 createDnsUpstream，这里只给响应帧格式。
+        // 帧形态：[addrType + addr + port] + [2B length BE] + [0x0d, 0x0a] + [payload]
+        const dnsUpstream = createDnsUpstream(webSocket, 'Trojan', log, (dnsPayload) => {
+            if (currentRequestHeader) {
+                const frame = new Uint8Array(
+                    currentRequestHeader.length + 4 + dnsPayload.length
+                );
+                frame.set(currentRequestHeader, 0);
+                frame[currentRequestHeader.length] = (dnsPayload.length >> 8) & 0xff;
+                frame[currentRequestHeader.length + 1] = dnsPayload.length & 0xff;
+                frame[currentRequestHeader.length + 2] = 0x0d;
+                frame[currentRequestHeader.length + 3] = 0x0a;
+                frame.set(dnsPayload, currentRequestHeader.length + 4);
+                if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                    webSocket.send(frame.buffer);
                 }
-            });
-        }
+            }
+        }, fetcher);
 
-        // Connect to DNS server via TCP
-        const socket = connectSocket({ hostname: '8.8.4.4', port: 53 }, fetcher);
-        try {
-            await Promise.race([
-                socket.opened,
-                new Promise((_, reject) => setTimeout(() => reject(new Error('DNS connect timeout')), 5000))
-            ]);
-        } catch (connectError) {
-            // F-11：建连超时/失败时这条 socket 还没登记清理钩子（WS 也没关），必须就地关闭，否则残留半开连接
-            safeCloseTcpSocket(socket);
-            throw connectError;
-        }
-        log('Trojan DNS TCP connected to 8.8.4.4:53');
-        handleTrojanUDPResponse(socket);
-
-        const writer = socket.writable.getWriter();
-        // F-11：UDP DNS 复用的 TCP socket 不在 remoteSocketWrapper 纳管范围内（WS 关闭时无人关它），
-        // 在此登记到 WS teardown 钩子：关闭后读循环因 done/error 退出并释放 reader 锁。
-        registerWsCleanup(webSocket, () => {
-            try { writer.releaseLock(); } catch { /* 有未决写时释放会抛，忽略（socket 即将关闭） */ }
-            safeCloseTcpSocket(socket);
-        });
+        await dnsUpstream.open();
 
         // F-12：请求头已给出目标地址（ATYP+ADDR+PORT），首个 UDP 包可能省略地址头，用它预置响应帧头；
         // 否则响应帧无从构建（原实现 currentRequestHeader 只在收到带地址头的包后才置位）
@@ -1444,7 +1569,8 @@ export async function handleUDPOutBound(webSocket: WebSocket, VLResponseHeader: 
                 prefixed[0] = (dnsQuery.length >> 8) & 0xff;
                 prefixed[1] = dnsQuery.length & 0xff;
                 prefixed.set(dnsQuery, 2);
-                await writer.write(prefixed);
+                // B-16：上游已死由 dnsUpstream.write 内部先重建（见 createDnsUpstream）
+                await dnsUpstream.write(prefixed);
             },
         };
     }

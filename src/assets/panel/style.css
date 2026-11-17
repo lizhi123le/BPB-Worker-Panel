@@ -59,37 +59,6 @@ body {
 }
 
 /* 伪装背景 iframe 垫底：整页铺满，内容浮于其上 */
-body.has-fallback {
-    background: transparent;
-}
-
-body.has-fallback > * {
-    position: relative;
-    z-index: 2;
-}
-
-body.has-fallback::before {
-    content: "";
-    position: fixed;
-    inset: 0;
-    z-index: 1;
-    pointer-events: none;
-    background: var(--color-bg-main);
-    opacity: 0.35;
-}
-
-#fallback-bg {
-    position: fixed;
-    inset: 0;
-    z-index: 0;
-    width: 100vw;
-    height: 100vh;
-    border: 0;
-    pointer-events: none;
-    object-fit: fill;
-    background: var(--color-bg-main);
-}
-
 *,
 *::before,
 *::after {
@@ -569,10 +538,6 @@ summary h3 {
     margin: 1em 0;
 }
 
-hr {
-    margin: 1px 0;
-    border: 1px solid var(--color-border-accent);
-}
 
 .footer-container {
     overflow: visible;

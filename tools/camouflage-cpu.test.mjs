@@ -10,7 +10,9 @@
  *      但内容量在预算内时同样把 host 换掉（伪装效果不退化）；
  *   3. 体积超过改写预算 → 立即停止改写，余下原样流出，且**不缓存**这份半改写的产物；
  *   4. 根路径突发超过额度 → 熔断为内建页（0 次出站 fetch）；
- *   5. 缓存键剥离 utm_* 等噪声参数 → 两个只有噪声参数不同的请求命中同一份缓存。
+ *   5. 带 utm_* 等噪声参数的请求**既不读也不写缓存**（S-02：原先是「从键里剥掉」，
+ *      那会让 `?utm_source=<script>` 的响应以无 query 的键被缓存并发给所有访客）；
+ *      非噪声参数（如 `?page=2`）仍各自成为独立缓存条目。
  *
  * 为什么需要它：这四条都靠「体积」和「次数」这类边界触发，手测很难稳定复现；
  * 而回归的方向又极其具体 —— 退化成「全部缓冲」就是 CPU 超限复发，
@@ -58,13 +60,18 @@ globalThis.fetch = async (url) => {
     if (!u.includes(UPSTREAM_HOST)) {
         return new Response('{}', { headers: { 'content-type': 'application/json' } });
     }
+    // 桩正文必须**依赖 query**：否则「带噪声参数的响应到底有没有被写进缓存」在断言里不可区分
+    // （正文与 query 无关时，「污染了」与「没污染」看起来完全一样，那条断言就是空转 —— 正是
+    // 本次修掉的问题）。这里把 utm_source 回显进正文，于是「缓存里有没有它」成为可判定的判据。
+    const echoed = new URL(u).searchParams.get('utm_source');
+    const body = echoed ? `${plan.body}<!--echo:${echoed}-->` : plan.body;
     const headers = { 'content-type': 'text/html; charset=utf-8', ...plan.extra };
-    if (plan.mode === 'known') headers['content-length'] = String(Buffer.byteLength(plan.body));
+    if (plan.mode === 'known') headers['content-length'] = String(Buffer.byteLength(body));
     // 分块吐字，确保 TransformStream 会看到多个 chunk（更接近真实的 chunked 上游）
     const stream = new ReadableStream({
         start(controller) {
             const enc = new TextEncoder();
-            const bytes = enc.encode(plan.body);
+            const bytes = enc.encode(body);
             const step = 4096;
             for (let i = 0; i < bytes.length; i += step) {
                 controller.enqueue(bytes.subarray(i, i + step));
@@ -166,12 +173,26 @@ text = await resp.text();
 check('缓存命中：第二次请求 0 次出站 fetch', fetchCount === before, `before=${before} now=${fetchCount}`);
 check('缓存命中：返回的仍是改写后的内容', text.includes('panel.example.com'));
 
-// ---------- 3. 噪声 query 归一化：只有 utm_* 不同 → 命中同一份缓存 ----------
+// ---------- 3. 噪声 query：S-02 —— 带噪声参数（utm_*）的请求**完全绕过缓存** ----------
+// 安全背景（有意改动，非回归）：原实现只是把 utm_* 从缓存键里剔掉，于是
+// `GET /?utm_source=<script>…` 的响应会以「无 query」的键被缓存 5 分钟并发给之后所有访客；
+// 上游若把该参数回显进 HTML，就构成面板**同源**上的任意脚本（代理响应没有 CSP）。
+// 现在改为「既不读也不写缓存」：下面的三条断言分别钉住「不读」「不写」「不污染」。
 const beforeUtm = fetchCount;
 resp = await get('/?utm_source=newsletter&utm_medium=email');
 text = await resp.text();
-check('噪声 query：utm_* 不参与缓存键，未额外出站', fetchCount === beforeUtm, `before=${beforeUtm} now=${fetchCount}`);
-check('噪声 query：仍返回改写后的缓存内容', text.includes('panel.example.com'));
+check('噪声 query：绕过缓存命中（本次额外出站 1 次）', fetchCount === beforeUtm + 1, `before=${beforeUtm} now=${fetchCount}`);
+check('噪声 query：仍返回改写后的内容', text.includes('panel.example.com'));
+// 先证明桩确实是 query 敏感的（否则下面的「未污染」断言无法成立，等于空转）
+check('噪声 query：桩正文确实回显了 utm_source（下面两条断言的前提）', text.includes('echo:newsletter'), text.slice(-80));
+
+// 噪声请求不得**污染**缓存：随后再请求无 query 的首页仍应 0 次出站，且内容是正常的那份
+const beforeAfterUtm = fetchCount;
+const afterUtmText = await (await get('/')).text();
+check('噪声 query：不写缓存（随后无 query 的请求仍命中原条目）', fetchCount === beforeAfterUtm, `before=${beforeAfterUtm} now=${fetchCount}`);
+// 真正的判据：命中的缓存正文里**不含**噪声请求的回显 —— 写与不写在这里才可区分
+check('噪声 query：无 query 的缓存内容未被污染（不含噪声回显）',
+    !afterUtmText.includes('echo:'), afterUtmText.slice(-80));
 
 // 反过来验证「非噪声参数确实区分缓存」
 const beforeReal = fetchCount;
@@ -567,11 +588,23 @@ await (await get(`/about?k=ts1&t=${nowSec}`)).text();
 check('缓存键：基线请求确实出站（防止额度耗尽导致假通过）', fetchCount === beforeBaseline + 1,
     `before=${beforeBaseline} now=${fetchCount}`);
 
-// 同组参数、只差一个"当前时刻"的秒级时间戳 → 必须命中同一份缓存
+// B-26（有意改动，非回归）：**接口路径**上的秒级 t= 现在一律保留。
+// 原行为把它归一，于是「以当前时刻为内容键」的接口（行情/直播抽帧/实时榜单）会被折叠成
+// 同一个缓存键 —— 首个访客的快照被发给所有人并固化 5 分钟，正是注释里自己定义的缓存投毒。
+// 归一仍然保留在**静态资源路径**上（那里的 ?t=<秒> 是真·缓存破坏参数），见下一个断言。
 let beforeTs = fetchCount;
 await (await get(`/about?k=ts1&t=${nowSec + 1}`)).text();
-check('缓存键：当前时刻的 t= 被归一（0 次额外出站）', fetchCount === beforeTs,
+check('缓存键：接口路径上的秒级 t= 不被归一（防实时内容投毒）', fetchCount === beforeTs + 1,
     `before=${beforeTs} now=${fetchCount}`);
+
+// 静态资源路径：秒级 t= 仍归一（真·缓存破坏参数，归一既安全又保住命中率）
+const beforeTsStatic = fetchCount;
+await (await get(`/about/app.js?k=ts1&t=${nowSec}`)).text();
+const beforeTsStatic2 = fetchCount;
+await (await get(`/about/app.js?k=ts1&t=${nowSec + 1}`)).text();
+check('缓存键：静态资源路径上的秒级 t= 被归一', fetchCount === beforeTsStatic2
+    && beforeTsStatic2 === beforeTsStatic + 1,
+    `afterFirst=${beforeTsStatic2} afterSecond=${fetchCount}`);
 
 // 13 位毫秒时间戳只在**静态资源路径**上归一（对象 ID / 日志时间戳也常是 13 位，API 路径上归一会投毒）
 const beforeMs = fetchCount;

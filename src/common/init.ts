@@ -4,6 +4,8 @@ import { applyAddressEnvOverrides } from "@utils";
 // 出厂默认值移至零依赖的 ./defaults，使 @kv 也能以它作校验基准而不产生循环依赖。
 // 这里保留同名再导出，既有的 `import { DEFAULT_SETTINGS } from "@init"`（如 @handlers）继续可用。
 import { DEFAULT_SETTINGS } from "./defaults";
+// R-12：端口表的唯一来源（构建期 build.js 也读同一文件，注入面板页面）
+import PORTS from './ports.json';
 
 export { DEFAULT_SETTINGS };
 
@@ -52,6 +54,22 @@ function safeDecodePath(raw: string): string | null {
 }
 
 /**
+ * B-56：路径归一化（去尾斜杠，兜底根路径）。
+ *
+ * 此前这段归一化只在 `initHttp` 内部算出来喂给凭据校验，**没有回流路由**：
+ * `globalConfig.pathName` 保留的是原样路径，而 `handleLogin` / `handlePanel` /
+ * `handleSubscriptions` / `handleProxyIPs` 全部按 pathName **精确**匹配，
+ * 于是 `/login/`、`/panel/settings/`、`/sub/normal/<x>/` 一律落到 fallback 伪装页 ——
+ * 与 initHttp 注释里「`/secrets/` 与 `/secrets` 等价」的承诺相反
+ * （那个承诺只在 worker.ts 的首段级 switch 上侥幸成立，二级路由全部不成立）。
+ *
+ * 单一来源：init() 与 initHttp() 都用这一个函数，避免「校验看 A、路由看 B」再次分叉。
+ */
+function normalizePath(raw: string): string {
+    return raw.replace(/\/+$/, '') || '/';
+}
+
+/**
  * KV 校验的豁免路径：登录页首访「设置管理员口令」流程要在没绑 KV 的情况下也能打开，
  * 并把「还没绑 KV」用可读 JSON（POST /login/set-password）说清楚，而不是先被拦成通用错误页。
  * 只豁免 KV 这一条 —— UUID / TR_PASS 是部署必填凭据，仍然照旧强制。
@@ -78,12 +96,46 @@ export function assertRequiredCredentials(env: any, normalizedPath: string): voi
     if (!isKvBound(env)) throw new Error(`KV Dataset is not properly set! Please refer to the tutorials.`, { cause: "kv-not-set" });
 }
 
+/**
+ * R-12：TLS / 明文端口表的**服务端单一来源**（此前 initHttp 里内联一份字面量）。
+ *
+ * 为什么做不到「全仓唯一」：面板（src/assets/panel/script.js）是静态资源，读不到服务端常量；
+ * 把常量注入面板需要 scripts/build.js 做模板替换（本轮不可改），而面板能拿到的
+ * 只有 `settings.ports`（用户勾选后的结果，不是端口全集），无法反推全集。
+ * 因此落地方式是「服务端唯一 + 面板逐字同步」，面板侧的告警注释见 panel/script.js 顶部。
+ *
+ * ⚠ 两处必须保持**集合相同**（新增端口两侧同时改；漏一处的后果是「面板选不到的端口」或
+ * 「服务端不认的端口 → isHttps 判成明文」）。顺序则**不要**顺手排序：服务端只用 `includes`
+ * 做成员判定（顺序不可观测），但面板侧的顺序决定它提交的 `settings.ports` 顺序，
+ * 而订阅节点的输出顺序就是 ports 的顺序 —— 排序会改变订阅输出。
+ */
+// R-12：表本身移进 ./ports.json（单一来源），面板侧由 scripts/build.js 在构建期注入。
+export const DEFAULT_HTTP_PORTS: number[] = PORTS.http;
+export const DEFAULT_HTTPS_PORTS: number[] = PORTS.https;
+
+/**
+ * R-11：伪装 / 兜底域名的出厂默认值（未命中任何路由的请求会被反代到这里）。
+ *
+ * ⚠ **本常量目前不是全仓唯一来源**：本轮可改的文件里只有 init 侧
+ * （camouflage.ts / handlers.ts 不在工作单允许改动的范围内），所以只归一了 init 这一处：
+ *  - `camouflage.ts` 的 `maskSources()` 与 `resolveMaskTarget()` 仍各自抄了一遍
+ *    `homepage || HOMEPAGE || URL || FALLBACK || globalConfig.fallbackDomain` 的 env 链
+ *    （两者归一化语义还不一致：一个按 `|` 切分并丢 `nginx`，一个先判 `nginx` 再切分）；
+ *  - `handlers.ts` 的 `fallback()` 自己又写了一份 `'www.hcaptcha.com'` 字面量兜底。
+ * 所以「改这里就完事」是**错的**：改本值必须同步 handlers.ts 的那份字面量，
+ * 否则 `/panel/*` 等路径的兜底域会与「未命中路由」的兜底域分叉。
+ * 下一轮把上面三处（camouflage 两个函数 + handlers 的字面量）都改为引用本常量，
+ * 才算真正的单一来源 —— init 侧已就绪，引用即可。
+ */
+export const DEFAULT_FALLBACK_DOMAIN = 'www.hcaptcha.com';
+
 export function init(request: Request, env: Env) {
     const { pathname } = new URL(request.url);
     const { UUID, TR_PASS, DOH_URL } = env;
 
     // 伪装页环境变量对齐 cfnew：homepage / HOMEPAGE / URL 优先，FALLBACK 兼容保留
-    const fallback = String((env as any).homepage || (env as any).HOMEPAGE || (env as any).URL || env.FALLBACK || 'www.hcaptcha.com');
+    // R-11：出厂默认值改由 DEFAULT_FALLBACK_DOMAIN 提供（单一来源；残留的第二份实现见该常量注释）
+    const fallback = String((env as any).homepage || (env as any).HOMEPAGE || (env as any).URL || env.FALLBACK || DEFAULT_FALLBACK_DOMAIN);
 
     // H6：env 覆盖出厂默认的公共出口域名（未设置 → 还原出厂值，行为逐字不变）
     (globalThis.dict as any)._public_proxy_ip_ = (env as any).PUBLIC_PROXY_IP || PUBLIC_PROXY_IP_DEFAULT;
@@ -92,12 +144,19 @@ export function init(request: Request, env: Env) {
     applyAddressEnvOverrides(env);
 
     globalThis.globalConfig = {
-        userID: UUID,
+        // B-01：必须小写化。isValidUUID 的正则带 /i（接受 A1B2…），但服务端从首包 16 字节
+        // 重建出的 UUID 恒为小写（unified.ts 的 stringify 结尾 .toLowerCase()），比较是全等，
+        // 因此大写 UUID 部署会让**每一条 VLESS 连接**在首包被判 "invalid user" → close(1008)，
+        // 而面板 / 登录 / 订阅全部正常 —— 最难自查的一类故障。
+        // 注意：resolveSubPath 仍读 env.UUID（旧部署的 subPath 因此保留原大小写），
+        // 不要把它「顺手统一」成 globalConfig.userID，否则老订阅 URL 会静默变号。
+        userID: String(UUID).toLowerCase(),
         TrPass: TR_PASS,
         // F-14：畸形编码不再抛 URIError（顶层 catch 的 BPB 错误页 = 部署指纹），
         // 解码失败保留原始未解码路径 → 交回既有路由：default 分支走伪装反代，
         // 首段命中内置路由（如 /panel/%zz）则落到该处理器自身的 fallback 兜底，同样不返回错误页
-        pathName: safeDecodePath(pathname) ?? pathname,
+        // B-56：归一化结果直接进路由，二级路由（/panel/settings/ 等）不再落到伪装页
+        pathName: normalizePath(safeDecodePath(pathname) ?? pathname),
         fallbackDomain: fallback,
         dohURL: DOH_URL || 'https://cloudflare-dns.com/dns-query'
     };
@@ -121,8 +180,16 @@ export function initWs(env: any) {
 
 /** KV 键：subPath 的持久值（H8(b)：首次解析时写入，运维可改此键轮换订阅路径） */
 const SUB_PATH_KV_KEY = 'subPath';
-/** isolate 级缓存：命中后本 isolate 不再为 subPath 读 KV（HTTP 热路径每个请求都要它） */
+/**
+ * isolate 级缓存：命中后本 isolate 不再为 subPath 读 KV（HTTP 热路径每个请求都要它）。
+ *
+ * B-33：必须带 TTL。原实现是**永久**缓存，而文件头承诺「运维可改 KV 的 subPath 轮换订阅路径」——
+ * 轮换后要等 isolate 回收才生效（可能数小时），承诺与行为不符。
+ * 5 分钟与 kv-cache 的 CACHE_TTL 同量级：轮换延迟可控，而热路径依然是 0 次 KV 读。
+ */
+const SUB_PATH_CACHE_TTL_MS = 300_000;
 let cachedSubPath: string | null = null;
+let cachedSubPathAt = 0;
 
 /**
  * H8(b)：由 UUID 单向派生独立 subPath（仅全新部署使用）。
@@ -159,7 +226,7 @@ async function deriveIndependentSubPath(UUID: string): Promise<string> {
 export async function resolveSubPath(env: any): Promise<string> {
     const { UUID, SUB_PATH, kv } = env;
     if (SUB_PATH) return String(SUB_PATH);
-    if (cachedSubPath) return cachedSubPath;
+    if (cachedSubPath && Date.now() - cachedSubPathAt < SUB_PATH_CACHE_TTL_MS) return cachedSubPath;
     if (!kv || typeof kv.get !== 'function') return UUID;
     // 凭据尚未配置（/secrets 首访引导流程）：不派生也不写 KV，保持改动前的旧值语义
     if (!UUID || !isValidUUID(UUID)) return UUID;
@@ -172,6 +239,7 @@ export async function resolveSubPath(env: any): Promise<string> {
     }
     if (stored) {
         cachedSubPath = stored;
+        cachedSubPathAt = Date.now();
         return stored;
     }
 
@@ -200,6 +268,7 @@ export async function resolveSubPath(env: any): Promise<string> {
         if (!initialized) return UUID;
     }
     cachedSubPath = resolved;
+    cachedSubPathAt = Date.now();
     return resolved;
 }
 
@@ -210,7 +279,7 @@ export async function initHttp(request: Request, env: any) {
     // 而错误页正是他此时唯一的自救入口（未配置凭据时无处可去），会形成死循环。
     // F-14：畸形 `%` 编码不再抛 URIError（否则顶层 catch 返回 BPB 错误页 = 任何人可指纹识别本部署）；
     // 解码失败保留原始未解码路径 → 交回既有路由（default 分支 / 各处理器 fallback 兜底），不再出现错误页
-    const normalizedPath = (safeDecodePath(pathname) ?? pathname).replace(/\/+$/, '') || '/';
+    const normalizedPath = normalizePath(safeDecodePath(pathname) ?? pathname);
 
     assertRequiredCredentials(env, normalizedPath);
 
@@ -219,8 +288,10 @@ export async function initHttp(request: Request, env: any) {
 
     globalThis.httpConfig = {
         panelVersion: __VERSION__,
-        defaultHttpPorts: [80, 8080, 2052, 2082, 2086, 2095, 8880],
-        defaultHttpsPorts: [443, 8443, 2053, 2083, 2087, 2096],
+        // R-12：端口表来自本文件顶部的单一来源。每次请求按值拷贝一份 —— 常量是模块级的，
+        // 若将来某处写成 `httpConfig.defaultHttpsPorts.push(...)`，共享引用会把常量改坏并跨请求串味。
+        defaultHttpPorts: [...DEFAULT_HTTP_PORTS],
+        defaultHttpsPorts: [...DEFAULT_HTTPS_PORTS],
         hostName: hostname,
         client: safeDecodePath(appParam) ?? appParam,
         urlOrigin: origin,

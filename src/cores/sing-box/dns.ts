@@ -1,6 +1,6 @@
 import { getGeoAssets } from './geo-assets';
 import { DNS, DnsRule, DnsServer } from '#types/sing-box';
-import { accDnsRules, pickRandomEch, resolveDNS, isDomain, antiSanctionDohTarget } from '@utils';
+import { accDnsRules, pickRandomEch, resolveDNS, isDomain, antiSanctionDohTarget, concatIf, omitEmpty } from '@utils';
 
 /**
  * H7：解析节点自身域名的 hosts 静态 IP 服务器 tag。
@@ -33,6 +33,23 @@ export function retargetDnsDetour(dns: DNS, removedGroups: ReadonlySet<string>, 
     }
 }
 
+/** sing-box 认得的 DNS 服务器类型（`remoteDNS` 的 scheme → type）；未知 scheme 一律按 udp */
+const DNS_SERVER_TYPES = new Set(['udp', 'tcp', 'tls', 'https', 'h3', 'quic']);
+
+/**
+ * B-05：把 remoteDNS 安全地折算成 sing-box 的 `dns.servers[].type`。
+ * 非 URL 形态（裸 IP / 裸域名 / 空串）或未知 scheme 一律返回 'udp' —— 宁可退化成
+ * 明文 DNS，也不能让一个字段填错把整份订阅打成错误页（详见 buildDNS 调用点注释）。
+ */
+function safeDnsServerType(remoteDNS: string): string {
+    try {
+        const protocol = new URL(remoteDNS).protocol.replace(':', '').toLowerCase();
+        return DNS_SERVER_TYPES.has(protocol) ? protocol : 'udp';
+    } catch {
+        return 'udp';
+    }
+}
+
 export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> {
     const {
         localDNS,
@@ -46,8 +63,12 @@ export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> 
         echServerName
     } = globalThis.settings;
 
-    const url = new URL(remoteDNS);
-    const protocol = url.protocol.replace(':', '');
+    // B-05：remoteDNS 来自 KV（kv.ts 只校验 `typeof === 'string'`），面板输入框允许任意字符串。
+    // 填裸 IP / 裸域名（`8.8.8.8`、`dns.google`）时 `new URL()` 会抛 TypeError，而 buildDNS 没有
+    // try/catch → 异常冒到 `/sub/normal?app=sing-box`，**整份 sing-box 订阅变成错误页**
+    // （同一份设置下 xray / clash 订阅照常，用户只会以为 sing-box 客户端坏了）。
+    // 兜底为明文 udp：地址仍由 remoteDnsHost.host 给出（kv.ts 已用 getDomain 归一过）。
+    const protocol = safeDnsServerType(remoteDNS);
     // 命名引用：下面「域名型 DoH 服务器需要 domain_resolver」处直接改这个对象
     const remoteServer: DnsServer = {
         type: isWarp ? "udp" : protocol,
@@ -121,7 +142,7 @@ export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> 
 
     if (remoteDnsHost.isDomain && !isWarp) {
         const { ipv4, ipv6, host } = remoteDnsHost;
-        const predefined = ipv4.concatIf(enableIPv6, ipv6);
+        const predefined = concatIf(ipv4, enableIPv6, ipv6);
         addDnsServer(servers, "hosts", "hosts", undefined, undefined, undefined, host, predefined);
         // 域名型 DoH 服务器（server 是域名）必须能解析自身地址 → 指向上面的静态 hosts 服务器
         //（面板侧已解析出 IP，无需真实 DNS 查询，无环）。这正是 sing-box 1.12+ 对「域名型 DNS 服务器」
@@ -332,7 +353,7 @@ function addDnsRule(
             { rule_set: geoip }
         ] : undefined,
         rule_set: geosite?.length && !geoip ? geosite : undefined,
-        domain_suffix: domain?.omitEmpty(),
+        domain_suffix: domain ? omitEmpty(domain) : undefined,
         query_type,
         action: dns === 'reject' ? 'reject' : 'route',
         server: dns === 'reject' ? undefined : dns
@@ -347,7 +368,7 @@ function addDnsRule(
 async function resolveNodeIPs(host: string, enableIPv6: boolean): Promise<string[]> {
     try {
         const { ipv4, ipv6 } = await resolveDNS(host, !enableIPv6);
-        return ipv4.concatIf(enableIPv6, ipv6);
+        return concatIf(ipv4, enableIPv6, ipv6);
     } catch {
         return [];
     }

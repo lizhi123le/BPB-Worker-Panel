@@ -46,6 +46,69 @@ const failure = `${red}✗${reset}`;
 
 const version = pkg.version;
 
+// R-12：端口表的唯一来源（与 src/common/init.ts 读的是同一份），用于注入面板页面。
+const DEFAULT_PORTS = JSON.parse(readFileSync(join(__dirname, '../src/common/ports.json'), 'utf8'));
+
+// R-10：各页共用的伪装背景样式（原先 5 份逐字副本，现只此一份）。
+const BASE_STYLE = readFileSync(join(ASSET_PATH, 'common/base.css'), 'utf8');
+
+/** index.html 里的模板占位符（与 buildWorker 的 define 及各页 index.html 成对）。 */
+const HTML_PLACEHOLDERS = ['__VERSION__', '__STYLE__', '__SCRIPT__', '__BASE_STYLE__', '__DEFAULT_HTTP_PORTS__', '__DEFAULT_HTTPS_PORTS__'];
+
+/** String.prototype.replace(All) 的替换模式序列：出现在**替换值**里会被展开，不是原样输出。 */
+const HTML_SUBSTITUTION_SEQUENCES = ['$&', "$'", '$`'];
+
+/**
+ * 占位符残留断言。必须在 htmlMinify **之前**跑：压缩器会改写 token 形状（引号、空白、
+ * 属性名大小写），之后再查既可能查不到残留、也可能把正文里的同名字符串误判成残留。
+ * 留一个未替换的占位符发到线上，页面会直接渲染出字面量 `__SCRIPT__` / `__STYLE__` / `__VERSION__`。
+ */
+function assertNoPlaceholder(html, dir) {
+    const left = HTML_PLACEHOLDERS.filter((token) => html.includes(token));
+    if (left.length > 0) {
+        throw new Error(
+            `assets/${dir}/index.html 的占位符没有被替换：${left.join(', ')}。` +
+                '检查 index.html 里的拼写，以及 build.js 的 replaceAll 是否仍与它们成对' +
+                '（__STYLE__ / __SCRIPT__ 只在 dir !== "error" 分支替换）。'
+        );
+    }
+}
+
+/**
+ * 替换保真断言：`$&` / `$'` / `` $` `` 是 String.replace(All) 的**替换模式**，用字符串形式替换时
+ * 替换值里的这些序列会被展开（`$&` → 命中的 `__SCRIPT__` 本身），整块插入内容随之损坏。
+ * 改成函数形式（`() => chunk`）后替换值不再被解析，这条断言把"不再被解析"钉成事实：
+ * 插入的内容必须逐字出现在结果里。
+ *
+ * 为什么不断言"chunk 里不许出现这些序列"：src/assets/secrets/script.js 的 SUB_PATH 字符集里
+ * 合法地就有一个字面量 `$&`（它正是本次事故的受害者），那条断言会永久失败。
+ */
+function assertInsertedVerbatim(html, chunk, label) {
+    if (typeof chunk !== 'string') {
+        throw new Error(`${label} 的插入内容不是字符串（${typeof chunk}）—— 检查 jsMinify 的返回值`);
+    }
+    if (html.includes(chunk)) return;
+    const sequences = HTML_SUBSTITUTION_SEQUENCES.filter((seq) => chunk.includes(seq));
+    throw new Error(
+        `${label} 插入 HTML 后没有逐字保留（chunk ${chunk.length} 字节）。` +
+            (sequences.length > 0
+                ? `chunk 里含 replace 的替换模式序列 ${sequences.join(' ')} —— 替换必须用函数形式（() => chunk），不能写字符串。`
+                : '检查 index.html 的占位符位置是否被替换到了错误的地方。')
+    );
+}
+
+/**
+ * 只提示、不失败：被插入的内容里出现替换模式序列，意味着"将来任何一处改回字符串形式替换
+ * 就会静默改写它"（本次事故就是这一形态）。当前唯一来源是 src/assets/secrets/script.js
+ * 的合法字符集字面量，所以记一条 note 而不是把构建打红。
+ */
+function collectSubstitutionSequences(text, label, notes) {
+    const found = HTML_SUBSTITUTION_SEQUENCES.filter((seq) => text.includes(seq));
+    if (found.length > 0) {
+        notes.push(`${label} 含 ${found.join(' ')}（替换必须保持函数形式，否则会被展开成匹配文本）`);
+    }
+}
+
 async function processHtmlPages() {
     const indexFiles = globSync('**/index.html', { cwd: ASSET_PATH });
     const result = {};
@@ -55,16 +118,48 @@ async function processHtmlPages() {
         const base = (file) => join(ASSET_PATH, dir, file);
 
         const indexHtml = readFileSync(base('index.html'), 'utf8');
-        let finalHtml = indexHtml.replaceAll('__VERSION__', version);
+        // 函数形式替换：__VERSION__ 来自 package.json（当前不含 `$`），但字符串形式一旦遇到
+        // `$&` / `$'` / `` $` `` 就会展开成匹配文本 —— 与下面 __STYLE__ / __SCRIPT__ 同一个坑。
+        let finalHtml = indexHtml
+            .replaceAll('__VERSION__', () => version)
+            // R-10：error 页没有独立 style.css，公共伪装背景样式就地注入（目录页走 styleChunk 前缀）
+            .replaceAll('__BASE_STYLE__', () => BASE_STYLE);
 
         if (dir !== 'error') {
             const styleCode = readFileSync(base('style.css'), 'utf8');
             const scriptCode = readFileSync(base('script.js'), 'utf8');
             const finalScriptCode = await jsMinify(scriptCode);
+            // 必须用函数形式替换。字符串形式会把**替换值里**的 `$&` / `$'` / `` $` `` / `$$`
+            // 当成替换模式展开：src/assets/secrets/script.js 的字符集里就有字面量 `$&`，
+            // 用它替换 __SCRIPT__ 时 `$&` 会被展开成被匹配的 `__SCRIPT__` 本身 —— 线上 /secrets
+            // 页的 SUB_PATH 字符集因此变成 `!@__SCRIPT__*_-+;:,.`（应为 `!@$&*_-+;:,.`）。
+            // R-10：公共伪装背景样式拼在**各页样式之前**，保证页面自有规则仍可覆盖它。
+            const styleChunk = `<style>${BASE_STYLE}\n${styleCode}</style>`;
+            const scriptChunk = finalScriptCode.code;
             finalHtml = finalHtml
-                .replaceAll('__STYLE__', `<style>${styleCode}</style>`)
-                .replaceAll('__SCRIPT__', finalScriptCode.code);
+                .replaceAll('__STYLE__', () => styleChunk)
+                .replaceAll('__SCRIPT__', () => scriptChunk);
+
+            // 断言放在 htmlMinify 之前：压缩器会改写 token 形状，之后再查既可能漏掉残留，
+            // 也可能把正文里的字符串误判成残留。
+            assertInsertedVerbatim(finalHtml, styleChunk, `${dir}/style.css`);
+            assertInsertedVerbatim(finalHtml, scriptChunk, `${dir}/script.js（terser 输出）`);
+
+            // R-12：把端口表注入面板页面。面板是静态资源，读不到服务端的 @init 常量，
+            // 所以由构建期从**同一份** src/common/ports.json 填占位符 —— 两处再也不用手工同步。
+            // 顺序即面板拼 settings.ports 的顺序 = 订阅节点端口顺序，故原样保序（见 ports.json 的 _note）。
+            finalHtml = finalHtml
+                .replaceAll('__DEFAULT_HTTP_PORTS__', () => JSON.stringify(DEFAULT_PORTS.http))
+                .replaceAll('__DEFAULT_HTTPS_PORTS__', () => JSON.stringify(DEFAULT_PORTS.https));
+
+            const notes = [];
+            collectSubstitutionSequences(styleCode, `${dir}/style.css`, notes);
+            collectSubstitutionSequences(scriptChunk, `${dir}/script.js`, notes);
+            if (notes.length > 0) console.log(`  note  ${notes.join('；')}`);
         }
+
+        // 每个页面（含 error）替换完都必须没有占位符残留。
+        assertNoPlaceholder(finalHtml, dir);
 
         const minifiedHtml = htmlMinify(finalHtml, {
             collapseWhitespace: true,

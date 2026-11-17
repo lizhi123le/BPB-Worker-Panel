@@ -5,7 +5,7 @@
  * （package.json 里是 `npm run test:wslimit`）
  *
  * 被测规则（unified.ts）：每条 WS 连接占一个名额，上限由 env `WS_MAX_CONNECTIONS` 决定
- * （默认 128，钳制 1~1024，非法值回退默认，高于默认值会 warn 一次）；
+ * （默认 256，钳制 1~1024，非法值回退默认，高于默认值会 warn 一次）；
  * 超限直接返回 429（不 accept 服务端 socket、不分配任何缓冲）；
  * 连接关闭时名额必须归还（登记在 registerWsCleanup 的清理钩子上）。
  *
@@ -78,7 +78,7 @@ check('WS：字典内随机路径仍可正常升级（未被误伤）', okPath.s
 if (okPath.status === 101) state.lastPair[1].listeners.close?.forEach((fn) => fn());
 
 // ---------- 1. 一直连到被拒，确认上限数值与拒绝方式 ----------
-const EXPECTED_LIMIT = 128;   // 默认值（unified.ts 的 WS_MAX_CONNECTIONS_DEFAULT / env WS_MAX_CONNECTIONS）
+const EXPECTED_LIMIT = 256;   // 默认值（unified.ts 的 WS_MAX_CONNECTIONS_DEFAULT / env WS_MAX_CONNECTIONS）
 let opened = 0;
 let rejectedAt = null;
 for (let i = 0; i < EXPECTED_LIMIT + 5; i++) {

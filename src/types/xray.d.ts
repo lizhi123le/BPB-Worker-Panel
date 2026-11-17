@@ -59,16 +59,6 @@ export interface MixedInbound {
     tag: "mixed-in";
 }
 
-export interface TunInbound {
-    protocol: "tun";
-    settings: {
-        mtu: 1500;
-        name: "xray0";
-    };
-    sniffing: Sniffing;
-    tag: "tun";
-}
-
 export interface DokodemoDoorInbound {
     listen: string;
     port: 10853;
@@ -267,13 +257,6 @@ interface DnsOutSettings {
 
 export type FragmentPacket = "tlshello" | "1-1" | "1-2" | "1-3" | "1-5";
 
-interface Fragment {
-    packets: FragmentPacket;
-    length: string;
-    interval: string;
-    maxSplit?: string;
-}
-
 export interface Noise {
     rand?: string;
     randRange?: string;
@@ -398,7 +381,9 @@ export interface Config {
     };
     log: Log;
     dns: Dns;
-    inbounds: Array<MixedInbound | DokodemoDoorInbound | TunInbound>;
+    // D-04：Xray TUN 出站未实现（Worker 侧无 TUN 资源），`buildTunInbound` 与 `TunInbound`
+    // 已删除；此处保留联合形态，将来恢复时只加回一个成员类型即可。
+    inbounds: Array<MixedInbound | DokodemoDoorInbound>;
     outbounds: Outbound[];
     policy: Policy;
     routing: Routing,

@@ -315,7 +315,7 @@ check('非 BYOB 回退：普通 reader 下仍能正确成帧',
 // 「越播越卡 → 最后断」（延迟线性增长 + 堆顶到内存上限）。节流是唯一能形成端到端背压的点：
 // await 令牌 → 不 read() → socket 接收缓冲满 → TCP 窗口关闭 → 上游停顿。
 // 容量 = clamp(min(速率, WS_DOWNLINK_BURST_KB), 下限 256KiB)：本用例 128KiB/s → 容量 256KiB
-//（突发额度默认 2MB 不构成限制，限制来自速率；256KiB 是「必须大于单块」的下界）。
+//（突发额度默认 3MB 不构成限制，限制来自速率；256KiB 是「必须大于单块」的下界）。
 // 结果：先放 256KiB，其余按 128KiB/s 排队。
 plan = { mode: 'stream', queue: [] };
 const seventh = await openConnection('case7', makeEnv({
@@ -376,7 +376,7 @@ check('send() 返回 thenable：字节仍完整有序',
 // 因此尺寸是常量，这里不再保留开关用例。
 
 // =========================================================== 用例 9：默认值钉死 + 显式 0 可关闭
-// 这两个默认值现在是**默认开启**的（10MB/s 速率上限、900MB 会话字节预算），所以它们
+// 这两个默认值现在是**默认开启**的（速率上限、会话字节预算），所以它们
 // 必须像 WS_MAX_CONNECTIONS 一样在测试里钉住：改默认值 = 改所有部署的行为，不能悄悄漂。
 // 判据用 debug 仪表那一行（它把生效值原样打出来），不靠读实现常量。
 // 用 WS_DOWNLINK_STATS=1 开仪表，而不是改 globalThis.settings —— 后者会被 KV 里的
@@ -391,7 +391,9 @@ for (let i = 0; i < 15; i++) {
     await sleep(100);
 }
 const defaultLines = logs.slice(logsBeforeDefaults).filter((l) => l.includes('downlink '));
-check('默认值：下行速率上限默认 10MB/s', defaultLines.some((l) => l.includes('cap=10000000B/s')),
+// 默认值已按业主指定调整为 20MB/s / 900MiB（突发 3MiB：见下一段的显式 env 用例，
+// 这里只钉「未设 env 时生效的是哪个数」，所以断言的是 B/s 与预算的绝对值）。
+check('默认值：下行速率上限默认 20MB/s', defaultLines.some((l) => l.includes('cap=20000000B/s')),
     `lines=${defaultLines.slice(-2).join(' | ')}`);
 check('默认值：会话字节预算默认 900MB', defaultLines.some((l) => l.includes('budget=943718400B')),
     `lines=${defaultLines.slice(-2).join(' | ')}`);
