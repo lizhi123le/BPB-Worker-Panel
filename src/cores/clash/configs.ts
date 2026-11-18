@@ -227,16 +227,24 @@ export async function getClNormalConfig(): Promise<Response> {
                 // 顺序：base 基础行 → Block/Bypass 拦截（广告/色情/恶意/挖矿等 REJECT，国内/直连 DIRECT）
                 // → 模板规则；Block/Bypass 放在模板规则之前，避免模板规则覆盖掉 Block 拦截。
                 // 基础行传 false：本入口（getClNormalConfig）的 buildConfig isWarp 恒为 false，取非 Warp 分支。
+                //
+                // 模板的 `MATCH,<组>` 就是模板自己声明的 FINAL（默认去向），**必须原样保留**：
+                // 原实现用 `filter(r => !r.startsWith('MATCH,'))` 把它丢掉、再用「第一个 select 分组」补一条，
+                // 结果是模板写着 FINAL → 「🐟 漏网之鱼」，生成出来的却是 `MATCH,🚀 节点选择`（与模板不符）。
+                // MATCH 是终止规则：它之后的行永远不会再被匹配，故把模板的 MATCH 统一钉到最后。
+                const aclMatchRules = acl.rules.filter(r => r.startsWith('MATCH,'));
                 config.rules = [
                     ...buildBaseRoutingRules(false),
                     ...buildBlockRules(),
                     ...buildBypassRules(),
-                    ...acl.rules.filter(r => !r.startsWith('MATCH,'))
+                    ...acl.rules.filter(r => !r.startsWith('MATCH,')),
+                    ...aclMatchRules
                 ];
-                if (!config.rules.some(r => r.startsWith('MATCH,'))) {
+                if (!aclMatchRules.length) {
+                    // 只有「模板没写 FINAL」才需要兜底：取第一个 select 分组（主流模板即「🚀 节点选择」）；
+                    // 零分组兜底：模板只有规则、一个分组都没生成时该名字并不存在（proxy-groups 为空）
+                    // → MATCH 策略悬空、mihomo 加载失败。退回内置 DIRECT（恒存在）。
                     const fallback = acl.groups.find(g => g.type === 'select') || acl.groups[0];
-                    // 零分组兜底：模板只有规则、一个分组都没生成时，历史字面量 '🚀 节点选择' 并不存在
-                    // （proxy-groups 为空）→ MATCH 策略悬空、mihomo 加载失败。退回内置 DIRECT（恒存在）。
                     config.rules.push(`MATCH,${fallback ? fallback.name : 'DIRECT'}`);
                 }
                 // 规则集引用：模板 provider 合并进既有 provider（避免重名），不清空
