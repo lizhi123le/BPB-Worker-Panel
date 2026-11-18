@@ -39,15 +39,14 @@ export interface DnsServer {
 }
 
 export interface DnsRule {
-    type?: "logical";
     clash_mode?: "Global" | "Direct";
-    mode?: "and";
-    rules?: { rule_set: string | string[]; }[];
     rule_set?: string[] | string;
     domain?: string[];
     domain_suffix?: string[];
     // 注意：不要在此加 ip_cidr / ip_is_private / ip_accept_any / response_* —— 它们属 Response Match Fields，
     // sing-box 1.14 起需要 match_response，较新内核会以「require match_response」拒载整份配置（见 dns.ts）。
+    // 同样不声明 logical 三件套（type/mode/rules）：sing-box 1.14 起 DNS 规则不接受 IP 类 rule_set
+    // （geoip-*），原先唯一需要它的「勾选地区」分支已改成只发 geosite → 代码侧再无生成器（见 dns.ts#addDnsRule）。
     inbound?: string;
     query_type?: Array<"A" | "AAAA" | "HTTPS">;
     action?: "route" | "reject";

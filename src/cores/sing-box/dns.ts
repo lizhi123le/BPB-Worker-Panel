@@ -137,7 +137,7 @@ export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> 
         // 与 handlers.ts:876 的 URI 侧（`pickRandomEch(echServerName) || host`）取同一口径；
         // 且与出站侧一致：出站 ech.query_server_name 同样因空名单而为 undefined → sing-box 改用
         // server_name（= 节点 SNI）查 HTTPS RR，也是该域名。
-        addDnsRule(rules, echName || (!isChain && nodeIPs.length) ? 'dns-remote' : 'dns-direct', undefined, undefined, undefined, [echName || hostName], ["HTTPS"]);
+        addDnsRule(rules, echName || (!isChain && nodeIPs.length) ? 'dns-remote' : 'dns-direct', undefined, undefined, [echName || hostName], ["HTTPS"]);
     }
 
     if (remoteDnsHost.isDomain && !isWarp) {
@@ -167,24 +167,24 @@ export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> 
             'reject',
             undefined,
             dnsRules.block.geosites,
-            undefined, 
             dnsRules.block.domains
         );
     }
 
-    dnsRules.bypass.localDNS.geositeGeoips.forEach(({ geosite, geoip }) => {
-        addDnsRule(
-            rules,
-            'dns-direct',
-            undefined,
-            [geosite], 
-            geoip,
-            undefined
-        );
-    });
+    // sing-box 1.14 起：**DNS 规则不接受 IP 类 rule_set**（geoip-*），只认域名类（geosite-*）。
+    // 原先这里对「勾选的地区」（bypassChina / bypassIran / bypassRussia，它们同时带 geosite 与 geoip）
+    // 生成 logical(and)[geosite, geoip] 规则，1.14+ 会因 geoip rule_set 出现在 DNS 规则里拒载整份配置。
+    // 现在 DNS 侧只用 geosite 表达（与 route 段同一覆盖面），geoip 只留在 route 段 —— 那里仍然合法。
+    // 顺带说明语义变化：原 logical-and 是「域名命中 geosite **且** 解析出的 IP 命中 geoip」，
+    // 去掉 geoip 后变为「域名命中 geosite 即用本地 DNS」，与 route 段（geosite/geoip 同一条规则里
+    // 是 OR）口径一致，不再出现「路由直连、DNS 却按远程解析」的错配。
+    const bypassLocalGeosites = [
+        ...dnsRules.bypass.localDNS.geositeGeoips.map(({ geosite }) => geosite),
+        ...dnsRules.bypass.localDNS.geosites
+    ];
 
     const bypassDomains = [
-        ...dnsRules.bypass.localDNS.geosites,
+        ...bypassLocalGeosites,
         ...dnsRules.bypass.localDNS.domains
     ];
 
@@ -193,8 +193,7 @@ export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> 
             rules,
             'dns-direct',
             undefined,
-            dnsRules.bypass.localDNS.geosites,
-            undefined,
+            bypassLocalGeosites,
             dnsRules.bypass.localDNS.domains
         );
     }
@@ -219,7 +218,6 @@ export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> 
             'dns-anti-sanction',
             undefined,
             dnsRules.bypass.antiSanctionDNS.geosites,
-            undefined,
             dnsRules.bypass.antiSanctionDNS.domains
         );
 
@@ -257,7 +255,7 @@ export async function buildDNS(isWarp: boolean, isChain: boolean): Promise<DNS> 
             enableIPv6 ? "fc00::/18" : undefined
         );
 
-        addDnsRule(rules, "dns-fake", "tun-in", undefined, undefined, undefined, ["A", "AAAA"]);
+        addDnsRule(rules, "dns-fake", "tun-in", undefined, undefined, ["A", "AAAA"]);
     }
 
     return {
@@ -334,25 +332,25 @@ function addDnsServer(
     servers.push(entry);
 }
 
+/**
+ * 追加一条 DNS 规则。
+ *
+ * 只承载「域名类」匹配（rule_set 里的 geosite-* / domain_suffix）与 query_type：
+ * sing-box 1.14 起 DNS 规则不接受 IP 类 rule_set（geoip-*），也把 Response Match Fields 收归
+ * `match_response` 之下，故不再有 logical(and)[geosite, geoip] 形态 —— 原先那个分支的唯一
+ * 调用点（勾选地区时的 geosite+geoip 配对）已改成只发 geosite，这里同步去掉死参数。
+ */
 function addDnsRule(
     rules: DnsRule[],
     dns: string,
     inbound?: string,
     geosite?: string[],
-    geoip?: string,
     domain?: string[],
     query_type?: Array<"A" | "AAAA" | "HTTPS">
 ) {
-    const isPair = geosite && geoip;
     rules.push({
         inbound,
-        type: isPair ? 'logical' : undefined,
-        mode: isPair ? 'and' : undefined,
-        rules: isPair ? [
-            { rule_set: geosite }, 
-            { rule_set: geoip }
-        ] : undefined,
-        rule_set: geosite?.length && !geoip ? geosite : undefined,
+        rule_set: geosite?.length ? geosite : undefined,
         domain_suffix: domain ? omitEmpty(domain) : undefined,
         query_type,
         action: dns === 'reject' ? 'reject' : 'route',
