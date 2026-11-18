@@ -1345,6 +1345,13 @@ function validateSettingsForm() {
         ...defaultHttpsPorts
     ].filter(port => formData.has(port.toString()));
 
+    // 端口复选框的 name 就是端口号（见 renderPortsBlock），`Object.fromEntries(formData)` 会把这些
+    // 复选框变成顶层键 `"443": "true"`。端口数组已由上面的 form.ports 表达（= 勾选中的端口，
+    // 也就是 FormData 里会出现的全部数字键），按它清掉残渣即可：
+    // 否则每次保存后端都打「忽略未知字段：80, 443, …」告警（真异常会被噪音淹没），
+    // 导出的 .dat 也会带上这些脏键。只删对象上的重复键，checkbox 的 name 与 formData 判定不变。
+    for (const port of form.ports) delete form[String(port)];
+
     checkboxElements.forEach(elm => {
         form[elm.id] = formData.has(elm.id);
     });
