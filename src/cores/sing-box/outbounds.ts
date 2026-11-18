@@ -104,8 +104,8 @@ export function buildWebsocketOutbound(
             criterion.allowInsecure,
             criterion.sni,
             // G13-C7/C10：是否启用 ECH 一律以「该节点抽到的 ECH 名称」为准（分片节点不启用；
-            // 名单为空时已回退到 host，仍算启用，见上方 B-43），
-            // 与判据里抑制 alpn 用同一个字段，避免 ECH 参数与 alpn 参数各按一套条件判断而互相矛盾。
+            // 名单为空时已回退到 host，仍算启用，见上方 B-43）。
+            // alpn 与 ECH 解耦：criterion.alpn 恒为前端 ALPN 设置，开启 ECH 时照常下发。
             !!criterion.echName,
             criterion.echName,
             criterion.alpn,

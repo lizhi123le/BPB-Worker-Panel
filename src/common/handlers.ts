@@ -855,7 +855,9 @@ export async function getURLConfigs() {
             // C-15(W2a)：selectSniHost 的 allowInsecure 原先只被 Clash（skip-cert-verify）/sing-box（insecure）消费，
             // URL 订阅侧被丢弃 → 两类订阅 TLS 策略不一致。按 v2rayN/sing-box 的 URI 约定补 allowInsecure=1。
             if (allowInsecure) config.searchParams.append('allowInsecure', '1');
-            if (!enableECH && alpn) config.searchParams.append('alpn', alpn);
+            // ALPN 与 ECH 是面板上两个独立开关：开启 ECH 时同样下发用户选择的 alpn
+            // （与 resolveNodeTls 的判据第 4 条、三端 JSON 输出同源同值）。
+            if (alpn) config.searchParams.append('alpn', alpn);
             if (enableECH) {
                 config.searchParams.append('ech', `${pickRandomEch(echServerName) || host}+${remoteDNS}`);
             }

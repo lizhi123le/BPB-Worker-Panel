@@ -1148,8 +1148,8 @@ export function selectSniHost(address: string, sniHostOverride?: string) {
  *     下一轮不要把它「改回去」。
  *  3. ECH 名名单为空时回退到本节点 host（`pickRandomEch(echServerName) || host`），与
  *     handlers.ts#buildConfig（URI 侧）的同一表达式逐字一致（B-43）。
- *  4. 仅当本节点**真的**启用 ECH（echName 有值）时才抑制 alpn（G13-C7）；分片节点不启用 ECH，
- *     必须放行 alpn，否则该节点既无 ECH 也无 alpn。
+ *  4. alpn 恒取自前端 ALPN 设置（settings.alpn），**不**因启用 ECH 而抑制：ECH 与 alpn 是两个
+ *     独立开关，面板上设了什么就下发什么。三端 JSON 与 URI 侧（handlers.ts#buildConfig）同源同值。
  *  5. `allowInsecure` 只来自 #selectSniHost（地址命中 customCdnAddrs），三端同源同值。
  *
  * `isFragment` 只影响 ECH（分片节点不启用）；Clash 无分片订阅，恒传 false。
@@ -1165,7 +1165,7 @@ export interface NodeTlsCriterion {
     allowInsecure: boolean;
     /** 本节点的 ECH 名；undefined = 本节点不启用 ECH */
     echName?: string;
-    /** 本节点要下发的 alpn 档位；本节点启用 ECH 时恒 undefined（判据第 4 条） */
+    /** 本节点要下发的 alpn 档位（= 前端 settings.alpn，判据第 4 条） */
     alpn?: string;
 }
 
@@ -1184,7 +1184,7 @@ export function resolveNodeTls(address: string, port: number, isFragment: boolea
         isTLS,
         allowInsecure,
         echName,
-        alpn: echName ? undefined : (alpn || undefined)
+        alpn: alpn || undefined
     };
 }
 

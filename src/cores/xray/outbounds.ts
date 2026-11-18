@@ -109,7 +109,7 @@ function buildNodeTlsContext(address: string, port: number, isFragment: boolean)
 
     // R-04：判据统一走 @utils#resolveNodeTls，与 sing-box / Clash 同一份实现。
     // 该函数内部保证「先 hostSniList 再 echServerName」的抽取顺序、名单为空时 ECH 名回退到
-    // 本节点 host、并且仅在本节点真的启用 ECH 时才抑制 alpn（G13-C7/G13-C10）。
+    // 本节点 host；alpn 恒取前端 ALPN 设置，不再因启用 ECH 而抑制（G13-C10）。
     const criterion = resolveNodeTls(address, port, isFragment);
 
     return {
