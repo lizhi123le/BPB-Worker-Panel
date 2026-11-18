@@ -1,4 +1,4 @@
-import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes, isBareIPv4, PROBE_PHASE_BUDGET_MS } from '@utils';
+import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes, isBareIPv4 } from '@utils';
 import { evictOldest, safeErrorMessage, randomUserAgent, base64EncodeUtf8, createSessionWatchdog, createSignatureGate, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
@@ -25,13 +25,6 @@ const PROXY_DIAL_TIMEOUT = 5000; // 代理竞速连接超时（对齐 cfnew 连�
 const UPSTREAM_HANDSHAKE_TIMEOUT = 8000;
 const RACE_DIAL_CONCURRENCY = 3; // 并发拨号数量，参考 cfnew
 const RACE_DIAL_MAX_BATCHES = 5; // 最大重试批次
-/**
- * 预热拨号（探测期间抢跑，见 connectWithRaceDial 第 5 步）的连接超时。
- * 直接取 utils 的**探测总预算**（单一来源，不写第二份字面量）：它要抢在「探测收口」之前，
- * 窗口自然就该是同一个数。刻意**短于**批次用的 PROXY_DIAL_TIMEOUT(5s) —— 抢不到就该让批次接管，
- * 若也取 5s，它自己会变成一段纯等待，把最坏建连时延再拉长一截。
- */
-const WARM_DIAL_TIMEOUT = PROBE_PHASE_BUDGET_MS;
 /**
  * 每连接从缓存池抽取参与可达性探测的候选数（抽取在探测前、按黑名单过滤后进行）。
  * 探测本身由 filterReachableEntries 按 3 条**滚动窗口**限流（见 utils 的 PROBE_CONCURRENCY），
@@ -108,12 +101,20 @@ function shuffleTake<T>(items: T[], n: number): T[] {
 // 代理竞速 IP 级轮询游标：成功候选推进游标（对齐 edgetunnel 缓存反代数组索引 5779/5800）
 let proxyIpPoolCursor = 0;
 
-/** 预热拨号抢到的那条连接（= 本次连接的胜者）。抢跑失败/探测先收口都用 `null` 表示 ——
- *  两者在控制流上完全等价（都落回批次循环），所以不再造一个只用来区分日志的失败态。
- *  刻意的取舍：少一个状态就少一条「两个分支做同一件事」的重复代码。 */
-type WarmWinner = { socket: Socket; ip: string; port: number };
+/**
+ * 接管来的那条连接（= 本次连接的胜者）：`filterReachableEntries` 把第一条被测通的 socket
+ * 直接交出来，调用方写首包后就用它 —— 不再另拨一次。
+ */
+type ClaimedSocket = { socket: Socket; ip: string; port: number };
 
-/** cfnew 风格：竞速拨号多个代理 IP，取最快成功的 */
+/** cfnew 风格：竞速拨号多个代理 IP，取最快成功的。
+ *
+ *  **一条路径服务两种池**：反代池（`poolOverride` 省略 → 读 panelIPs）与官方 CF 池
+ *  （`poolOverride` = officialPool）。两者都走「按黑名单过滤 → 抽 6 → 探测 + 接管 → 批次兜底」。
+ *  曾经给官方池开了 `skipProbe`（整池直接分批）——理由是「anycast 没有信息量、别垫 2s 探测」；
+ *  但「探测即预连接」实现之后，探测不再额外建连、也不再额外等待（首条连通就是首包时刻），
+ *  于是那条理由失效，反而丢了「死候选进黑名单」这条学习通道（官方 IP 也会挂）→ 已统一。
+ */
 async function connectWithRaceDial(
     targetAddress: string,
     targetPort: number,
@@ -121,13 +122,7 @@ async function connectWithRaceDial(
     log: Function,
     fetcher?: any,
     poolOverride?: string[],
-    onSocket?: (socket: Socket) => void,
-    /**
-     * `skipProbe`：跳过可达性探测，整池直接进批次循环。**官方 CF 池（末级兜底）专用** ——
-     * 那一池清一色是 CF 边缘 anycast，探测既没有信息量（几乎恒可达），又要把「拨号前」再垫上
-     * 最多 2s；而它出现在回退阶梯的末段，延迟最贵。反代池不走这里（它的候选质量参差，必须探测）。
-     */
-    options?: { skipProbe?: boolean }
+    onSocket?: (socket: Socket) => void
 ): Promise<{ socket: Socket; usedIp: string }> {
     // 1. 获取配置
     //    poolOverride 供「CF 内置 IP 池」层使用：显式指定官方直连池，
@@ -179,90 +174,71 @@ async function connectWithRaceDial(
     const blacklistBypass = usableEntries.length === 0;
     const drawSource = blacklistBypass ? poolEntries : usableEntries;
 
-    // 抽取阶段（skipProbe 不抽取：整池直接进批次循环，见下方分支）：
-    // 池内（本次可用的）全部候选都有机会被用到，不再由解析期的 slice(0,8) 把其余候选结构性丢弃、锁死 10 分钟。
-    const skipProbe = options?.skipProbe === true;
-    const probeEntries = skipProbe ? drawSource : shuffleTake(drawSource, RACE_PROBE_COUNT);
+    // 抽取：池内（本次可用的）全部候选都有机会被用到，不再由解析期的 slice(0,8) 把其余候选
+    // 结构性丢弃、锁死 10 分钟。反代池与官方池同一套（理由见函数头对 skipProbe 的说明）。
+    const probeEntries = shuffleTake(drawSource, RACE_PROBE_COUNT);
 
-    if (skipProbe) {
-        log(`got ${poolEntries.length} IPs for proxy ${proxyAddr}, probing skipped (official pool): dialing all ${probeEntries.length} (${poolEntries.length - drawSource.length} in backoff)`);
-    } else {
-        log(`got ${poolEntries.length} IPs for proxy ${proxyAddr}, drawing ${probeEntries.length} (${poolEntries.length - drawSource.length} in backoff), probing reachability...`);
-    }
+    log(`got ${poolEntries.length} IPs for proxy ${proxyAddr}, drawing ${probeEntries.length} (${poolEntries.length - drawSource.length} in backoff), probing reachability...`);
 
-    // 默认：候选直接进批次循环（skipProbe 的语义与取舍见签名处 options.skipProbe 的说明）
-    let reachableEntries: [string, number][] = probeEntries;
+    // 5. 探测（总预算 2s）+ **探测即预连接**：第一条被测通的候选，它那条**已经建立的 socket**
+    //    直接接管成数据连接，立刻写首包返回。
+    //    为什么不「等整批探测跑完再拨」：那段等待整段落在首包之前，而探测只是筛选、不是裁决 ——
+    //    只要有一条候选已被证明可达，就没有理由为「等最慢那条的结论」按住首包。
+    //    为什么不是「另起一次拨号」（更早的实现）：那要给每条连接多开一个 socket + 一个超时定时器，
+    //    探测相位先收口时还要再等它 —— 净增一份建连成本。接管现成 socket 的成本是 0：
+    //    并发峰值仍是探测窗口 3，不会出现「第 4 条连接」。
+    const probeFailed: [string, number][] = [];
+    // 只以「接管成功」落地：接管没发生就压根不 resolve（那就等 probeDone 那条）——
+    // 所以不需要 null 变体，少一个永远不会出现的状态。
+    let resolveClaim: (winner: ClaimedSocket) => void = () => {};
+    const claimOutcome = new Promise<ClaimedSocket>((resolve) => { resolveClaim = resolve; });
 
-    if (!skipProbe) {
-        // 5. 探测（总预算 2s）+ **预热拨号**：第一条探测合格的候选立刻单独拨一次，成功即返回。
-        //    为什么不「等整批探测跑完再拨」：那段等待整段落在首包之前，而探测只是筛选、不是裁决 ——
-        //    只要有一条候选已被证明可达，就没有理由为「等最慢那条的结论」按住首包。
-        //    并发账：探测窗口 3 + 预热 1 = 峰值 4（< 运行时单请求 6 条并发连接配额；批次阶段仍是 1 波 3）。
-        const probeFailed: [string, number][] = [];
-        let warmDialStarted = false;
-        let resolveWarm: (winner: WarmWinner | null) => void = () => {};
-        const warmOutcome = new Promise<WarmWinner | null>((resolve) => { resolveWarm = resolve; });
+    /** 接管探测连上的那条 socket（只会被调用一次：filterReachableEntries 内部只交第一条）。
+     *  这里只做三件事：登记到连接级清理钩子（teardown 才关得掉）、交付接管结果、返回 true 表示
+     *  「所有权归我，别关」。写首包/记账留给主流程 —— 一个 ArrayBuffer 只能交给 write 一次，
+     *  必须等主流程确认这条真的赢了再写。 */
+    const claimProbeSocket = (entry: [string, number], socket: Socket): boolean => {
+        const cleanIp = entry[0].replace(/^\[|\]$/g, '');
+        onSocket?.(socket);
+        resolveClaim({ socket, ip: cleanIp, port: entry[1] });
+        return true;
+    };
 
-        /** 抢跑拨号：只在**第一次**探测成功时启动一次（超时口径见 WARM_DIAL_TIMEOUT）。
-         *  失败**不记黑名单**（与批次路径不同）：它只是一次抢跑，不是对候选的裁决 ——
-         *  该候选仍在 reachableEntries 里，必要时由批次用完整的 PROXY_DIAL_TIMEOUT 再拨一次。 */
-        const tryWarmDial = (entry: [string, number]): void => {
-            if (warmDialStarted) return;
-            warmDialStarted = true;
-            const [ip, entryPort] = entry;
-            const cleanIp = ip.replace(/^\[|\]$/g, '');
-            openCandidate({ hostname: cleanIp, port: entryPort }, WARM_DIAL_TIMEOUT, fetcher, { onSocket })
-                .then((socket) => resolveWarm({ socket, ip: cleanIp, port: entryPort }))
-                .catch(() => resolveWarm(null));
-        };
+    // 探测照常跑完（≤2s 预算），结论用于批次与黑名单，与是否已接管无关。
+    // 探针在 filterReachableEntries 内部按 3 条滚动窗口限流，所以这里的「不通」是候选自身的结论，
+    // 不是被自己的探测并发撞配额打出来的假失败；预算内没轮到的候选是 'unknown'（不上报、不判死）。
+    const probePromise = filterReachableEntries(probeEntries, (entry, ok) => {
+        if (!ok) probeFailed.push(entry);
+    }, claimProbeSocket);
 
-        // 探测照常跑完（≤2s 预算），结论用于批次与黑名单，与是否已抢跑无关。
-        // 探针在 filterReachableEntries 内部按 3 条滚动窗口限流，所以这里的「不通」是候选自身的结论，
-        // 不是被自己的探测并发撞配额打出来的假失败；预算内没轮到的候选是 'unknown'（不上报、不判死）。
-        const probePromise = filterReachableEntries(probeEntries, (entry, ok) => {
-            if (!ok) probeFailed.push(entry);
-        }, tryWarmDial);
-
-        // 记账挂在探测**完成**的回调里，不挂在主流程的 await 之后：预热赢了会提前 return，
-        // 但「哪些候选是真的不通」仍必须落进黑名单（否则死候选每连接都要白探一次）。
-        probePromise.then((entries) => {
-            // 例外：本批抽取的候选**全部**探测不通 —— 这是「整池集体抖动」的信号，而不是 6 个候选各自死了。
-            // 探测超时(2s)比拨号超时(5s)更严，「探测判死」本来就不等于「拨号连不上」：
-            // filterReachableEntries 会把它们原样返回继续拨号，所以此时不记退避，
-            // 免得一次集体抖动就把整池锁进黑名单（真不通的候选会在拨号超时/写首包失败时按既有逻辑记账）。
-            const allProbeFailed = probeEntries.length > 0 && probeFailed.length === probeEntries.length;
-            if (!blacklistBypass && !allProbeFailed) {
-                for (const [host, port] of probeFailed) blacklistRecord(blacklistKey(host, port));
-            }
-            log(`reachable proxy IPs: ${entries.map(([h, p]) => `${h}:${p}`).join(', ')}`);
-        }).catch(() => { /* 探测本身不抛；兜一层，别让未处理的 rejection 逃出去 */ });
-
-        // 抢跑窗口：预热先赢 / 抢跑失败 / 探测收口 —— 先到者决定下一步（后两者都落回批次循环）。
-        const probeDone = probePromise.then<null, null>(() => null, () => null);
-        let early = await Promise.race([warmOutcome, probeDone]);
-        // 探测先收口、但预热还在途 → **等它**（上限 WARM_DIAL_TIMEOUT，从它发起时算）。
-        // 不能像早先那样「收口即作废」：它已经在建连了，扔掉它再让批次从头拨一遍，
-        // 等于把抢跑白做一次（而它的剩余等待本来就不比批次的 5s 更久）。
-        if (!early && warmDialStarted) early = await warmOutcome;
-
-        if (early) {
-            try {
-                // 只有胜者写首包（与批次路径同一条铁律：一个 ArrayBuffer 只能交给 write 一次）
-                await writeFirstPacket(early.socket, rawClientData);
-                blacklistClear(blacklistKey(early.ip, early.port));
-                // 预热胜者刻意不推进 proxyIpPoolCursor：它的下标属于「探测完成后的可达集合」，
-                // 此刻该集合还没成型。影响仅是下一次连接的起点偏移（每次连接另有随机起点兜着）。
-                log(`race dial winner (warm): ${early.ip}:${early.port} (proxy: ${proxyAddr})`);
-                return { socket: early.socket, usedIp: early.ip };
-            } catch (writeError) {
-                log(`warm dial write failed for ${early.ip}:${early.port}: ${safeErrorMessage(writeError)}`);
-                blacklistRecord(blacklistKey(early.ip, early.port));
-                // 落回批次循环：该候选已被拉黑，批次里的预检会跳过它
-            }
+    // 记账挂在探测**完成**的回调里，不挂在主流程的 await 之后：接管成功会提前 return，
+    // 但「哪些候选是真的不通」仍必须落进黑名单（否则死候选每连接都要白探一次）。
+    probePromise.then((entries) => {
+        // 例外：本批抽取的候选**全部**探测不通 —— 这是「整池集体抖动」的信号，而不是 6 个候选各自死了。
+        // 探测超时(2s)比拨号超时(5s)更严，「探测判死」本来就不等于「拨号连不上」：
+        // filterReachableEntries 会把它们原样返回继续拨号，所以此时不记退避，
+        // 免得一次集体抖动就把整池锁进黑名单（真不通的候选会在拨号超时/写首包失败时按既有逻辑记账）。
+        const allProbeFailed = probeEntries.length > 0 && probeFailed.length === probeEntries.length;
+        if (!blacklistBypass && !allProbeFailed) {
+            for (const [host, port] of probeFailed) blacklistRecord(blacklistKey(host, port));
         }
+        log(`reachable proxy IPs: ${entries.map(([h, p]) => `${h}:${p}`).join(', ')}`);
+    }).catch(() => { /* 探测本身不抛；兜一层，别让未处理的 rejection 逃出去 */ });
 
-        reachableEntries = await probePromise;
+    // 接管窗口：接管到连接（已建立）/ 探测收口。接管一定早于收口发生（在探测 worker 内），
+    // 所以这里不需要「收口后再等它一会儿」—— 那一步只在更早的「另起一次拨号」实现里才需要。
+    const probeDone = probePromise.then<null, null>(() => null, () => null);
+    const claimed = await Promise.race([claimOutcome, probeDone]);
+
+    if (claimed) {
+        // 写首包/清黑名单/打点统一由 commitWinner 负责（一个 ArrayBuffer 只写一次，见该函数）
+        if (await commitWinner(claimed, rawClientData, log, proxyAddr, 'race dial winner (probe socket, no extra dial)')) {
+            return { socket: claimed.socket, usedIp: claimed.ip };
+        }
+        // 写首包失败：该候选已记账并关过 socket，落回批次循环（批次里的预检会跳过它）
     }
+
+    const reachableEntries = await probePromise;
 
     // 对齐 cfnew 取官方直连地址（每次连接随机取一个官方 IP）：
     // 每次连接随机起点，让不同连接从池中不同位置开始竞速拨号，
@@ -304,12 +280,21 @@ async function connectWithRaceDial(
             if (!blacklistBypass && blacklistCheck(key)) throw new Error('candidate blacklisted');
 
             // 先到先得闸门与黑名单记账留在本路径；建连与写首包的收口见 openCandidate / writeFirstPacket
-            const socket = await openCandidate(
-                { hostname: cleanIp, port: entryPort },
-                PROXY_DIAL_TIMEOUT,
-                fetcher,
-                { onSocket }
-            );
+            let socket: Socket;
+            try {
+                socket = await openCandidate(
+                    { hostname: cleanIp, port: entryPort },
+                    PROXY_DIAL_TIMEOUT,
+                    fetcher,
+                    { onSocket }
+                );
+            } catch (dialError) {
+                // 连不上/建连超时是这个候选自己的问题 → 记一次退避（「输掉竞速」不记：它是通了的，
+                // 见下面的 batchWinnerClaimed 分支）。openCandidate 只关闭 socket、不记账，
+                // 所以这条路径必须自己记 —— 否则死候选会被每次连接反复拨。
+                if (!blacklistBypass) blacklistRecord(key);
+                throw dialError;
+            }
 
             // B-11：晚到的候选（本批已经有人连上）自行关闭并出局
             if (batchWinnerClaimed) {
@@ -336,20 +321,10 @@ async function connectWithRaceDial(
 
         if (winner) {
             const { socket, ip: winnerIp, port: winnerPort, index } = winner;
-            try {
-                // 只有胜者写首包（每个 ArrayBuffer 只能交给 write 一次，见 openCandidate 的说明），
-                // 且必须在关闭其余候选之前写，避免连接被重置。
-                await writeFirstPacket(socket, rawClientData);
-                // 成功：清除黑名单 + 游标推进到成功候选（对齐 edgetunnel 5799-5800）
-                blacklistClear(blacklistKey(winnerIp, winnerPort));
-                proxyIpPoolCursor = index;
-                log(`race dial winner: ${winnerIp}:${winnerPort} (proxy: ${proxyAddr})`);
+            // 必须在关闭其余候选之前写首包，避免连接被重置；
+            // 成功时游标推进到该候选（对齐 edgetunnel 5799-5800），其余记账见 commitWinner
+            if (await commitWinner({ socket, ip: winnerIp, port: winnerPort }, rawClientData, log, proxyAddr, 'race dial winner', index)) {
                 return { socket, usedIp: winnerIp };
-            } catch (writeError) {
-                // 保持原语义：只有「连上了但首包写不出去」的候选才记黑名单（连不上的不算，
-                // 那由抽取阶段的可达性探测与批量回退负责）。writeFirstPacket 已关闭该 socket。
-                log(`race dial write failed for ${winnerIp}:${winnerPort}: ${safeErrorMessage(writeError)}`);
-                blacklistRecord(blacklistKey(winnerIp, winnerPort));
             }
         }
 
@@ -582,6 +557,37 @@ async function writeFirstPacket(socket: Socket, rawClientData: ArrayBuffer | und
         throw writeError;
     }
     writer.releaseLock();
+}
+
+/**
+ * 「胜者落地」的唯一实现：写首包 → 清黑名单 →（可选）推进池游标 → 打点；
+ * 失败则记一次黑名单并返回 false（socket 已由 writeFirstPacket 解锁并关闭，调用方只需决定后续）。
+ *
+ * 为什么必须收在一处：`rawClientData` 是**同一个** ArrayBuffer，write 会 detach 它 ——
+ * 「一个连接只写一次」这条铁律每多一份实现，就多一次被写错的机会（R-03 的成因正是写入被挪进候选内部）。
+ * 为什么只有失败才记账：「连上了但首包写不出去」才算这个候选的问题；连不上的由探测/批次失败负责。
+ * `cursorIndex` 省略 = 接管路径（探测即预连接）：它的下标属于「探测完成后的可达集合」，此刻还没成型，
+ * 跳过它只影响下一次连接的起点偏移（每次连接另有随机起点兜着）。
+ */
+async function commitWinner(
+    winner: { socket: Socket; ip: string; port: number },
+    rawClientData: ArrayBuffer | undefined,
+    log: Function,
+    proxyAddr: string,
+    label: string,
+    cursorIndex?: number
+): Promise<boolean> {
+    try {
+        await writeFirstPacket(winner.socket, rawClientData);
+        blacklistClear(blacklistKey(winner.ip, winner.port));
+        if (cursorIndex !== undefined) proxyIpPoolCursor = cursorIndex;
+        log(`${label}: ${winner.ip}:${winner.port} (proxy: ${proxyAddr})`);
+        return true;
+    } catch (writeError) {
+        log(`first packet write failed for ${winner.ip}:${winner.port}: ${safeErrorMessage(writeError)}`);
+        blacklistRecord(blacklistKey(winner.ip, winner.port));
+        return false;
+    }
 }
 
 /**
@@ -1192,9 +1198,8 @@ export async function handleTCPOutBound(
                 triedHops.add('official');
                 try {
                     log(`retry: attempting CF official IP pool race dial for ${originalAddress}:${originalPort}`);
-                    // skipProbe：官方池是末级兜底（清一色 CF 边缘 anycast），探测没有信息量，
-                    // 只会把这一跳的拨号再延后最多 2s —— 直接整池进批次循环。
-                    const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool, (s) => remoteSocket.track?.(s), { skipProbe: true });
+                    // 官方池不特殊化：与反代池同一条路（探测 + 接管 → 批次兜底），理由见 connectWithRaceDial 的函数头
+                    const { socket: tcpSocket, usedIp } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool, (s) => remoteSocket.track?.(s));
 
                     tcpSocket.closed
                         .catch(error => console.log('CF official pool TCP socket closed error', error))
@@ -1355,8 +1360,8 @@ export async function handleTCPOutBound(
             triedHops.add('official');
             try {
                 log(`pool-first: CF official IP pool race dial for ${originalAddress}:${originalPort}`);
-                // skipProbe：同 retry 路径 —— 官方池不探测，整池直接进批次循环
-                const { socket } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool, (s) => remoteSocket.track?.(s), { skipProbe: true });
+                // 与 retry 路径同口径：官方池不特殊化，走「探测 + 接管 → 批次兜底」
+                const { socket } = await connectWithRaceDial(originalAddress, originalPort, rawClientData, log, fetcher, officialPool, (s) => remoteSocket.track?.(s));
                 poolSocket = socket;
             } catch (officialError) {
                 log(`pool-first CF official pool failed: ${safeErrorMessage(officialError)}`);

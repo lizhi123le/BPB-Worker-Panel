@@ -30,8 +30,9 @@
  *      成功即不再拨官方直连池（官方池只留在回退阶梯的下一级）
  *  10. 探测阶段总预算 2s：慢候选（首连 1.4s）时**第二波不再发起**，整场只碰第一波 3 条
  *      （预算用尽后剩下的候选按 unknown 处理：不记退避、仍照常拨号）
- *  11. 预热拨号（探测与拨号并行）：第一条候选一被测通就立刻起拨，赢在「等整批探测收口」之前 ——
- *      日志是 `race dial winner (warm)` 且没有 `race dialing batch`
+ *  11. 探测即预连接：第一条候选一被测通，它那条**已建好的 socket** 直接接管成数据连接，首包在
+ *      「等整批探测收口」之前就发出去 —— 日志是 `race dial winner (probe socket` 且没有
+ *      `race dialing batch`；接管**不新开连接**（connect 次数 = 探测条数，峰值仍 ≤ 3）
  *
  * 前提：先构建过（`NODE_ENV=mangle node scripts/build.js`），本测试加载
  * .build/worker.reference.js（混淆前产物，行为等价且可读）。
@@ -423,29 +424,37 @@ check('大池抽出的候选都来自该池',
 
 // ── 阶段 E：不砍 IPv6（A + AAAA 都要入池、都要参与抽取与探测）
 //    回归钉：曾经有人把 AAAA 丢掉（直连池只取 ipv4），或把 v6 键用 split(':') 解析坏 —— 这里全钉住。
+//    ⚠️ 「探测即预连接」后单次连接**只会碰 1~3 个候选**（接管成功即停止发起新探测，这是省 socket 的
+//    关键），所以这里按多轮累积覆盖，而不是要求一次连接碰满 6 条。
 out(`— 阶段 E：${V6_DOMAIN} 同时发布 ${V6_A.length} 条 A + ${V6_AAAA.length} 条 AAAA，两类都要在池里并被抽到 —`);
 env.PROXY_IP = V6_DOMAIN;
 const v6runs = [];
-for (let i = 0; i < 3; i++) v6runs.push(await runConnection());
+const v6Probed = new Set();
+for (let i = 0; i < 20; i++) {
+    const r = await runConnection();
+    v6runs.push(r);
+    for (const h of r.probed) v6Probed.add(h);
+    // 6 条全部被碰过就收工；每轮 1~3 条，20 轮仍未覆盖的概率 < 1e-6
+    if (V6_A.every((ip) => v6Probed.has(ip)) && V6_AAAA.every((ip) => v6Probed.has(ip))) break;
+}
 const v6First = v6runs[0];
-const v6Probed = new Set(v6runs.flatMap((r) => [...r.probed]));
 const v6ProbedV6 = [...v6Probed].filter((h) => h.includes(':'));
 const v6ProbedV4 = [...v6Probed].filter((h) => !h.includes(':'));
 
 check(`双栈池全量入池（A ${V6_A.length} + AAAA ${V6_AAAA.length} = ${V6_A.length + V6_AAAA.length} 条）`,
     v6First.poolSize === V6_A.length + V6_AAAA.length,
     `poolSize=${v6First.poolSize} log=${v6First.drawLog}`);
-check('AAAA 候选确实进入抽取/探测（3 条 v6 都被拨到过）',
+check('AAAA 候选确实进入抽取/探测（3 条 v6 都被抽到过）',
     V6_AAAA.every((ip) => v6Probed.has(ip)),
-    `v6probed=${v6ProbedV6.sort().join(',')} 期望=${V6_AAAA.join(',')}`);
+    `v6probed=${v6ProbedV6.sort().join(',')} 期望=${V6_AAAA.join(',')} runs=${v6runs.length}`);
 check('A 候选同样被抽到（v6 不是靠挤掉 v4 才进池的）',
     V6_A.every((ip) => v6Probed.has(ip)),
-    `v4probed=${v6ProbedV4.sort().join(',')}`);
+    `v4probed=${v6ProbedV4.sort().join(',')} runs=${v6runs.length}`);
 check('抽取键未被 v6 的冒号解析坏（抽到的 host 都是完整地址，无 2001 之类的截断）',
     v6ProbedV6.every((h) => /^[0-9a-fA-F:]+$/.test(h) && h.split(':').length >= 3),
     `v6probed=${v6ProbedV6.sort().join(',')}`);
-check('v6 候选能正常完成探测并参与竞速（本次竞速有胜者）',
-    v6runs.every((r) => r.status === 101 && [...r.probed].some((h) => h.includes(':'))),
+check('v6 候选完成 TCP 探测后连接仍成功（每轮 101）',
+    v6runs.every((r) => r.status === 101),
     v6runs.map((r) => `status=${r.status} probed=${[...r.probed].join('|')}`).join(' ;; '));
 
 // ── 阶段 D：地区隔离（面板按 @地区 锚定的两条域名 + wk 指定地区）
@@ -546,25 +555,31 @@ check('默认模式 + CF 目标：连接成功返回 101',
     cfRun.status === 101,
     `status=${cfRun.status}`);
 
-// ── 阶段 H：探测总预算（2s 封顶）+ 预热拨号（约 +1.6s）──
-//    6 条候选**首次**建连都要 SLOW_MS 才成功（探测＝首次，真拨＝第二次），于是：
+// ── 阶段 H：探测总预算（2s 封顶）+ 探测即预连接（约 +1.6s）──
+//    6 条候选**首次**建连都要 SLOW_MS 才成功，于是：
 //      · 窗口 3：第一波 3 条在 1.4s 才出结论；此刻剩余预算 ≈ 0.6s < 「半个单条超时」下限(1s)
 //        → 第二波 3 条**根本不发起**（记 unknown）。所以整场只碰过 3 个 IP —— 这是预算的回归钉；
-//      · 预热拨号：第一条探测一成功（1.4s）立刻起拨，1.4s + 3ms 拿到首包 —— 日志必须是
-//        `race dial winner (warm)` 且**没有** `race dialing batch`（预热赢就不进批次循环）。
-//    旧实现会分别破这两条：无预算 → 第二波也发（碰 6 个 IP）；无预热 → 必须等探测收口才进批次。
-out(`— 阶段 H：${SLOW_POOL.length} 条慢候选（首连 ${SLOW_MS}ms）→ 探测预算封顶 + 预热拨号（约 +1.6s）—`);
+//      · 探测即预连接：第一条探测成功（1.4s）时，**它那条已建好的 socket 直接被接管**成数据连接，
+//        首包立刻写出去 —— 日志是 `race dial winner (probe socket` 且**没有** `race dialing batch`；
+//      · 关键的一条（CPU 侧的回归钉）：接管路径**不再另开连接**。整场 connect() 次数必须正好是 3
+//        （第一波探测 3 条，其中 1 条成为数据连接），而不是「3 探测 + 1 抢跑拨号」的 4。
+//    旧实现会分别破这三条：无预算 → 第二波也发（碰 6 个 IP）；另起拨号 → connect 4 次；
+//    等探测收口才拨 → 必须进批次循环。
+out(`— 阶段 H：${SLOW_POOL.length} 条慢候选（首连 ${SLOW_MS}ms）→ 探测预算封顶 + 探测即预连接（约 +1.6s）—`);
 env.PROXY_IP = SLOW_DOMAIN;
 dohIps = SLOW_POOL;
 const slow = await runConnection('?qj=only', TARGET, SLOW_MS + 400);
 check('慢候选：第二波探测被预算拦住（整场只碰过第一波的 3 条）',
     slow.probed.size > 0 && slow.probed.size <= 3,
     `probed=${[...slow.probed].join(',')} dialed=${slow.dialed.join(' | ')}`);
-check('慢候选：预热拨号赢下首包，且没有进批次循环',
-    slow.logs.some((l) => l.includes('race dial winner (warm)'))
+check('慢候选：接管探测 socket 摘下首包，且没有进批次循环',
+    slow.logs.some((l) => l.includes('race dial winner (probe socket'))
     && !slow.logs.some((l) => l.includes('race dialing batch')),
     `logs=${slow.logs.filter((l) => l.includes('race dial') || l.includes('reachable')).join(' | ')}`);
-check('慢候选：首包在「一次慢建连」之内到达（预热没有白等探测预算）',
+check('慢候选：接管后不再多建连（connect 次数 = 3，没有额外的并行拨号）',
+    slow.dialed.length === 3,
+    `dialed=${slow.dialed.join(' | ')}`);
+check('慢候选：首包在「一次慢建连」之内到达（接管没有白等探测预算）',
     slow.firstPacketAt !== null && slow.firstPacketAt < SLOW_MS + 300,
     `firstPacketAt=${slow.firstPacketAt}ms expect<${SLOW_MS + 300}`);
 check('慢候选：连接成功返回 101',
@@ -573,11 +588,11 @@ check('慢候选：连接成功返回 101',
 
 // ── 并发总账（整场，含慢候选阶段）──
 //    这条是「探测窗口限流」的兜底：任何一条路径退回到「一次性全发」（大池 6 条、v6 池 6 条），
-//    峰值都会立刻超过 4 —— 运行时对单请求的并发连接有配额，撞上就是假失败 + 误判退避。
-//    4 = 探测窗口 3（PROBE_CONCURRENCY）+ 预热拨号 1（探测期间抢的那一条）。
+//    峰值都会立刻超过 3 —— 运行时对单请求的并发连接有配额，撞上就是假失败 + 误判退避。
+//    「探测即预连接」把峰值从「窗口 3 + 抢跑 1 = 4」压回 **3**：接管的是探测自己那条，不新开连接。
 //    放在最后统一判：maxInFlight 是全程累加的峰值，分散在多处断言只会重复同一条上界。
-check('全流程（含慢候选阶段）同时在飞的 socket 峰值 ≤ 4（窗口 3 + 预热 1；一次性全发会立刻破 4）',
-    maxInFlight <= 4 && maxInFlight > 0,
+check('全流程（含慢候选阶段）同时在飞的 socket 峰值 ≤ 3（窗口 3；接管不新开连接）',
+    maxInFlight <= 3 && maxInFlight > 0,
     `maxInFlight=${maxInFlight}`);
 
 for (const level of ['log', 'info', 'warn', 'error', 'debug']) console[level] = originalConsole[level];

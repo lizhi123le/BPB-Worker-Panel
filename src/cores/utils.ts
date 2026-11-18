@@ -1685,7 +1685,7 @@ const PROBE_TIMEOUT = 2000;
  * 见 getConfigItems 的说明 —— 那是刻意接受的边界，不是这里的疏漏）。这条误判链从根上断掉了，
  * 不需要在「哪些失败该退避」上做区分。
  * 回归钉：tools/proxy-pool-draw.test.mjs 钉两条 —— 事件序列开头连续 3 个 start（窗口宽度）、
- * 全程在飞峰值 ≤ 4（窗口 3 + 反代池探测期间抢跑的那 1 条预热拨号；回到「一次性全发」立刻变 6）。
+ * 全程在飞峰值 ≤ 3（接管的是探测自己那条 socket，不新开连接；回到「一次性全发」立刻变 6）。
  */
 const PROBE_CONCURRENCY = 3;
 
@@ -1702,11 +1702,8 @@ const PROBE_CONCURRENCY = 3;
  * unknown 的语义是**「没有结论」**，既不算通也不算不通：
  *   - **不**记黑名单 —— 那正是「假失败连锁误杀好候选」要防的事；
  *   - 仍留在拨号集合里 —— 与 connectWithRaceDial 的 allProbeFailed 同一取向（连通性优先）。
- *
- * 导出（而不仅是模块内常量）：WS 侧的 `WARM_DIAL_TIMEOUT` 直接取本值 —— 「预热拨号的抢跑窗口」
- * 与「它要抢在谁之前的探测预算」在语义上就应该是同一个数，写两处字面量迟早悄悄分叉。
  */
-export const PROBE_PHASE_BUDGET_MS = 2000;
+const PROBE_PHASE_BUDGET_MS = 2000;
 
 /**
  * 剩余预算低于它就不再发起新探测：只跑得满「半个单条超时」的探测拿不到可信结论 ——
@@ -1749,16 +1746,24 @@ async function mapWithConcurrency<T, R>(
  * 避免两个调用点各写一套「预算 / 单条超时 / unknown 判据」而口径分叉。
  * 预算用尽后剩下的项一律 'unknown'（**不发起**连接，零 socket、零定时器）。
  * 单条超时取 min(PROBE_TIMEOUT, 剩余预算)：最后一批也必须在预算内收口，否则预算形同虚设。
+ *
+ * `shouldStop`：调用方已经拿到可用连接（探测即预连接）后由它返回 true —— 剩下的候选既不必再
+ * 证明什么，也不该再开 socket，于是统一记 'unknown'（不判死、不进黑名单）。
  */
 async function probeWithinBudget<T>(
     items: T[],
-    probe: (item: T, timeoutMs: number) => Promise<boolean>
+    probe: (item: T, timeoutMs: number) => Promise<boolean>,
+    shouldStop?: () => boolean
 ): Promise<Array<{ item: T; verdict: ProbeVerdict }>> {
     const deadline = Date.now() + PROBE_PHASE_BUDGET_MS;
     return await mapWithConcurrency(items, PROBE_CONCURRENCY, async (item): Promise<{ item: T; verdict: ProbeVerdict }> => {
-        const remaining = deadline - Date.now();
-        if (remaining < PROBE_MIN_LAUNCH_MS) return { item, verdict: 'unknown' };
-        const ok = await probe(item, Math.min(PROBE_TIMEOUT, remaining));
+        // 两种「不发起」都记 'unknown'（不判死、不进黑名单）：
+        //   ① 调用方已接管了一条连接 → 剩下的候选不必再证明什么；
+        //   ② 剩余预算跑不满半个单条超时 → 失败也只能是超时假象。
+        if (shouldStop?.() || deadline - Date.now() < PROBE_MIN_LAUNCH_MS) {
+            return { item, verdict: 'unknown' };
+        }
+        const ok = await probe(item, Math.min(PROBE_TIMEOUT, deadline - Date.now()));
         return { item, verdict: ok };
     });
 }
@@ -1782,11 +1787,16 @@ function dialableFrom<T>(
  * **模块私有**：唯一驱动方是 probeWithinBudget（预算 / 窗口 / 结论口径都在那里）。
  * 不导出、也不给参数默认值 —— 导出去只会诱使别处再写一套「自己算超时、自己判失败」的探测，
  * 把 unknown / 黑名单的口径分叉掉；默认超时则等于悄悄替调用方决定一个预算之外的等待。
+ *
+ * `handover`：连上的**那一刻**把这条已建立的 socket 交给调用方（探测即预连接）。
+ * 返回 true = 调用方接管，本函数不再关闭它。这是「探测即预连接」的实现：不重复建连，
+ * 不重复建连，探测用的连接直接变成数据连接。
  */
 async function probeIPReachability(
     hostname: string,
     port: number,
-    timeoutMs: number
+    timeoutMs: number,
+    handover?: (socket: Socket) => boolean
 ): Promise<boolean> {
     let socket: Socket | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1802,6 +1812,12 @@ async function probeIPReachability(
                 (timer as unknown as { unref?: () => void }).unref?.();
             }),
         ]);
+        if (handover) {
+            // 交接失败（调用方已经有一条、或自身抛错）就当普通探测处理：照旧关闭，结论仍是「可达」
+            let taken = false;
+            try { taken = handover(createdSocket) === true; } catch { taken = false; }
+            if (taken) socket = null;   // 所有权已转移，finally 不能再关
+        }
         return true;
     } catch {
         return false;
@@ -1831,22 +1847,32 @@ export async function filterReachableIPs(
 /** 对 [host, port] 条目数组做**预算内滚动窗口**探测（每项用自身端口），返回拨号可用条目子集（保序）。
  *  onProbe 可选回调：把每条候选的**可信**探测结论交给调用方 —— 反代池用它把「探测不通」的候选
  *  记进临时黑名单（指数退避），避免同一个死候选每连接都白等满一次探测超时。
- *  'unknown'（预算内没轮到）**不上报**：记成失败就是误杀好候选。
- *  onReachable 可选回调：某条候选**一被测通就立刻**回调（不等整批收口）—— 调用方用它抢跑拨号，
- *  把「等最慢那条探测」的等待从关键路径上摘掉。它可能比本函数的 Promise 更早触发。
+ *  'unknown'（预算内没轮到 / 已接管后未发起）**不上报**：记成失败就是误杀好候选。
+ *  onReachable 可选回调：某条候选**一被测通就立刻**把它那条**已建好的 socket** 交给调用方
+ *  （返回 true = 接管，本函数不再关闭它）。这是「探测即预连接」的唯一钩子：调用方拿到的是
+ *  一条现成的连接，不必另拨 —— 比「先探测、再单独拨一次」少一次建连、少一个定时器。
+ *  它比本函数的 Promise 更早触发；接管成功后剩余候选不再发起探测（记 'unknown'）。
  *  探针本身按 PROBE_CONCURRENCY 限流，所以这里的失败是候选自身的结论，不是并发配额打出来的。 */
 export async function filterReachableEntries(
     entries: [string, number][],
     onProbe?: (entry: [string, number], ok: boolean) => void,
-    onReachable?: (entry: [string, number]) => void
+    onReachable?: (entry: [string, number], socket: Socket) => boolean
 ): Promise<[string, number][]> {
+    /** 是否已有候选被接管（只交第一条：调用方只需要一条连接，多接管等于多占一条） */
+    let claimed = false;
     const outcomes = await probeWithinBudget(entries, async (entry, timeoutMs) => {
-        // 直接把 entry 透传给 onReachable：不要再拼一个 [ip, port]（同一份数据第二次分配）
-        const ok = await probeIPReachability(entry[0].replace(/^\[|\]$/g, ''), entry[1], timeoutMs);
-        // 合格即刻上报（不等本批收口）：这是「探测与拨号并行」的唯一触发点
-        if (ok) onReachable?.(entry);
+        const ok = await probeIPReachability(
+            entry[0].replace(/^\[|\]$/g, ''), entry[1], timeoutMs,
+            onReachable
+                ? (socket) => {
+                    if (claimed) return false;
+                    claimed = onReachable(entry, socket);
+                    return claimed;
+                }
+                : undefined
+        );
         return ok;
-    });
+    }, () => claimed);
     for (const { item, verdict } of outcomes) {
         if (verdict !== 'unknown') onProbe?.(item, verdict);
     }
