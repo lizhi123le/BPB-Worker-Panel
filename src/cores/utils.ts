@@ -574,13 +574,13 @@ const CF_DOH = 'https://cloudflare-dns.com/dns-query';
 //   实测 `https://dns.google/dns-query?name=ipv6.test-ipv6.com&type=AAAA` 恒返回 HTTP 400，响应体是
 //   HTML（"RFC8484 handler at /dns-query received parameter 'name', which it does not accept.
 //   Did you intend to pass the 'dns' parameter, or call the JSON handler at /resolve"），
-//   于是本文件 fetchDNSRecords 里 response.json() 直接抛错 → dualSourceResolve 的 allSettled 把该源
+//   于是本文件 dohJsonQuery 里 response.json() 直接抛错 → dohAnswersDual 的 allSettled 把该源
 //   判为 rejected，**第二源从未生效**（dohQueryRaw 的 `.william` TXT 兜底同理，一直是死代码）。
-//   但 dualSourceResolve 是「先 CF 后 Google，取第一个非空」，而 CF_DOH 这个 JSON DoH 端点本身可用
+//   但 dohAnswersDual 是「先 CF 后 Google，取第一个非空」，而 CF_DOH 这个 JSON DoH 端点本身可用
 //   （Cloudflare 官方文档的 dns-json 用法），所以生产上 A/AAAA 一直由 CF 提供：本改动只是**补回
 //   冗余**（CF DoH 取不到 / 被墙时还有 AAAA 来源），IPv6 症状的根因在
 //   protocols/websocket/common.ts#connectWithDirectRaceDial 丢掉 AAAA。
-//   代价（须知）：dualSourceResolve 用 Promise.allSettled 会等**两个源都返回**，改前死源是快速 400
+//   代价（须知）：dohAnswersDual 用 Promise.allSettled 会等**两个源都返回**，改前死源是快速 400
 //   失败，改后若某机房到 dns.google 不通，每个记录类型最多多等一次 AbortSignal.timeout(10s)；
 //   该源是必要的冗余，但若想彻底零风险可只保留 CF 单源。
 //   正确值与 cfnew 一致（cfnew L193 `https://dns.google/resolve`）。
@@ -588,68 +588,35 @@ const CF_DOH = 'https://cloudflare-dns.com/dns-query';
 //   → {"Status":0,...,"Answer":[{"type":28,"data":"2400:8905::2000:6bff:fe22:d426"}]}，字段形状与 CF 一致。
 const GOOGLE_DOH = 'https://dns.google/resolve';
 
-// ── DoH 结果缓存（两条：解析结果 / 原始记录）──
+// ── DoH 结果缓存（**唯一一份**：原始 Answer）──
 // 为什么要有：一次请求里同一个域名会被解析**多次** —— 订阅生成先由 getConfigItems 解析节点域名，
 // sing-box 的 DNS 构建（resolveNodeIPs）再解析一次同一个域名；目标分类（isCloudflareTarget）
-// 与直连竞速（resolveTargetDNS）也各要一次。没有缓存时这些是多次真实 DoH 往返，
-// 而单次 DoH 的上限是 AbortSignal.timeout(10s) —— 重复解析会把 DNS 阶段的耗时上界成倍放大。
-// TTL 口径与原 resolveTargetDNS 相同（有结果 10 分钟、空结果 30 秒），空结果给短 TTL 是为了
-// 上游「刚发布记录」时能快速恢复。
-// ⚠️ 三个期限常量是**唯一来源**，同时供两处缓存使用：
-//    · _dnsCache（本处）：缓存「域名 → ipv4/ipv6」的解析结果；
-//    · _dohResultCache（下方 dohQueryCached）：缓存「域名+记录类型 → 原始 Answer」，反代池解析用。
-//    两处原先各写一份 10min/30s/200 的字面量，改一处忘一处就会让两个缓存的口径悄悄分叉。
+// 与直连竞速（resolveTargetDNS）也各要一次；反代池解析（A/AAAA/TXT）同样走 DoH。
+// 没有缓存时这些是多次真实往返，而单次 DoH 的上限是 AbortSignal.timeout(10s) ——
+// 重复解析会把 DNS 阶段的耗时上界成倍放大。
+//
+// 为什么只存**原始 Answer**、且只留一份：两个消费方要的形状不同 ——
+//   · resolveDNS 要「按记录类型过滤后的 v4/v6 字符串」（下面 answersToRecords 投影）；
+//   · 反代池要整份 Answer（CNAME 过滤、TXT 前缀展开、类型判断都在它那边做）。
+// 原先各存一个 Map（解析结果 / 原始记录），同一域名在两处各打一轮 DoH，两套空结果 TTL 还得
+// 各自维护；现在只缓存上游应答本身，形状差异由调用点投影 ——
+// 顺带让「反代池域名」与「目标域名」偶发相同时也只解析一次。
+//
+// TTL：有结果 10 分钟、空结果 30 秒（空结果给短 TTL 是为了上游「刚发布记录」时能快速恢复）。
 const DOH_CACHE_TTL = 10 * 60 * 1000;   // 有结果 10min
 const DOH_CACHE_EMPTY_TTL = 30 * 1000;  // 空结果 30s
 const DOH_CACHE_MAX = 200;
-const _dnsCache = new Map<string, { ipv4: string[]; ipv6: string[]; time: number; empty: boolean }>();
+const _dohAnswerCache = new Map<string, { answers: any[]; time: number; empty: boolean }>();
 
-export async function resolveDNS(domain: string, onlyIPv4 = false): Promise<DnsResult> {
-    // 键含 onlyIPv4：只查 A 与查 A+AAAA 的结果形状不同，不能互相顶替
-    const cacheKey = `${domain.toLowerCase()}|${onlyIPv4 ? 'a' : 'a+aaaa'}`;
-    const cached = _dnsCache.get(cacheKey);
-    if (cached && Date.now() - cached.time < (cached.empty ? DOH_CACHE_EMPTY_TTL : DOH_CACHE_TTL)) {
-        _dnsCache.delete(cacheKey);   // 命中即刷新 LRU 顺序
-        _dnsCache.set(cacheKey, cached);
-        // 返回**副本**：调用方会拿这两个数组做过滤 / 拼接 / 原地操作，缓存不能被共享出去改坏
-        return { ipv4: [...cached.ipv4], ipv6: [...cached.ipv6] };
-    }
-    if (cached) _dnsCache.delete(cacheKey);
-
-    const cfBase = `${CF_DOH}?name=${encodeURIComponent(domain)}`;
-    const googleBase = `${GOOGLE_DOH}?name=${encodeURIComponent(domain)}`;
-
-    try {
-        const ipv4 = await dualSourceResolve(cfBase, googleBase, 'A', 1);
-        const ipv6 = onlyIPv4 ? [] : await dualSourceResolve(cfBase, googleBase, 'AAAA', 28);
-        // 只缓存**成功**结果：抛错路径不写缓存，故障不会被固化 10 分钟
-        _dnsCache.set(cacheKey, {
-            ipv4: [...ipv4],
-            ipv6: [...ipv6],
-            time: Date.now(),
-            empty: ipv4.length === 0 && ipv6.length === 0,
-        });
-        if (_dnsCache.size > DOH_CACHE_MAX) evictOldest(_dnsCache, DOH_CACHE_MAX);
-        return { ipv4, ipv6 };
-    } catch (error) {
-        throw new Error(`Error resolving DNS for ${domain}: ${safeErrorMessage(error)}`);
-    }
-}
-
-/**
- * 并发双源查询，取第一个「成功且非空」的结果；两个源都失败或都为空则返回 []。
- * 语义要点（改动前两份实现逐字相同，合并后仍是同一套）：用 allSettled 等**两个源都结束**，
- * 而不是 Promise.any 提前返回 —— 慢源只在真的没有更快结果时才被等待。
- */
-async function firstNonEmptyResult<T>(promises: Promise<T[]>[]): Promise<T[]> {
-    const results = await Promise.allSettled(promises);
-    const first = results.find(r => r.status === 'fulfilled' && r.value.length > 0);
-    return first?.status === 'fulfilled' ? first.value : [];
-}
+/** 查询类型 → Answer 里的数字记录类型。只用于判「这一种记录确实没有」——
+ *  注意**不能**用 `answers.length === 0` 代替：A 应答里常带 CNAME（type 5），此时
+ *  「应答非空但没有 A」与「上游暂时答不出来」必须区分开，否则后者会被当成有结果缓存 10 分钟，
+ *  与「空结果只缓存 30s、让上游刚发布的记录能快速生效」的口径冲突。 */
+const DNS_TYPE_CODE: Record<string, number> = { A: 1, AAAA: 28, TXT: 16 };
 
 /**
  * 单源 JSON DoH 取数（RFC 8484 的 /resolve 风格：accept: application/dns-json）。
- * 失败**一律抛错**：吞错还是上抛由调用方决定（resolveDNS 路径上抛、代理池路径吞成 []）。
+ * 失败**一律抛错**：吞错还是上抛由调用方决定（dohQueryRaw 吞成 []）。
  */
 async function dohJsonQuery(url: string): Promise<any[]> {
     const response = await fetch(url, {
@@ -660,25 +627,85 @@ async function dohJsonQuery(url: string): Promise<any[]> {
     return data.Answer || [];
 }
 
-/** Query Cloudflare + Google in parallel, return result data[] from first with results (对齐 edgetunnel 9958-9976) */
-async function dualSourceResolve(cfBase: string, googleBase: string, typeName: string, recordType: number): Promise<string[]> {
+/**
+ * 并发双源查询，取第一个「成功且非空」的结果；两个源都失败或都为空则返回 []。
+ * 用 allSettled 等**两个源都结束**，而不是 Promise.any 提前返回 —— 慢源只在真的没有更快结果时才被等待。
+ */
+async function firstNonEmptyResult<T>(promises: Promise<T[]>[]): Promise<T[]> {
+    const results = await Promise.allSettled(promises);
+    const first = results.find(r => r.status === 'fulfilled' && r.value.length > 0);
+    return first?.status === 'fulfilled' ? first.value : [];
+}
+
+/** 单源原始 Answer（吞错返回 []）。保留「裸单源」语义的唯一理由：`.william` TXT 的 Google 兜底。 */
+async function dohQueryRaw(domain: string, type: string, dohUrl: string): Promise<any[]> {
+    try {
+        return await dohJsonQuery(`${dohUrl}?name=${encodeURIComponent(domain)}&type=${type}`);
+    } catch {
+        return [];
+    }
+}
+
+/** 双源原始 Answer（CF ‖ Google，取第一个非空；两源都失败/都空 → []）。**DoH 的唯一出站口**。 */
+async function dohAnswersDual(domain: string, type: string): Promise<any[]> {
     return await firstNonEmptyResult([
-        fetchDNSRecords(`${cfBase}&type=${typeName}`, recordType),
-        fetchDNSRecords(`${googleBase}&type=${typeName}`, recordType),
+        dohQueryRaw(domain, type, CF_DOH),
+        dohQueryRaw(domain, type, GOOGLE_DOH),
     ]);
 }
 
-export async function fetchDNSRecords(url: string, recordType: number): Promise<string[]> {
-    try {
-        const answer = await dohJsonQuery(url);
-
-        return answer
-            .filter((record: any) => record.type === recordType)
-            .map((record: any) => record.data);
-
-    } catch (error) {
-        throw new Error(`Failed to fetch DNS records from ${url}: ${safeErrorMessage(error)}`);
+/**
+ * 带缓存的原始 Answer：`resolveDNS`（节点/目标域名）与反代池解析（A/AAAA/TXT）共用。
+ * 键含查询类型（A 与 AAAA 的应答形状不同，不能互相顶替）；域名统一小写（DNS 名大小写不敏感，
+ * 否则同一域名换种写法就多存一份）。命中即刷新 LRU 顺序。
+ */
+async function dohAnswersCached(domain: string, type: string): Promise<any[]> {
+    const cacheKey = `${domain.toLowerCase()}|${type}`;
+    const cached = _dohAnswerCache.get(cacheKey);
+    const effectiveTTL = cached?.empty ? DOH_CACHE_EMPTY_TTL : DOH_CACHE_TTL;
+    if (cached && Date.now() - cached.time < effectiveTTL) {
+        _dohAnswerCache.delete(cacheKey);   // 命中即刷新 LRU 顺序
+        _dohAnswerCache.set(cacheKey, cached);
+        return cached.answers;
     }
+    if (cached) _dohAnswerCache.delete(cacheKey);
+
+    const answers = await dohAnswersDual(domain, type);
+    // 「空」按**查询类型**判（只带 CNAME 的 A 应答也算空），空结果只留 30s（见 DNS_TYPE_CODE）
+    const empty = answersToRecords(answers, DNS_TYPE_CODE[type] ?? -1).length === 0;
+    _dohAnswerCache.set(cacheKey, { answers, time: Date.now(), empty });
+
+    // 先按绝对 TTL 清过期项，再按 LRU 兜住容量（与反代池缓存同一套）
+    if (_dohAnswerCache.size > DOH_CACHE_MAX) {
+        const now = Date.now();
+        for (const [key, value] of _dohAnswerCache) {
+            if (now - value.time >= DOH_CACHE_TTL) _dohAnswerCache.delete(key);
+        }
+        evictOldest(_dohAnswerCache, DOH_CACHE_MAX);
+    }
+
+    return answers;
+}
+
+/** Answer → 指定记录类型的字符串列表（CNAME / 无关记录一律丢弃，口径与旧的 fetchDNSRecords 一致） */
+function answersToRecords(answers: any[], recordType: number): string[] {
+    return answers
+        .filter((record: any) => record.type === recordType)
+        .map((record: any) => record.data);
+}
+
+/**
+ * 解析域名的 A / AAAA（`onlyIPv4` 时只查 A）。
+ *
+ * 两个源都不通时返回**空结果**而不是抛错：这条路径上的调用方本来就按「解析不出来」处理
+ * （prefix 模式缺 IPv4、直连池空池都各自给精确错误），空结果也只在缓存里停留 30 秒；
+ * 原先那层 `throw new Error('Error resolving DNS …')` 从未真正触发过（双源查询把所有拒绝
+ * 都吞成 []），留着只会让调用方误以为这里会抛。
+ */
+export async function resolveDNS(domain: string, onlyIPv4 = false): Promise<DnsResult> {
+    const ipv4 = answersToRecords(await dohAnswersCached(domain, 'A'), DNS_TYPE_CODE.A);
+    const ipv6 = onlyIPv4 ? [] : answersToRecords(await dohAnswersCached(domain, 'AAAA'), DNS_TYPE_CODE.AAAA);
+    return { ipv4, ipv6 };
 }
 
 export function getProtocols() {
@@ -1752,11 +1779,17 @@ function dialableFrom<T>(
     return dialable.length > 0 ? dialable : fallback;
 }
 
-/** 对单个 IP:port 做 TCP 连接探测，返回是否可达 */
-export async function probeIPReachability(
+/**
+ * 对单个 IP:port 做 TCP 连接探测，返回是否可达。
+ *
+ * **模块私有**：唯一驱动方是 probeWithinBudget（预算 / 窗口 / 结论口径都在那里）。
+ * 不导出、也不给参数默认值 —— 导出去只会诱使别处再写一套「自己算超时、自己判失败」的探测，
+ * 把 unknown / 黑名单的口径分叉掉；默认超时则等于悄悄替调用方决定一个预算之外的等待。
+ */
+async function probeIPReachability(
     hostname: string,
-    port: number = 443,
-    timeoutMs: number = PROBE_TIMEOUT
+    port: number,
+    timeoutMs: number
 ): Promise<boolean> {
     let socket: Socket | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1821,53 +1854,6 @@ export async function filterReachableEntries(
         if (verdict !== 'unknown') onProbe?.(item, verdict);
     }
     return dialableFrom(outcomes, entries);
-}
-
-// ── DoH query with dual-source + cache (for proxy pool resolution, 对齐 edgetunnel 9958-9993) ──
-
-/** Low-level DoH query returning raw answer records (no cache). 吞错返回 []（与 resolveDNS 路径的上抛语义不同，刻意保留） */
-async function dohQueryRaw(domain: string, type: string, dohUrl = CF_DOH): Promise<any[]> {
-    try {
-        return await dohJsonQuery(`${dohUrl}?name=${encodeURIComponent(domain)}&type=${type}`);
-    } catch {
-        return [];
-    }
-}
-
-/** Dual-source DoH query: parallel Cloudflare + Google, return raw records from first with results. */
-async function dohQueryDual(domain: string, type: string): Promise<any[]> {
-    return await firstNonEmptyResult([
-        dohQueryRaw(domain, type, CF_DOH),
-        dohQueryRaw(domain, type, GOOGLE_DOH),
-    ]);
-}
-
-// DoH result cache for proxy pool resolution（原始 Answer；期限常量与 _dnsCache 共用上方的 DOH_CACHE_*）
-const _dohResultCache = new Map<string, { result: any[]; time: number; empty: boolean }>();
-
-/** DoH query with dual-source + cache (对齐 edgetunnel doh解析缓存 9949-9993) */
-async function dohQueryCached(domain: string, type: string): Promise<any[]> {
-    const cacheKey = `${domain}|${type}`;
-    const cached = _dohResultCache.get(cacheKey);
-    const effectiveTTL = cached?.empty ? DOH_CACHE_EMPTY_TTL : DOH_CACHE_TTL;
-    if (cached && Date.now() - cached.time < effectiveTTL) {
-        return cached.result;
-    }
-
-    const records = await dohQueryDual(domain, type);
-
-    _dohResultCache.set(cacheKey, { result: records, time: Date.now(), empty: records.length === 0 });
-
-    // Evict expired + cap size (对齐 edgetunnel 9984-9993)
-    if (_dohResultCache.size > DOH_CACHE_MAX) {
-        const now = Date.now();
-        for (const [key, value] of _dohResultCache) {
-            if (now - value.time >= DOH_CACHE_TTL) _dohResultCache.delete(key);
-        }
-        evictOldest(_dohResultCache, DOH_CACHE_MAX);
-    }
-
-    return records;
 }
 
 // ── Proxy IP pool resolution cache (对齐 edgetunnel 缓存反代IP 9896) ──
@@ -2084,7 +2070,8 @@ async function resolveProxyPoolUncached(
         if (entry.includes('.william')) {
             // .william domain: DoH TXT query to expand prefix list (对齐 edgetunnel 9918-9935)
             try {
-                let txtRecords = await dohQueryCached(entry, 'TXT');
+                // 与 resolveDNS 共用同一份 Answer 缓存（键含查询类型，TXT 与 A/AAAA 互不覆盖）
+                let txtRecords = await dohAnswersCached(entry, 'TXT');
                 let txtData = txtRecords.filter((r: any) => r.type === 16).map((r: any) => r.data as string);
                 if (txtData.length === 0) {
                     // Fallback to Google DoH
@@ -2118,8 +2105,8 @@ async function resolveProxyPoolUncached(
 
             if (!ipv4Regex.test(host) && !ipv6Regex.test(host)) {
                 const [aRecords, aaaaRecords] = await Promise.all([
-                    dohQueryCached(host, 'A'),
-                    dohQueryCached(host, 'AAAA'),
+                    dohAnswersCached(host, 'A'),
+                    dohAnswersCached(host, 'AAAA'),
                 ]);
                 const ipv4s = aRecords.filter((r: any) => r.type === 1).map((r: any) => r.data as string);
                 const ipv6s = aaaaRecords.filter((r: any) => r.type === 28).map((r: any) => `[${r.data}]`);
