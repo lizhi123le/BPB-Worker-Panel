@@ -1,7 +1,6 @@
-import { safeErrorMessage, createSessionWatchdog, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
+import { envNumber, safeErrorMessage, createSessionWatchdog, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
 import {
     envConnectionLimit,
-    envNumber,
     handleTCPOutBound,
     runWsCleanupHooks,
     safeCloseTcpSocket,

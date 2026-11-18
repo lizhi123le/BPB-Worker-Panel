@@ -28,11 +28,12 @@
  *      （回归钉：防止以后有人把 v6 候选过滤掉，或用 `split(':')` 之类把 v6 键解析坏）
  *   9. 指定地区 + 默认模式 + CF 目标：反代池（含内置兜底）应该是池首跳的**第一优先**，
  *      成功即不再拨官方直连池（官方池只留在回退阶梯的下一级）
- *  10. 探测阶段总预算 2s：慢候选（首连 1.4s）时**第二波不再发起**，整场只碰第一波 3 条
- *      （预算用尽后剩下的候选按 unknown 处理：不记退避、仍照常拨号）
- *  11. 探测即预连接：第一条候选一被测通，它那条**已建好的 socket** 直接接管成数据连接，首包在
+ *  10. 探测即预连接：第一条候选一被测通，它那条**已建好的 socket** 直接接管成数据连接，首包在
  *      「等整批探测收口」之前就发出去 —— 日志是 `race dial winner (probe socket` 且没有
  *      `race dialing batch`；接管**不新开连接**（connect 次数 = 探测条数，峰值仍 ≤ 3）
+ *  11. 探测总预算的 env 覆盖（`PROBE_PHASE_BUDGET_MS`）：默认 2000ms；设成低于下限 1000ms 的值
+ *      会被钳到 1000ms 并告警 —— 此时慢候选（首连 1.4s）第一波全部探测超时判死、没有可接管对象，
+ *      必须退回批次循环仍能连通（预算用尽/跳过的候选按 unknown 处理：不记退避、仍照常拨号）
  *
  * 前提：先构建过（`NODE_ENV=mangle node scripts/build.js`），本测试加载
  * .build/worker.reference.js（混淆前产物，行为等价且可读）。
@@ -166,7 +167,9 @@ let firstPacketWritesThisConnection = [];
 let eventsThisConnection = [];
 /** 当前在飞的 socket 数与其峰值。运行时对单请求的并发连接有配额（约 6 条），
  *  这条峰值就是「会不会撞配额」的直接度量：探测 3 + 竞速 3 各自独立成峰，永远不该超过 3。
- *  ⚠️ 名额在 `opened` 有结论时归还，所以它假设桩里的 socket 最终都会 settle（当前全部如此）。 */
+ *  ⚠️ 名额在 `opened` **有结论**时归还，而「有结论」包含 `close()`：探测超时后探针会主动关掉
+ *  那条半开连接（真实运行时 `opened` 随之 reject），桩必须一样处理，否则已关掉的 socket 会被
+ *  继续算在飞 —— 阶段 I（预算收紧 → 探测全部超时 → 立刻改走批次）就会假性冲到 6。 */
 let inFlight = 0;
 let maxInFlight = 0;
 /** 本次连接内每个 host 被建连的次数（阶段 H 用：第 1 次＝探测，之后＝真拨） */
@@ -184,6 +187,13 @@ globalThis.connect = ({ hostname, port }) => {
     let resolveOpened;
     let rejectOpened;
     const opened = new Promise((res, rej) => { resolveOpened = res; rejectOpened = rej; });
+    /** `opened` 只允许出结论一次：连上 / 失败 / 被 close() 打断，三者取先到者 */
+    let openedSettled = false;
+    const settleOpened = (error) => {
+        if (openedSettled) return;
+        openedSettled = true;
+        if (error) rejectOpened(error); else resolveOpened();
+    };
     // 这一个 then 同时承担「记 settle 事件 + 归还在飞名额 + 处理 rejection」三件事，
     // 所以不再需要额外的 opened.catch(() => {})（它原先只用来防未处理的 rejection）。
     const onSettled = () => {
@@ -202,16 +212,17 @@ globalThis.connect = ({ hostname, port }) => {
                 // 记录每次写入的字节量（断言「胜者恰好写一次且字节完整」用）
                 writeRecord.writes++;
                 writeRecord.bytes.push(chunk?.byteLength ?? 0);
-                // 首包落地时刻（相对本次连接开始）：阶段 H 用它量「探测预算 + 预热拨号」的真实延迟
+                // 首包落地时刻（相对本次连接开始）：阶段 H 用它量「探测即预连接」的真实延迟
                 if (writeRecord.at === null) writeRecord.at = Date.now() - connectionStartedAt;
             }
         }),
-        close() {}
+        // 关闭 = 这条连接不再在飞（真实运行时 `opened` 会 reject）
+        close() { settleOpened(new Error('closed before open')); }
     };
-    if (FAILING.has(hostname)) rejectOpened(new Error('ECONNREFUSED'));
+    if (FAILING.has(hostname)) settleOpened(new Error('ECONNREFUSED'));
     // 慢候选：**首次**建连（探测）慢，之后的建连（预热/批次真拨）立即成功
-    else if (SLOW.has(hostname) && attempt === 1) setTimeout(resolveOpened, SLOW_MS);
-    else setTimeout(resolveOpened, 3);
+    else if (SLOW.has(hostname) && attempt === 1) setTimeout(() => settleOpened(), SLOW_MS);
+    else setTimeout(() => settleOpened(), 3);
     return socket;
 };
 
@@ -555,21 +566,21 @@ check('默认模式 + CF 目标：连接成功返回 101',
     cfRun.status === 101,
     `status=${cfRun.status}`);
 
-// ── 阶段 H：探测总预算（2s 封顶）+ 探测即预连接（约 +1.6s）──
+// ── 阶段 H：探测即预连接（约 +1.6s）──
 //    6 条候选**首次**建连都要 SLOW_MS 才成功，于是：
-//      · 窗口 3：第一波 3 条在 1.4s 才出结论；此刻剩余预算 ≈ 0.6s < 「半个单条超时」下限(1s)
-//        → 第二波 3 条**根本不发起**（记 unknown）。所以整场只碰过 3 个 IP —— 这是预算的回归钉；
-//      · 探测即预连接：第一条探测成功（1.4s）时，**它那条已建好的 socket 直接被接管**成数据连接，
-//        首包立刻写出去 —— 日志是 `race dial winner (probe socket` 且**没有** `race dialing batch`；
+//      · 窗口 3：第一波 3 条在 1.4s 出结论；**第一条成功的瞬间被接管** → 剩余候选不再发起探测
+//        （`shouldStop` 记 unknown），所以整场只碰过 3 个 IP；
+//      · 接管：那条已建好的 socket 直接变成数据连接，首包立刻写出去 —— 日志是
+//        `race dial winner (probe socket` 且**没有** `race dialing batch`；
 //      · 关键的一条（CPU 侧的回归钉）：接管路径**不再另开连接**。整场 connect() 次数必须正好是 3
 //        （第一波探测 3 条，其中 1 条成为数据连接），而不是「3 探测 + 1 抢跑拨号」的 4。
-//    旧实现会分别破这三条：无预算 → 第二波也发（碰 6 个 IP）；另起拨号 → connect 4 次；
-//    等探测收口才拨 → 必须进批次循环。
-out(`— 阶段 H：${SLOW_POOL.length} 条慢候选（首连 ${SLOW_MS}ms）→ 探测预算封顶 + 探测即预连接（约 +1.6s）—`);
+//    ⚠️ 这一阶段不再依赖预算：拦住第二波的是「已接管」，不是剩余预算（旧注释写错过一次）。
+//       预算本身由阶段 I 用 env 单独钉。
+out(`— 阶段 H：${SLOW_POOL.length} 条慢候选（首连 ${SLOW_MS}ms）→ 探测即预连接（约 +1.6s）—`);
 env.PROXY_IP = SLOW_DOMAIN;
 dohIps = SLOW_POOL;
 const slow = await runConnection('?qj=only', TARGET, SLOW_MS + 400);
-check('慢候选：第二波探测被预算拦住（整场只碰过第一波的 3 条）',
+check('慢候选：接管后不再碰剩余候选（整场只碰过第一波的 3 条）',
     slow.probed.size > 0 && slow.probed.size <= 3,
     `probed=${[...slow.probed].join(',')} dialed=${slow.dialed.join(' | ')}`);
 check('慢候选：接管探测 socket 摘下首包，且没有进批次循环',
@@ -585,6 +596,28 @@ check('慢候选：首包在「一次慢建连」之内到达（接管没有白�
 check('慢候选：连接成功返回 101',
     slow.status === 101,
     `status=${slow.status}`);
+
+// ── 阶段 I：探测总预算的 env 覆盖（约 +2.8s）──
+//    同一批慢候选（首连 1.4s），把 `PROBE_PHASE_BUDGET_MS` 设成 500（低于下限 1000）：
+//      · env 真的被读到 → 打一条「低于下限 → 按 1000ms 生效」的告警；
+//      · 生效预算 1000ms < 慢候选的 1.4s → 第一波探测**全部超时判死**，没有候选可接管
+//        （日志里不该出现 `race dial winner (probe socket`）；
+//      · 于是必须走批次循环，由第二次建连（立即成功）连上 → 101 + `race dialing batch`。
+//    这一对（阶段 H 默认 2s → 接管 / 阶段 I 收紧 → 批次）就是预算开关的回归钉。
+out('— 阶段 I：PROBE_PHASE_BUDGET_MS=500（钳到 1000ms）→ 探测判死、改走批次（约 +2.8s）—');
+env.PROBE_PHASE_BUDGET_MS = '500';
+// 等待 = 探测超时(1s) + 批次里那几条候选的**首次**建连（桩里同样是 SLOW_MS）
+const tight = await runConnection('?qj=only', TARGET, SLOW_MS * 2);
+delete env.PROBE_PHASE_BUDGET_MS;
+check('预算 env：非法/过低值被钳到下限并打一条告警',
+    tight.logs.some((l) => l.includes('[探针预算]') && l.includes('按 1000ms 生效')),
+    `logs=${tight.logs.filter((l) => l.includes('探针预算')).join(' | ')}`);
+check('预算 env：收紧后没有候选被接管（探测全部判死）',
+    !tight.logs.some((l) => l.includes('race dial winner (probe socket')),
+    `logs=${tight.logs.filter((l) => l.includes('race dial')).join(' | ')}`);
+check('预算 env：收紧后改走批次循环并连通',
+    tight.logs.some((l) => l.includes('race dialing batch')) && tight.status === 101,
+    `status=${tight.status} logs=${tight.logs.filter((l) => l.includes('race dial')).join(' | ')}`);
 
 // ── 并发总账（整场，含慢候选阶段）──
 //    这条是「探测窗口限流」的兜底：任何一条路径退回到「一次性全发」（大池 6 条、v6 池 6 条），

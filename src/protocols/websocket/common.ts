@@ -1,5 +1,5 @@
 import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes, isBareIPv4 } from '@utils';
-import { evictOldest, safeErrorMessage, randomUserAgent, base64EncodeUtf8, createSessionWatchdog, createSignatureGate, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
+import { evictOldest, safeErrorMessage, randomUserAgent, base64EncodeUtf8, createSessionWatchdog, createSignatureGate, envNumber, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
 // 核心修复：原写法 `export const connectSocket = getConnect()` 在模块加载期立即执行，
@@ -28,7 +28,7 @@ const RACE_DIAL_MAX_BATCHES = 5; // 最大重试批次
 /**
  * 每连接从缓存池抽取参与可达性探测的候选数（抽取在探测前、按黑名单过滤后进行）。
  * 探测本身由 filterReachableEntries 按 3 条**滚动窗口**限流（见 utils 的 PROBE_CONCURRENCY），
- * 而**整批耗时由 PROBE_PHASE_BUDGET_MS 封顶在 2s**（预算内没轮到的候选按 unknown 处理：
+ * 而**整批耗时默认封顶 2s**（env `PROBE_PHASE_BUDGET_MS` 可覆盖；预算内没轮到的候选按 unknown 处理：
  * 不记退避、照常拨号）—— 所以这个数不是并发连接数，也不是延迟上界，只是「一次能考几个候选」。
  * 同时必须满足 RACE_PROBE_COUNT ≤ RACE_DIAL_MAX_BATCHES × RACE_DIAL_CONCURRENCY
  * （6 ≤ 15）：一旦抽取数超过批次窗口，尾部候选永远排不进批次（结构性饥饿，白抽 + 白探测）。
@@ -1600,27 +1600,6 @@ export function envConnectionLimit(name: string, fallback: number): { raw: numbe
     const raw = envNumber(name, fallback);
     const value = Math.min(CONNECTION_LIMIT_CEILING, Math.max(CONNECTION_LIMIT_FLOOR, Math.floor(raw)));
     return { raw, value };
-}
-
-/**
- * 从 env 读数值。语义（顺序即判据）：
- *   - **未设 / 空串** → `fallback`；
- *   - 非数字、负数 → `fallback`（fail-closed：设错了不能静默变成"无上限"或"全关"）；
- *   - **显式 0** → `zeroMeansOff` 时返回 0（关闭），否则仍是 `fallback`；
- *   - 正数 → 原值。
- *
- * 为什么必须区分「未设」与「显式 0」：默认值一旦不是 0（如下行速率、会话预算），
- * `?? 0` 的写法会把"没设"也当成 0 —— 默认值就永远不生效（本仓库踩过这个坑）。
- * 同时保留显式 0 = 关闭，否则"改默认值"等于"永久失去回滚开关"。
- * 三处（会话字节预算、下行速率、上行 isolate 预算）共用这一份实现。
- */
-export function envNumber(name: string, fallback: number, zeroMeansOff = false): number {
-    const value = (globalThis as any).env?.[name];
-    if (value === undefined || value === null || value === '') return fallback;
-    const raw = Number(value);
-    if (!Number.isFinite(raw) || raw < 0) return fallback;
-    if (raw === 0) return zeroMeansOff ? 0 : fallback;
-    return raw;
 }
 
 // --- Uint8Array helpers (aligned with cfnew 处理值值8数组 / 拼接值8数组) ---

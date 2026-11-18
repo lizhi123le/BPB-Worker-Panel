@@ -1,4 +1,4 @@
-import { evictOldest, safeErrorMessage, crossRequestSingleFlight } from "@common";
+import { evictOldest, safeErrorMessage, crossRequestSingleFlight, createSignatureGate, envNumber } from "@common";
 import { PUBLIC_PATH_POOL } from "../common/ratelimit";
 
 // ── H6：跨部署硬编码常量的 env 覆盖入口 ──
@@ -833,7 +833,7 @@ export async function getConfigItems(isFragment: boolean): Promise<ConfigItem[]>
     // 对 DNS 解析出的 IP 做可达性探测，过滤不可达地址（两族并行：探测内部各自按 3 条滚动窗口
     // 限流，所以两族同时跑时峰值是 2 × 3 = 6 —— 与运行时「单请求并发出站连接」配额同量级，
     // 属于刻意接受的边界：订阅生成是低频的人机交互，优先让两族同时出结果，而不是把耗时翻倍。
-    // 每条 filter 调用另有 PROBE_PHASE_BUDGET_MS(2s) 总预算：主机名解析出的 IP 多于窗口时，
+    // 每条 filter 调用另有探针总预算（默认 2s，env `PROBE_PHASE_BUDGET_MS` 可覆盖）：主机名解析出的 IP 多于窗口时，
     // 超出预算的候选按 'unknown' 保留（不判死），所以这里不会因为「没测完」而少给 IP。
     // 空数组不需要三元 + `Promise.resolve([] as string[])` 那种类型兼容写法：filterReachableIPs
     // 对空输入本来就返回 []（不发起任何连接），直接传进去语义等价。
@@ -1672,7 +1672,7 @@ export function stripRegionTag(entry: string): string {
  * 所以「探测判死」不等于「拨号一定连不上」：这正是 connectWithRaceDial 里 allProbeFailed 例外
  * （全部探测失败时不记退避、照常拨号）存在的原因。
  * 反面代价：黑洞候选在第一次遇到时要白等满 2 秒，之后进黑名单退避。
- * 整批耗时不靠「n × 本值」推导 —— 它由下方的 PROBE_PHASE_BUDGET_MS 封顶。
+ * 整批耗时不靠「n × 本值」推导 —— 它由下方 probePhaseBudgetMs() 封顶（默认 2s，env 可覆盖）。
  */
 const PROBE_TIMEOUT = 2000;
 /**
@@ -1690,26 +1690,49 @@ const PROBE_TIMEOUT = 2000;
 const PROBE_CONCURRENCY = 3;
 
 /**
- * 探测阶段的**总预算**（毫秒）：整批探测最多占这么久。
+ * 剩余预算低于它就不再发起新探测：只跑得满「半个单条超时」的探测拿不到可信结论 ——
+ * 发起它既要白开一个 socket，判死时还会把好候选记进 30s 起指数退避的黑名单（误判链见下）。
+ * 它同时是 env `PROBE_PHASE_BUDGET_MS` 的**下限**（见 probePhaseBudgetMs）。
+ */
+const PROBE_MIN_LAUNCH_MS = PROBE_TIMEOUT / 2;
+
+/**
+ * 探测阶段的**总预算默认值**（毫秒）：整批探测最多占这么久。
  *
  * 与 PROBE_TIMEOUT 分工不同：单条超时决定「一个候选多久判死」，总预算决定「整批最多占用多久」。
- * 为什么必须有总预算：这段耗时**整段落在首包之前**（竞速拨号要等探测结束才开始），而滚动窗口
- * 的天然上界是 ceil(n / PROBE_CONCURRENCY) × PROBE_TIMEOUT —— 反代池 n = 6、窗口 3 → 两波 = 4s，
+ * 为什么必须有总预算：这段耗时**整段落在首包之前**，而滚动窗口的天然上界是
+ * ceil(n / PROBE_CONCURRENCY) × PROBE_TIMEOUT —— 反代池 n = 6、窗口 3 → 两波 = 4s，
  * 比「一次性全发」（8 条一波 = 2s）把最坏建连时延整整拉长一倍。预算取 2000 = 一波满窗：
  *   - 候选够快（常态）：两波都在预算内跑完，逐条结论与「不限预算」完全一致；
- *   - 第一波全黑洞：第二波拿不到预算 → 那几条按 unknown 处理，拨号照常立刻开始。
+ *   - 第一波全黑洞：第二波拿不到预算 → 那几条按 unknown 处理。
  *
  * unknown 的语义是**「没有结论」**，既不算通也不算不通：
  *   - **不**记黑名单 —— 那正是「假失败连锁误杀好候选」要防的事；
  *   - 仍留在拨号集合里 —— 与 connectWithRaceDial 的 allProbeFailed 同一取向（连通性优先）。
+ *
+ * env `PROBE_PHASE_BUDGET_MS` 可覆盖（口径与仓库其它旋钮一致）：
+ *   · 未设 / 空串 / 非数字 / 负数 → 用本默认值（fail-closed：写错不会静默变成「不限」）；
+ *   · **显式 0 → 不限预算**，回到「只受滚动窗口约束」的旧行为（回滚开关）；
+ *   · 正值 → 生效，但钳到 ≥ PROBE_MIN_LAUNCH_MS —— 比它还小的预算会让每次探测都只能记
+ *     'unknown'，等于把探测静默关掉；真要不探测请显式用 0。
+ * 每个探测相位读一次（不缓存）：env 按请求注入，灰度/测试切换都靠它。
  */
-const PROBE_PHASE_BUDGET_MS = 2000;
+const PROBE_PHASE_BUDGET_DEFAULT_MS = 2000;
 
-/**
- * 剩余预算低于它就不再发起新探测：只跑得满「半个单条超时」的探测拿不到可信结论 ——
- * 发起它既要白开一个 socket，判死时还会把好候选记进 30s 起指数退避的黑名单（误判链见上）。
- */
-const PROBE_MIN_LAUNCH_MS = PROBE_TIMEOUT / 2;
+/** 「env 值被钳制」只在一个取值上打一条 warn（与仓库其它 env 旋钮同口径） */
+const probeBudgetGate = createSignatureGate();
+
+/** 探针总预算的生效值（毫秒；Infinity = 不限）。env 口径见 PROBE_PHASE_BUDGET_DEFAULT_MS 的注释。 */
+function probePhaseBudgetMs(): number {
+    // 解析「未设 vs 显式 0」的判据统一在 @common#envNumber（zeroMeansOff = 显式 0 单独返回 0）
+    const value = envNumber('PROBE_PHASE_BUDGET_MS', PROBE_PHASE_BUDGET_DEFAULT_MS, true);
+    if (value === 0) return Number.POSITIVE_INFINITY;
+    if (value >= PROBE_MIN_LAUNCH_MS) return value;
+    if (probeBudgetGate.isNew(String(value))) {
+        console.warn(`[探针预算] PROBE_PHASE_BUDGET_MS=${value} 低于下限 ${PROBE_MIN_LAUNCH_MS}ms，按 ${PROBE_MIN_LAUNCH_MS}ms 生效（显式 0 = 不限）`);
+    }
+    return PROBE_MIN_LAUNCH_MS;
+}
 
 /** 单条探测的结论：true / false 是可信结论，'unknown' = 预算内没轮到它（未发起、零 socket） */
 type ProbeVerdict = boolean | 'unknown';
@@ -1718,7 +1741,7 @@ type ProbeVerdict = boolean | 'unknown';
  *  刻意不用「分块 Promise.all」：滚动窗口下快候选不必等慢候选那一整批结束
  *  （6 条里 4 条 3ms 通、2 条黑洞时，分块模式要等满一个探测超时才能开始第二批）。
  *  ⚠️ 滚动窗口本身**不封顶**总耗时（最坏是 ceil(n/3) × PROBE_TIMEOUT，6 条 = 两波 = 4s）。
- *  这个上界由调用方 probeWithinBudget 的 PROBE_PHASE_BUDGET_MS 直接压到 2s ——
+ *  这个上界由调用方 probeWithinBudget 的探针预算（默认 2s，env 可覆盖）压住 ——
  *  所以这里的并发度只决定「一批里能并行几条」，不再决定「整批能拖多久」。 */
 async function mapWithConcurrency<T, R>(
     items: T[],
@@ -1749,13 +1772,16 @@ async function mapWithConcurrency<T, R>(
  *
  * `shouldStop`：调用方已经拿到可用连接（探测即预连接）后由它返回 true —— 剩下的候选既不必再
  * 证明什么，也不该再开 socket，于是统一记 'unknown'（不判死、不进黑名单）。
+ *
+ * 预算是**每次调用现读**的（env `PROBE_PHASE_BUDGET_MS`，默认 2000ms，显式 0 = 不限）。
  */
 async function probeWithinBudget<T>(
     items: T[],
     probe: (item: T, timeoutMs: number) => Promise<boolean>,
     shouldStop?: () => boolean
 ): Promise<Array<{ item: T; verdict: ProbeVerdict }>> {
-    const deadline = Date.now() + PROBE_PHASE_BUDGET_MS;
+    // Infinity（显式 0）时 deadline 恒为 Infinity，下面的两个判断自然退化成「永不拦截」
+    const deadline = Date.now() + probePhaseBudgetMs();
     return await mapWithConcurrency(items, PROBE_CONCURRENCY, async (item): Promise<{ item: T; verdict: ProbeVerdict }> => {
         // 两种「不发起」都记 'unknown'（不判死、不进黑名单）：
         //   ① 调用方已接管了一条连接 → 剩下的候选不必再证明什么；

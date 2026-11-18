@@ -149,6 +149,30 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, label = '操作'
  */
 export const KV_READ_TIMEOUT_MS = 3000;
 
+/**
+ * 从 env 读数值。**全仓唯一实现**（WS 下行/会话/突发、XHTTP 旋钮、探针总预算都走它）。
+ * 语义（顺序即判据）：
+ *   - **未设 / 空串** → `fallback`；
+ *   - 非数字、负数 → `fallback`（fail-closed：设错了不能静默变成"无上限"或"全关"）；
+ *   - **显式 0** → `zeroMeansOff` 时返回 0（关闭/回滚），否则仍是 `fallback`；
+ *   - 正数 → 原值。
+ *
+ * 为什么必须区分「未设」与「显式 0」：默认值一旦不是 0（如下行速率、会话预算），
+ * `?? 0` 的写法会把"没设"也当成 0 —— 默认值就永远不生效（本仓库踩过这个坑）。
+ * 同时保留显式 0 = 关闭，否则"改默认值"等于"永久失去回滚开关"。
+ *
+ * 放在本模块（叶子模块、无 import）而不是某个协议文件里：`cores/utils` 与
+ * `protocols/websocket/common` 都要用它，谁都不是对方的依赖方向，只有这里两边都拿得到。
+ */
+export function envNumber(name: string, fallback: number, zeroMeansOff = false): number {
+    const value = (globalThis as any).env?.[name];
+    if (value === undefined || value === null || value === '') return fallback;
+    const raw = Number(value);
+    if (!Number.isFinite(raw) || raw < 0) return fallback;
+    if (raw === 0) return zeroMeansOff ? 0 : fallback;
+    return raw;
+}
+
 /** fetch with an overall timeout; falls back to AbortSignal.timeout when available. */
 export async function fetchWithTimeout(
     url: string | URL,
