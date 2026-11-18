@@ -6,7 +6,7 @@
  *
  * 为什么需要它：这套逻辑全在 WS 内部（resolveProxyIPPool + connectWithRaceDial），smoke 用例
  * 连不了真 TCP，所以这里用「早期数据」把合法 VLESS 首包喂进 write()，并用
- *   globalThis.connect  → 可编程的 TCP 桩（按 IP 决定 connect 立即失败还是 3ms 成功）
+ *   globalThis.connect  → 可编程的 TCP 桩（按 IP 决定 connect 立即失败 / 3ms 成功 / 首次建连慢 SLOW_MS）
  *   globalThis.fetch    → DoH 桩（按查询域名 + 查询类型返回对应的 A / AAAA 记录集合）
  * 把真实连接路径跑起来；env.PROXY_IP（或 KV proxyIPs）+ `?qj=only`（仅走代理）让首跳必然是反代池竞速。
  *
@@ -28,6 +28,10 @@
  *      （回归钉：防止以后有人把 v6 候选过滤掉，或用 `split(':')` 之类把 v6 键解析坏）
  *   9. 指定地区 + 默认模式 + CF 目标：反代池（含内置兜底）应该是池首跳的**第一优先**，
  *      成功即不再拨官方直连池（官方池只留在回退阶梯的下一级）
+ *  10. 探测阶段总预算 2s：慢候选（首连 1.4s）时**第二波不再发起**，整场只碰第一波 3 条
+ *      （预算用尽后剩下的候选按 unknown 处理：不记退避、仍照常拨号）
+ *  11. 预热拨号（探测与拨号并行）：第一条候选一被测通就立刻起拨，赢在「等整批探测收口」之前 ——
+ *      日志是 `race dial winner (warm)` 且没有 `race dialing batch`
  *
  * 前提：先构建过（`NODE_ENV=mangle node scripts/build.js`），本测试加载
  * .build/worker.reference.js（混淆前产物，行为等价且可读）。
@@ -60,6 +64,12 @@ const SG_POOL = Array.from({ length: 12 }, (_, i) => `10.50.0.${i + 1}`);
 // 双栈池：同一域名同时发布 A 与 AAAA，用来钉「AAAA 以 [v6] 入池并同等参与抽取/探测」
 const V6_A = ['10.60.0.1', '10.60.0.2', '10.60.0.3'];
 const V6_AAAA = ['2001:db8::1', '2001:db8::2', '2001:db8::3'];
+// 慢候选池（阶段 H）：**首次**建连要 SLOW_MS 才成功（＝可达性探测那一次），之后的建连立即成功。
+// 这样「等探测」与「真拨」两段耗时可以分开断言，不会被单一时延混在一起。
+const SLOW_DOMAIN = 'slow-pool.example.net';
+const SLOW_MS = 1400;
+const SLOW_POOL = Array.from({ length: 6 }, (_, i) => `10.70.0.${i + 1}`);
+const SLOW = new Set(SLOW_POOL);
 const BLACKLIST_BASE_TTL_MS = 30 * 1000; // IP_BLACKLIST_TTL：等过它才能验证「回池」
 const CONN_WAIT_MS = 300;                // 每次连接后等它的探测/拨号跑完
 
@@ -158,10 +168,16 @@ let eventsThisConnection = [];
  *  ⚠️ 名额在 `opened` 有结论时归还，所以它假设桩里的 socket 最终都会 settle（当前全部如此）。 */
 let inFlight = 0;
 let maxInFlight = 0;
+/** 本次连接内每个 host 被建连的次数（阶段 H 用：第 1 次＝探测，之后＝真拨） */
+let attemptsThisConnection = new Map();
+/** 本次连接开始的时刻（`firstPacketAt` 的零点） */
+let connectionStartedAt = 0;
 globalThis.connect = ({ hostname, port }) => {
     dialedThisConnection.push(`${hostname}:${port}`);
     dialedHostsThisConnection.push(hostname);
     eventsThisConnection.push('start');
+    const attempt = (attemptsThisConnection.get(hostname) || 0) + 1;
+    attemptsThisConnection.set(hostname, attempt);
     inFlight++;
     if (inFlight > maxInFlight) maxInFlight = inFlight;
     let resolveOpened;
@@ -174,7 +190,7 @@ globalThis.connect = ({ hostname, port }) => {
         inFlight--;
     };
     opened.then(onSettled, onSettled);
-    const writeRecord = { host: hostname, writes: 0, bytes: [] };
+    const writeRecord = { host: hostname, writes: 0, bytes: [], at: null };
     firstPacketWritesThisConnection.push(writeRecord);
     const socket = {
         opened,
@@ -185,11 +201,15 @@ globalThis.connect = ({ hostname, port }) => {
                 // 记录每次写入的字节量（断言「胜者恰好写一次且字节完整」用）
                 writeRecord.writes++;
                 writeRecord.bytes.push(chunk?.byteLength ?? 0);
+                // 首包落地时刻（相对本次连接开始）：阶段 H 用它量「探测预算 + 预热拨号」的真实延迟
+                if (writeRecord.at === null) writeRecord.at = Date.now() - connectionStartedAt;
             }
         }),
         close() {}
     };
     if (FAILING.has(hostname)) rejectOpened(new Error('ECONNREFUSED'));
+    // 慢候选：**首次**建连（探测）慢，之后的建连（预热/批次真拨）立即成功
+    else if (SLOW.has(hostname) && attempt === 1) setTimeout(resolveOpened, SLOW_MS);
     else setTimeout(resolveOpened, 3);
     return socket;
 };
@@ -203,6 +223,8 @@ function dohRecordsFor(name) {
     if (n.includes('kr-pool')) return { a: KR_POOL, aaaa: [] };
     if (n.includes('sg-pool')) return { a: SG_POOL, aaaa: [] };
     if (n.includes('v6-pool')) return { a: V6_A, aaaa: V6_AAAA };
+    // 阶段 H：6 条慢候选（首次建连 SLOW_MS）
+    if (n.includes('slow-pool')) return { a: SLOW_POOL, aaaa: [] };
     // 目标识别测试：解析到 Cloudflare 网段（104.16.0.0/13），首跳应走池
     if (n.includes('cf-target')) return { a: ['104.16.0.1'], aaaa: [] };
     return { a: dohIps, aaaa: [] };
@@ -248,12 +270,15 @@ const env = {
 const PACKET = vlessDomainPacket(TARGET, 443, PACKET_PAYLOAD);
 
 /** 发一次 WS 升级，等首包处理跑完，返回本次观测。
- *  target 默认是 TARGET；验证目标识别（CF 网段）时传 CF_TARGET。 */
-async function runConnection(query = '?qj=only', target = TARGET) {
+ *  target 默认是 TARGET；验证目标识别（CF 网段）时传 CF_TARGET。
+ *  waitMs：等待后台探测/拨号的时长（默认为「快候选」够用的 300ms；慢候选阶段要传更长的值）。 */
+async function runConnection(query = '?qj=only', target = TARGET, waitMs = CONN_WAIT_MS) {
     dialedThisConnection = [];
     dialedHostsThisConnection = [];
     firstPacketWritesThisConnection = [];
     eventsThisConnection = [];
+    attemptsThisConnection = new Map();
+    connectionStartedAt = Date.now();
     logs.length = 0;
     const packet = target === TARGET ? PACKET : vlessDomainPacket(target, 443, PACKET_PAYLOAD);
     const earlyData = Buffer.from(packet).toString('base64url');
@@ -265,7 +290,7 @@ async function runConnection(query = '?qj=only', target = TARGET) {
         }
     });
     const response = await handler.fetch(request, env, ctx);
-    await new Promise((r) => setTimeout(r, CONN_WAIT_MS));
+    await new Promise((r) => setTimeout(r, waitMs));
     // 断言集合用裸 hostname：IPv6 地址自带冒号，不能再按 ':' 切分
     const probed = new Set(dialedHostsThisConnection);
     const drawLog = logs.find((l) => /got \d+ IPs for proxy .* drawing \d+/.test(l)) || '';
@@ -289,6 +314,10 @@ async function runConnection(query = '?qj=only', target = TARGET) {
         leadingStarts,
         /** 首包字节数（应等于剥离 VLESS 头后的载荷长度，绝不是 0） */
         firstPacketBytes: wroteOnce.length ? wroteOnce[0].bytes[0] : null,
+        /** 首包落地时刻（ms，相对本次连接开始）；没有写入时为 null */
+        firstPacketAt: wroteOnce.length ? wroteOnce[0].at : null,
+        /** 本次连接产生的日志快照（下一个 runConnection 会清空全局 logs） */
+        logs: [...logs],
     };
 }
 
@@ -495,13 +524,6 @@ check('默认模式 + CF 目标：拨号候选来自反代池解析结果（不�
     cfRun.probed.size > 0 && [...cfRun.probed].every((ip) => BIG_POOL.includes(ip)),
     `probed=${[...cfRun.probed].join(',')}`);
 
-// ── 并发总账：整场（14 条池 / 50 条大池 / 双栈 / 地区池 / CF 目标）都算上，在飞峰值不得超 3 ──
-//    这条是「探测窗口限流」的兜底：任何一条路径退回到「一次性全发」（大池 6 条、v6 池 6 条），
-//    峰值都会立刻超过 3 —— 运行时对单请求的并发连接有配额，撞上就是假失败 + 误判退避。
-check('全流程同时在飞的 socket 峰值 ≤ 3（没有哪条路径偷偷恢复成一次性全发）',
-    maxInFlight <= 3 && maxInFlight > 0,
-    `maxInFlight=${maxInFlight}`);
-
 // ── 首包写入总账（R-03 回归的守卫）──
 // 竞速时同一批候选共享**同一个** ArrayBuffer：只要「每个候选各写一次」，就会有多个 socket
 // 收到同一份首包（write 语义上是 transfer，真正该拿到的胜者可能反而写出 0 字节）→
@@ -523,6 +545,40 @@ check('CF 目标：没有 0 字节的首包写入（共享缓冲区未被多写�
 check('默认模式 + CF 目标：连接成功返回 101',
     cfRun.status === 101,
     `status=${cfRun.status}`);
+
+// ── 阶段 H：探测总预算（2s 封顶）+ 预热拨号（约 +1.6s）──
+//    6 条候选**首次**建连都要 SLOW_MS 才成功（探测＝首次，真拨＝第二次），于是：
+//      · 窗口 3：第一波 3 条在 1.4s 才出结论；此刻剩余预算 ≈ 0.6s < 「半个单条超时」下限(1s)
+//        → 第二波 3 条**根本不发起**（记 unknown）。所以整场只碰过 3 个 IP —— 这是预算的回归钉；
+//      · 预热拨号：第一条探测一成功（1.4s）立刻起拨，1.4s + 3ms 拿到首包 —— 日志必须是
+//        `race dial winner (warm)` 且**没有** `race dialing batch`（预热赢就不进批次循环）。
+//    旧实现会分别破这两条：无预算 → 第二波也发（碰 6 个 IP）；无预热 → 必须等探测收口才进批次。
+out(`— 阶段 H：${SLOW_POOL.length} 条慢候选（首连 ${SLOW_MS}ms）→ 探测预算封顶 + 预热拨号（约 +1.6s）—`);
+env.PROXY_IP = SLOW_DOMAIN;
+dohIps = SLOW_POOL;
+const slow = await runConnection('?qj=only', TARGET, SLOW_MS + 400);
+check('慢候选：第二波探测被预算拦住（整场只碰过第一波的 3 条）',
+    slow.probed.size > 0 && slow.probed.size <= 3,
+    `probed=${[...slow.probed].join(',')} dialed=${slow.dialed.join(' | ')}`);
+check('慢候选：预热拨号赢下首包，且没有进批次循环',
+    slow.logs.some((l) => l.includes('race dial winner (warm)'))
+    && !slow.logs.some((l) => l.includes('race dialing batch')),
+    `logs=${slow.logs.filter((l) => l.includes('race dial') || l.includes('reachable')).join(' | ')}`);
+check('慢候选：首包在「一次慢建连」之内到达（预热没有白等探测预算）',
+    slow.firstPacketAt !== null && slow.firstPacketAt < SLOW_MS + 300,
+    `firstPacketAt=${slow.firstPacketAt}ms expect<${SLOW_MS + 300}`);
+check('慢候选：连接成功返回 101',
+    slow.status === 101,
+    `status=${slow.status}`);
+
+// ── 并发总账（整场，含慢候选阶段）──
+//    这条是「探测窗口限流」的兜底：任何一条路径退回到「一次性全发」（大池 6 条、v6 池 6 条），
+//    峰值都会立刻超过 4 —— 运行时对单请求的并发连接有配额，撞上就是假失败 + 误判退避。
+//    4 = 探测窗口 3（PROBE_CONCURRENCY）+ 预热拨号 1（探测期间抢的那一条）。
+//    放在最后统一判：maxInFlight 是全程累加的峰值，分散在多处断言只会重复同一条上界。
+check('全流程（含慢候选阶段）同时在飞的 socket 峰值 ≤ 4（窗口 3 + 预热 1；一次性全发会立刻破 4）',
+    maxInFlight <= 4 && maxInFlight > 0,
+    `maxInFlight=${maxInFlight}`);
 
 for (const level of ['log', 'info', 'warn', 'error', 'debug']) console[level] = originalConsole[level];
 

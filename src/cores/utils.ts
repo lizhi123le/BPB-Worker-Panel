@@ -809,6 +809,8 @@ export async function getConfigItems(isFragment: boolean): Promise<ConfigItem[]>
     // 对 DNS 解析出的 IP 做可达性探测，过滤不可达地址（两族并行：探测内部各自按 3 条滚动窗口
     // 限流，所以两族同时跑时峰值是 2 × 3 = 6 —— 与运行时「单请求并发出站连接」配额同量级，
     // 属于刻意接受的边界：订阅生成是低频的人机交互，优先让两族同时出结果，而不是把耗时翻倍。
+    // 每条 filter 调用另有 PROBE_PHASE_BUDGET_MS(2s) 总预算：主机名解析出的 IP 多于窗口时，
+    // 超出预算的候选按 'unknown' 保留（不判死），所以这里不会因为「没测完」而少给 IP。
     // 空数组不需要三元 + `Promise.resolve([] as string[])` 那种类型兼容写法：filterReachableIPs
     // 对空输入本来就返回 []（不发起任何连接），直接传进去语义等价。
     const [reachableIPv4, reachableIPv6] = await Promise.all([
@@ -1645,8 +1647,8 @@ export function stripRegionTag(entry: string): string {
  * 比竞速拨号的 PROXY_DIAL_TIMEOUT(5s) **更严** —— 探测只负责筛掉明显不可达的候选，
  * 所以「探测判死」不等于「拨号一定连不上」：这正是 connectWithRaceDial 里 allProbeFailed 例外
  * （全部探测失败时不记退避、照常拨号）存在的原因。
- * 反面代价：黑洞候选在第一次遇到时要白等满 2 秒，之后进黑名单退避；
- * 探测阶段的耗时上界 = ceil(n / PROBE_CONCURRENCY) × 2s（反代池 n = 6 → 两波 = 4s）。
+ * 反面代价：黑洞候选在第一次遇到时要白等满 2 秒，之后进黑名单退避。
+ * 整批耗时不靠「n × 本值」推导 —— 它由下方的 PROBE_PHASE_BUDGET_MS 封顶。
  */
 const PROBE_TIMEOUT = 2000;
 /**
@@ -1659,16 +1661,44 @@ const PROBE_TIMEOUT = 2000;
  * 见 getConfigItems 的说明 —— 那是刻意接受的边界，不是这里的疏漏）。这条误判链从根上断掉了，
  * 不需要在「哪些失败该退避」上做区分。
  * 回归钉：tools/proxy-pool-draw.test.mjs 钉两条 —— 事件序列开头连续 3 个 start（窗口宽度）、
- * 全程在飞峰值 ≤ 3（任一处理路径退回「一次性全发」立刻变 6）。
+ * 全程在飞峰值 ≤ 4（窗口 3 + 反代池探测期间抢跑的那 1 条预热拨号；回到「一次性全发」立刻变 6）。
  */
 const PROBE_CONCURRENCY = 3;
+
+/**
+ * 探测阶段的**总预算**（毫秒）：整批探测最多占这么久。
+ *
+ * 与 PROBE_TIMEOUT 分工不同：单条超时决定「一个候选多久判死」，总预算决定「整批最多占用多久」。
+ * 为什么必须有总预算：这段耗时**整段落在首包之前**（竞速拨号要等探测结束才开始），而滚动窗口
+ * 的天然上界是 ceil(n / PROBE_CONCURRENCY) × PROBE_TIMEOUT —— 反代池 n = 6、窗口 3 → 两波 = 4s，
+ * 比「一次性全发」（8 条一波 = 2s）把最坏建连时延整整拉长一倍。预算取 2000 = 一波满窗：
+ *   - 候选够快（常态）：两波都在预算内跑完，逐条结论与「不限预算」完全一致；
+ *   - 第一波全黑洞：第二波拿不到预算 → 那几条按 unknown 处理，拨号照常立刻开始。
+ *
+ * unknown 的语义是**「没有结论」**，既不算通也不算不通：
+ *   - **不**记黑名单 —— 那正是「假失败连锁误杀好候选」要防的事；
+ *   - 仍留在拨号集合里 —— 与 connectWithRaceDial 的 allProbeFailed 同一取向（连通性优先）。
+ *
+ * 导出（而不仅是模块内常量）：WS 侧的 `WARM_DIAL_TIMEOUT` 直接取本值 —— 「预热拨号的抢跑窗口」
+ * 与「它要抢在谁之前的探测预算」在语义上就应该是同一个数，写两处字面量迟早悄悄分叉。
+ */
+export const PROBE_PHASE_BUDGET_MS = 2000;
+
+/**
+ * 剩余预算低于它就不再发起新探测：只跑得满「半个单条超时」的探测拿不到可信结论 ——
+ * 发起它既要白开一个 socket，判死时还会把好候选记进 30s 起指数退避的黑名单（误判链见上）。
+ */
+const PROBE_MIN_LAUNCH_MS = PROBE_TIMEOUT / 2;
+
+/** 单条探测的结论：true / false 是可信结论，'unknown' = 预算内没轮到它（未发起、零 socket） */
+type ProbeVerdict = boolean | 'unknown';
 
 /** 滚动窗口并发 map：最多 `concurrency` 条同时在飞，任何一条 settle 立刻补位。
  *  刻意不用「分块 Promise.all」：滚动窗口下快候选不必等慢候选那一整批结束
  *  （6 条里 4 条 3ms 通、2 条黑洞时，分块模式要等满一个探测超时才能开始第二批）。
- *  代价是「全黑洞」最坏耗时变成 ceil(n/3) × PROBE_TIMEOUT（6 条 = 两波 = 4s，
- *  旧的一次性并发是一波 = 2s）—— 但黑名单恢复后，黑洞候选只在第一次遇到时付这笔账，
- *  之后就从抽取集合隐退。 */
+ *  ⚠️ 滚动窗口本身**不封顶**总耗时（最坏是 ceil(n/3) × PROBE_TIMEOUT，6 条 = 两波 = 4s）。
+ *  这个上界由调用方 probeWithinBudget 的 PROBE_PHASE_BUDGET_MS 直接压到 2s ——
+ *  所以这里的并发度只决定「一批里能并行几条」，不再决定「整批能拖多久」。 */
 async function mapWithConcurrency<T, R>(
     items: T[],
     concurrency: number,
@@ -1686,6 +1716,40 @@ async function mapWithConcurrency<T, R>(
     };
     await Promise.all(Array.from({ length: limit }, runner));
     return results;
+}
+
+/**
+ * 在总预算内对 items 做滚动窗口探测，返回**与 items 等长同序**的结论。
+ *
+ * 唯一实现：反代池（filterReachableEntries）与订阅侧 IP 过滤（filterReachableIPs）共用，
+ * 避免两个调用点各写一套「预算 / 单条超时 / unknown 判据」而口径分叉。
+ * 预算用尽后剩下的项一律 'unknown'（**不发起**连接，零 socket、零定时器）。
+ * 单条超时取 min(PROBE_TIMEOUT, 剩余预算)：最后一批也必须在预算内收口，否则预算形同虚设。
+ */
+async function probeWithinBudget<T>(
+    items: T[],
+    probe: (item: T, timeoutMs: number) => Promise<boolean>
+): Promise<Array<{ item: T; verdict: ProbeVerdict }>> {
+    const deadline = Date.now() + PROBE_PHASE_BUDGET_MS;
+    return await mapWithConcurrency(items, PROBE_CONCURRENCY, async (item): Promise<{ item: T; verdict: ProbeVerdict }> => {
+        const remaining = deadline - Date.now();
+        if (remaining < PROBE_MIN_LAUNCH_MS) return { item, verdict: 'unknown' };
+        const ok = await probe(item, Math.min(PROBE_TIMEOUT, remaining));
+        return { item, verdict: ok };
+    });
+}
+
+/**
+ * 结论 → 拨号集合的唯一判据：只剔除**确定不通**（verdict === false）的项，'unknown' 一律保留；
+ * 整批都被判死时回退原始列表（空列表会让调用方彻底不可用）。
+ * 两个 filter 共用它 —— 它们原先各写了一遍同样的「过滤 + 空则回退」三联表达式。
+ */
+function dialableFrom<T>(
+    outcomes: Array<{ item: T; verdict: ProbeVerdict }>,
+    fallback: T[]
+): T[] {
+    const dialable = outcomes.filter(o => o.verdict !== false).map(o => o.item);
+    return dialable.length > 0 ? dialable : fallback;
 }
 
 /** 对单个 IP:port 做 TCP 连接探测，返回是否可达 */
@@ -1721,38 +1785,42 @@ export async function probeIPReachability(
     }
 }
 
-/** 对 IP 数组做**分批**探测，返回可达的 IP 子集 */
+/**
+ * 对 IP 数组做**预算内滚动窗口**探测，返回拨号可用的 IP 子集（保序）。
+ * 取舍判据（只剔除确定不通 / 'unknown' 保留 / 全判死则回退原表）统一在 dialableFrom。
+ */
 export async function filterReachableIPs(
     ips: string[],
     port: number = 443
 ): Promise<string[]> {
-    const results = await mapWithConcurrency(ips, PROBE_CONCURRENCY, async (ip) => {
-        const clean = ip.replace(/^\[|\]$/g, ''); // 去掉 IPv6 括号
-        const ok = await probeIPReachability(clean, port);
-        return { ip, ok };
-    });
-    const reachable = results.filter(r => r.ok).map(r => r.ip);
-    // 如果全部不通则回退原始列表（避免空列表导致完全不可用）
-    return reachable.length > 0 ? reachable : ips;
+    const outcomes = await probeWithinBudget(ips, (ip, timeoutMs) =>
+        probeIPReachability(ip.replace(/^\[|\]$/g, ''), port, timeoutMs)); // 去掉 IPv6 括号
+    return dialableFrom(outcomes, ips);
 }
 
-/** 对 [host, port] 条目数组做**分批**探测（每项用自身端口），返回可达条目子集。
- *  onProbe 可选回调：把每条候选的探测结果交给调用方 —— 反代池用它把「探测不通」的候选
+/** 对 [host, port] 条目数组做**预算内滚动窗口**探测（每项用自身端口），返回拨号可用条目子集（保序）。
+ *  onProbe 可选回调：把每条候选的**可信**探测结论交给调用方 —— 反代池用它把「探测不通」的候选
  *  记进临时黑名单（指数退避），避免同一个死候选每连接都白等满一次探测超时。
+ *  'unknown'（预算内没轮到）**不上报**：记成失败就是误杀好候选。
+ *  onReachable 可选回调：某条候选**一被测通就立刻**回调（不等整批收口）—— 调用方用它抢跑拨号，
+ *  把「等最慢那条探测」的等待从关键路径上摘掉。它可能比本函数的 Promise 更早触发。
  *  探针本身按 PROBE_CONCURRENCY 限流，所以这里的失败是候选自身的结论，不是并发配额打出来的。 */
 export async function filterReachableEntries(
     entries: [string, number][],
-    onProbe?: (entry: [string, number], ok: boolean) => void
+    onProbe?: (entry: [string, number], ok: boolean) => void,
+    onReachable?: (entry: [string, number]) => void
 ): Promise<[string, number][]> {
-    const results = await mapWithConcurrency(entries, PROBE_CONCURRENCY, async ([ip, port]) => {
-        const clean = ip.replace(/^\[|\]$/g, '');
-        const ok = await probeIPReachability(clean, port);
-        onProbe?.([ip, port], ok);
-        return { entry: [ip, port] as [string, number], ok };
+    const outcomes = await probeWithinBudget(entries, async (entry, timeoutMs) => {
+        // 直接把 entry 透传给 onReachable：不要再拼一个 [ip, port]（同一份数据第二次分配）
+        const ok = await probeIPReachability(entry[0].replace(/^\[|\]$/g, ''), entry[1], timeoutMs);
+        // 合格即刻上报（不等本批收口）：这是「探测与拨号并行」的唯一触发点
+        if (ok) onReachable?.(entry);
+        return ok;
     });
-    const reachable = results.filter(r => r.ok).map(r => r.entry);
-    // 如果全部不通则回退原始列表（避免空列表导致完全不可用）
-    return reachable.length > 0 ? reachable : entries;
+    for (const { item, verdict } of outcomes) {
+        if (verdict !== 'unknown') onProbe?.(item, verdict);
+    }
+    return dialableFrom(outcomes, entries);
 }
 
 // ── DoH query with dual-source + cache (for proxy pool resolution, 对齐 edgetunnel 9958-9993) ──
