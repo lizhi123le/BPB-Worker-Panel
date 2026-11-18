@@ -588,13 +588,48 @@ const CF_DOH = 'https://cloudflare-dns.com/dns-query';
 //   → {"Status":0,...,"Answer":[{"type":28,"data":"2400:8905::2000:6bff:fe22:d426"}]}，字段形状与 CF 一致。
 const GOOGLE_DOH = 'https://dns.google/resolve';
 
+// ── DoH 结果缓存（两条：解析结果 / 原始记录）──
+// 为什么要有：一次请求里同一个域名会被解析**多次** —— 订阅生成先由 getConfigItems 解析节点域名，
+// sing-box 的 DNS 构建（resolveNodeIPs）再解析一次同一个域名；目标分类（isCloudflareTarget）
+// 与直连竞速（resolveTargetDNS）也各要一次。没有缓存时这些是多次真实 DoH 往返，
+// 而单次 DoH 的上限是 AbortSignal.timeout(10s) —— 重复解析会把 DNS 阶段的耗时上界成倍放大。
+// TTL 口径与原 resolveTargetDNS 相同（有结果 10 分钟、空结果 30 秒），空结果给短 TTL 是为了
+// 上游「刚发布记录」时能快速恢复。
+// ⚠️ 三个期限常量是**唯一来源**，同时供两处缓存使用：
+//    · _dnsCache（本处）：缓存「域名 → ipv4/ipv6」的解析结果；
+//    · _dohResultCache（下方 dohQueryCached）：缓存「域名+记录类型 → 原始 Answer」，反代池解析用。
+//    两处原先各写一份 10min/30s/200 的字面量，改一处忘一处就会让两个缓存的口径悄悄分叉。
+const DOH_CACHE_TTL = 10 * 60 * 1000;   // 有结果 10min
+const DOH_CACHE_EMPTY_TTL = 30 * 1000;  // 空结果 30s
+const DOH_CACHE_MAX = 200;
+const _dnsCache = new Map<string, { ipv4: string[]; ipv6: string[]; time: number; empty: boolean }>();
+
 export async function resolveDNS(domain: string, onlyIPv4 = false): Promise<DnsResult> {
+    // 键含 onlyIPv4：只查 A 与查 A+AAAA 的结果形状不同，不能互相顶替
+    const cacheKey = `${domain.toLowerCase()}|${onlyIPv4 ? 'a' : 'a+aaaa'}`;
+    const cached = _dnsCache.get(cacheKey);
+    if (cached && Date.now() - cached.time < (cached.empty ? DOH_CACHE_EMPTY_TTL : DOH_CACHE_TTL)) {
+        _dnsCache.delete(cacheKey);   // 命中即刷新 LRU 顺序
+        _dnsCache.set(cacheKey, cached);
+        // 返回**副本**：调用方会拿这两个数组做过滤 / 拼接 / 原地操作，缓存不能被共享出去改坏
+        return { ipv4: [...cached.ipv4], ipv6: [...cached.ipv6] };
+    }
+    if (cached) _dnsCache.delete(cacheKey);
+
     const cfBase = `${CF_DOH}?name=${encodeURIComponent(domain)}`;
     const googleBase = `${GOOGLE_DOH}?name=${encodeURIComponent(domain)}`;
 
     try {
         const ipv4 = await dualSourceResolve(cfBase, googleBase, 'A', 1);
         const ipv6 = onlyIPv4 ? [] : await dualSourceResolve(cfBase, googleBase, 'AAAA', 28);
+        // 只缓存**成功**结果：抛错路径不写缓存，故障不会被固化 10 分钟
+        _dnsCache.set(cacheKey, {
+            ipv4: [...ipv4],
+            ipv6: [...ipv6],
+            time: Date.now(),
+            empty: ipv4.length === 0 && ipv6.length === 0,
+        });
+        if (_dnsCache.size > DOH_CACHE_MAX) evictOldest(_dnsCache, DOH_CACHE_MAX);
         return { ipv4, ipv6 };
     } catch (error) {
         throw new Error(`Error resolving DNS for ${domain}: ${safeErrorMessage(error)}`);
@@ -771,10 +806,14 @@ export async function getConfigItems(isFragment: boolean): Promise<ConfigItem[]>
 
     const { ipv4, ipv6 } = await resolveDNS(hostName, !enableIPv6);
 
-    // 对 DNS 解析出的 IP 做可达性探测，过滤不可达地址（并行探测）
+    // 对 DNS 解析出的 IP 做可达性探测，过滤不可达地址（两族并行：探测内部各自按 3 条滚动窗口
+    // 限流，所以两族同时跑时峰值是 2 × 3 = 6 —— 与运行时「单请求并发出站连接」配额同量级，
+    // 属于刻意接受的边界：订阅生成是低频的人机交互，优先让两族同时出结果，而不是把耗时翻倍。
+    // 空数组不需要三元 + `Promise.resolve([] as string[])` 那种类型兼容写法：filterReachableIPs
+    // 对空输入本来就返回 []（不发起任何连接），直接传进去语义等价。
     const [reachableIPv4, reachableIPv6] = await Promise.all([
-        ipv4.length > 0 ? filterReachableIPs(ipv4) : Promise.resolve([] as string[]),
-        ipv6.length > 0 ? filterReachableIPs(ipv6) : Promise.resolve([] as string[]),
+        filterReachableIPs(ipv4),
+        filterReachableIPs(ipv6),
     ]);
 
     const items: ConfigItem[] = [];
@@ -1601,7 +1640,53 @@ export function stripRegionTag(entry: string): string {
 
 // ── IP 可达性探测（TCP 连接检查，对齐 cfnew 的 `探测IP可达性`）──
 
-const PROBE_TIMEOUT = 2000; // 单 IP 探测超时 2 秒
+/**
+ * 单 IP 探测超时 2 秒。
+ * 比竞速拨号的 PROXY_DIAL_TIMEOUT(5s) **更严** —— 探测只负责筛掉明显不可达的候选，
+ * 所以「探测判死」不等于「拨号一定连不上」：这正是 connectWithRaceDial 里 allProbeFailed 例外
+ * （全部探测失败时不记退避、照常拨号）存在的原因。
+ * 反面代价：黑洞候选在第一次遇到时要白等满 2 秒，之后进黑名单退避；
+ * 探测阶段的耗时上界 = ceil(n / PROBE_CONCURRENCY) × 2s（反代池 n = 6 → 两波 = 4s）。
+ */
+const PROBE_TIMEOUT = 2000;
+/**
+ * 探测并发上限。**必须和竞速拨号同量级**（那里是 3）：探测是单请求里唯一会成批开出站 TCP
+ * 的地方，而运行时对单请求的并发出站连接有配额（约 6 条）—— 一次把全部抽取候选（6 条，
+ * 改动前是 8 条）发出去，超出配额的候选会被运行时**直接拒绝**，那不是「候选不通」，
+ * 是被自己的探测并发拖累的假失败；而调用方（反代池）会把探测不通的候选记进黑名单
+ * （30s 起指数退避），假失败于是连锁误杀好候选。
+ * 改成滚动窗口后，**单个 filter 调用内**峰值在飞恒 ≤ 3（订阅生成路径两族并行时是 2 × 3 = 6，
+ * 见 getConfigItems 的说明 —— 那是刻意接受的边界，不是这里的疏漏）。这条误判链从根上断掉了，
+ * 不需要在「哪些失败该退避」上做区分。
+ * 回归钉：tools/proxy-pool-draw.test.mjs 钉两条 —— 事件序列开头连续 3 个 start（窗口宽度）、
+ * 全程在飞峰值 ≤ 3（任一处理路径退回「一次性全发」立刻变 6）。
+ */
+const PROBE_CONCURRENCY = 3;
+
+/** 滚动窗口并发 map：最多 `concurrency` 条同时在飞，任何一条 settle 立刻补位。
+ *  刻意不用「分块 Promise.all」：滚动窗口下快候选不必等慢候选那一整批结束
+ *  （6 条里 4 条 3ms 通、2 条黑洞时，分块模式要等满一个探测超时才能开始第二批）。
+ *  代价是「全黑洞」最坏耗时变成 ceil(n/3) × PROBE_TIMEOUT（6 条 = 两波 = 4s，
+ *  旧的一次性并发是一波 = 2s）—— 但黑名单恢复后，黑洞候选只在第一次遇到时付这笔账，
+ *  之后就从抽取集合隐退。 */
+async function mapWithConcurrency<T, R>(
+    items: T[],
+    concurrency: number,
+    worker: (item: T) => Promise<R>
+): Promise<R[]> {
+    const results = new Array<R>(items.length);
+    const limit = Math.max(1, Math.min(concurrency, items.length));
+    let next = 0;
+    // limit 条 runner 共享一个取号游标：同步启动 → 同一 tick 内先发出前 limit 条连接
+    const runner = async (): Promise<void> => {
+        while (next < items.length) {
+            const index = next++;
+            results[index] = await worker(items[index]);
+        }
+    };
+    await Promise.all(Array.from({ length: limit }, runner));
+    return results;
+}
 
 /** 对单个 IP:port 做 TCP 连接探测，返回是否可达 */
 export async function probeIPReachability(
@@ -1610,6 +1695,7 @@ export async function probeIPReachability(
     timeoutMs: number = PROBE_TIMEOUT
 ): Promise<boolean> {
     let socket: Socket | null = null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
         // 使用与 connectSocket 相同的懒求值模式，避免被打包器优化掉
         const createdSocket: Socket = (globalThis as any).connect({ hostname, port });
@@ -1618,14 +1704,15 @@ export async function probeIPReachability(
             createdSocket.opened,
             // timer.unref 让挂起的超时定时器不阻止请求结束（对齐 F-09 同类修复）
             new Promise((_, reject) => {
-                const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs) as unknown as { unref?: () => void };
-                timer.unref?.();
+                timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+                (timer as unknown as { unref?: () => void }).unref?.();
             }),
         ]);
         return true;
     } catch {
         return false;
     } finally {
+        if (timer !== undefined) clearTimeout(timer);
         // C-09：超时/异常路径同样关闭 socket —— 原先 close 只在成功路径执行，
         // 不可达候选多时未关闭的 TCP 尝试会在 isolate 内累积。
         try {
@@ -1634,38 +1721,35 @@ export async function probeIPReachability(
     }
 }
 
-/** 对 IP 数组做并发探测，返回可达的 IP 子集 */
+/** 对 IP 数组做**分批**探测，返回可达的 IP 子集 */
 export async function filterReachableIPs(
     ips: string[],
     port: number = 443
 ): Promise<string[]> {
-    const results = await Promise.all(
-        ips.map(async (ip) => {
-            const clean = ip.replace(/^\[|\]$/g, ''); // 去掉 IPv6 括号
-            const ok = await probeIPReachability(clean, port);
-            return { ip, ok };
-        })
-    );
+    const results = await mapWithConcurrency(ips, PROBE_CONCURRENCY, async (ip) => {
+        const clean = ip.replace(/^\[|\]$/g, ''); // 去掉 IPv6 括号
+        const ok = await probeIPReachability(clean, port);
+        return { ip, ok };
+    });
     const reachable = results.filter(r => r.ok).map(r => r.ip);
     // 如果全部不通则回退原始列表（避免空列表导致完全不可用）
     return reachable.length > 0 ? reachable : ips;
 }
 
-/** 对 [host, port] 条目数组做并发探测（每项用自身端口），返回可达条目子集。
+/** 对 [host, port] 条目数组做**分批**探测（每项用自身端口），返回可达条目子集。
  *  onProbe 可选回调：把每条候选的探测结果交给调用方 —— 反代池用它把「探测不通」的候选
- *  记进临时黑名单（指数退避），避免同一个死候选每连接都白等一次 2 秒探测。 */
+ *  记进临时黑名单（指数退避），避免同一个死候选每连接都白等满一次探测超时。
+ *  探针本身按 PROBE_CONCURRENCY 限流，所以这里的失败是候选自身的结论，不是并发配额打出来的。 */
 export async function filterReachableEntries(
     entries: [string, number][],
     onProbe?: (entry: [string, number], ok: boolean) => void
 ): Promise<[string, number][]> {
-    const results = await Promise.all(
-        entries.map(async ([ip, port]) => {
-            const clean = ip.replace(/^\[|\]$/g, '');
-            const ok = await probeIPReachability(clean, port);
-            onProbe?.([ip, port], ok);
-            return { entry: [ip, port] as [string, number], ok };
-        })
-    );
+    const results = await mapWithConcurrency(entries, PROBE_CONCURRENCY, async ([ip, port]) => {
+        const clean = ip.replace(/^\[|\]$/g, '');
+        const ok = await probeIPReachability(clean, port);
+        onProbe?.([ip, port], ok);
+        return { entry: [ip, port] as [string, number], ok };
+    });
     const reachable = results.filter(r => r.ok).map(r => r.entry);
     // 如果全部不通则回退原始列表（避免空列表导致完全不可用）
     return reachable.length > 0 ? reachable : entries;
@@ -1690,11 +1774,8 @@ async function dohQueryDual(domain: string, type: string): Promise<any[]> {
     ]);
 }
 
-// DoH result cache for proxy pool resolution
+// DoH result cache for proxy pool resolution（原始 Answer；期限常量与 _dnsCache 共用上方的 DOH_CACHE_*）
 const _dohResultCache = new Map<string, { result: any[]; time: number; empty: boolean }>();
-const DOH_CACHE_TTL = 10 * 60 * 1000;   // 有结果 10min
-const DOH_CACHE_EMPTY_TTL = 30 * 1000;   // 空结果 30s
-const DOH_CACHE_MAX = 200;
 
 /** DoH query with dual-source + cache (对齐 edgetunnel doh解析缓存 9949-9993) */
 async function dohQueryCached(domain: string, type: string): Promise<any[]> {
@@ -1724,7 +1805,8 @@ async function dohQueryCached(domain: string, type: string): Promise<any[]> {
 // ── Proxy IP pool resolution cache (对齐 edgetunnel 缓存反代IP 9896) ──
 // C-04：缓存键原先只有 proxyIP，且无 TTL → 同一 isolate 内第二个 targetDomain/uuid
 // 会拿到为第一个域名洗出的同一份 8 条子集，且首次降级结果被永久冻结。
-const PROXY_POOL_CACHE_TTL = 10 * 60 * 1000; // 10min：与解析依赖的 DoH 结果缓存 DOH_CACHE_TTL 对齐
+// 与解析依赖的 DoH 结果缓存同期限（直接引用，避免两处字面量各自漂移）
+const PROXY_POOL_CACHE_TTL = DOH_CACHE_TTL;
 const PROXY_POOL_CACHE_MAX = 32;             // 键数量上限，防止长生命周期 isolate 中无界增长
 
 /** 反代池缓存诊断日志：仅当面板「Log Level」设为 debug 时输出（与 unified.ts 的 logDebug 同口径）。
@@ -1841,9 +1923,9 @@ async function writeProxyPoolCacheApi(cacheKey: string, result: [string, number]
  * normal domains (DoH A/AAAA dual-source), and direct IPs.
  * Results are cached per (proxyIP, targetDomain, uuid) with a TTL; the pool keeps **all**
  * resolved entries (sorted + deterministically shuffled)，单池不设条数上限 ——
- * 截断会让被砍掉的候选连 2 秒探测的机会都没有（实测地区池 KR=14、SG/JP/通用=50）。
- * 抽取 8 条参与「2 秒探测 + 竞速拨号」的职责移到 connectWithRaceDial：那里按临时黑名单
- * 过滤后随机抽取。
+ * 截断会让被砍掉的候选连一次探测的机会都没有（实测地区池 KR=14、SG/JP/通用=50）。
+ * 抽取若干条参与「可达性探测 + 竞速拨号」的职责移到 connectWithRaceDial：那里按临时黑名单
+ * 过滤后随机抽取（条数口径见该文件的 RACE_PROBE_COUNT，当前 6）。
  * 三级顺序：一级 isolate 内 Map → 二级 Cache API（同一 PoP 跨 isolate）→ DoH；
  * 同一键的并发调用走单飞，只解析一次。
  * Aligns with edgetunnel `解析地址端口` (9895-10016).
@@ -1997,7 +2079,7 @@ async function resolveProxyPoolUncached(
     );
 
     // 池内保留**全部**解析结果，不做任何条数截断：实测地区池 KR=14 条、SG/JP/通用=50 条，
-    // 截断会让被砍掉的候选连 2 秒探测的机会都没有（那正是本改动要消除的浪费）。
+    // 截断会让被砍掉的候选连一次探测的机会都没有（那正是本改动要消除的浪费）。
     // 真正的边界来自 DoH 应答本身（一次 DNS 报文 ≤64KB）与 _proxyPoolCache 的 32 键上限。
     const result = shuffled;
     // C-04：写入带时间戳的键化缓存；超限时按插入顺序（LRU）淘汰最旧一条
@@ -2178,35 +2260,16 @@ export function isCloudflareIP(ip: string): boolean {
     return CF_V6_RANGES.some(range => ipv6InPrefix(words, range.base, range.prefix));
 }
 
-// 目标域名解析缓存：出站模式的目标分类与直连竞速共用，同一域名不再重复 DoH。
-// TTL 与既有 DoH 结果缓存同口径（有结果 10 分钟、空结果 30 秒）。
-const _targetDnsCache = new Map<string, { ipv4: string[]; ipv6: string[]; time: number; empty: boolean }>();
-const TARGET_DNS_TTL = 10 * 60 * 1000;
-const TARGET_DNS_EMPTY_TTL = 30 * 1000;
-const TARGET_DNS_CACHE_MAX = 200;
-
-/** 目标域名解析（A + AAAA，带 LRU 缓存） */
+/**
+ * 目标域名解析（A + AAAA）。
+ * 出站模式的目标分类与直连竞速共用它；**不再维护第二份缓存** —— 原实现自带一套 TTL/空结果/LRU
+ * 策略，与 resolveDNS 的口径完全相同，现在直接复用 resolveDNS 的缓存（同一域名在
+ * 「节点解析 / 目标解析 / sing-box DNS」之间共享结果，一次请求最多打一轮 DoH）。
+ * 保留这个具名入口，是因为调用点读起来是「解析目标」，且它恒为 onlyIPv4=false
+ * （目标分类与直连竞速都需要 v6）。
+ */
 export async function resolveTargetDNS(domain: string): Promise<DnsResult> {
-    const key = domain.toLowerCase();
-    const cached = _targetDnsCache.get(key);
-    if (cached && Date.now() - cached.time < (cached.empty ? TARGET_DNS_EMPTY_TTL : TARGET_DNS_TTL)) {
-        _targetDnsCache.delete(key);   // 命中即刷新 LRU 顺序
-        _targetDnsCache.set(key, cached);
-        return { ipv4: cached.ipv4, ipv6: cached.ipv6 };
-    }
-    if (cached) _targetDnsCache.delete(key);
-
-    const result = await resolveDNS(domain, false);
-    _targetDnsCache.set(key, {
-        ipv4: result.ipv4,
-        ipv6: result.ipv6,
-        time: Date.now(),
-        empty: result.ipv4.length === 0 && result.ipv6.length === 0,
-    });
-    if (_targetDnsCache.size > TARGET_DNS_CACHE_MAX) {
-        evictOldest(_targetDnsCache, TARGET_DNS_CACHE_MAX);
-    }
-    return result;
+    return await resolveDNS(domain, false);
 }
 
 /** 目标是否由 Cloudflare 承载：IP 字面量直接判段，域名解析后 A / AAAA 任一命中 CF 网段即为真。

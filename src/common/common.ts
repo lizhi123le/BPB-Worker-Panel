@@ -140,6 +140,15 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, label = '操作'
     });
 }
 
+/**
+ * 单次 KV **读**的超时（3s）。**唯一来源**：设置缓存（proxySettings / _ver）、WARP 账号与退避标记、
+ * 永久黑名单、违规计数共用同一个值。
+ * 为什么必须收在一处：这些读几乎都在请求最前面且被 `await`，一条挂住的 KV 读会把整份订阅/整页拖住；
+ * 以前这些超时分散成 2000/3000 的字面量，改一处忘一处就会出现「某个读先挂住，其它超时形同虚设」。
+ * 取值依据：KV 正常 10~50ms，3s 已经宽容到不会误伤，又能在真挂住时把请求推进下去。
+ */
+export const KV_READ_TIMEOUT_MS = 3000;
+
 /** fetch with an overall timeout; falls back to AbortSignal.timeout when available. */
 export async function fetchWithTimeout(
     url: string | URL,

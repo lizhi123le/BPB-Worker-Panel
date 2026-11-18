@@ -9,9 +9,12 @@
  *   5. Error → preserve existing cache, don't cascade failure
  */
 
-import { crossRequestSingleFlight } from '@common';
+import { crossRequestSingleFlight, KV_READ_TIMEOUT_MS, withTimeout } from '@common';
 
 const CACHE_TTL = 300_000; // 5min, same as cfnew 键值缓存期限
+// KV 读超时用 @common 的唯一来源常量（KV_READ_TIMEOUT_MS）：这条路径在每个 /sub/* 请求的最前面
+// （setSettings → getKvCache）且调用方 await 它，没有超时就会被一条挂住的读拖住整份订阅。
+// 超时后的行为由各处既有 catch 决定：版本读失败按「版本不变」继续、完整配置读失败保留现有缓存。
 
 interface KvCacheStore {
     settings: Settings | null;
@@ -103,7 +106,7 @@ async function loadSettingsFromKv(env: Env): Promise<Settings | null> {
         // P2: 轻量版本检查（~13B），cfnew 的 c_ver
         let currentVer = '';
         try {
-            currentVer = (await env.kv.get('proxySettings_ver')) || '';
+            currentVer = (await withTimeout(env.kv.get('proxySettings_ver'), KV_READ_TIMEOUT_MS, 'KV 设置版本读取')) || '';
         } catch { /* KV read timeout — proceed without version */ }
 
         // 版本未变化且已有缓存 → 仅刷新时间戳，跳过完整读取
@@ -113,17 +116,25 @@ async function loadSettingsFromKv(env: Env): Promise<Settings | null> {
         }
 
         // P3: 读取完整配置
-        const raw: Settings | null = await env.kv.get('proxySettings', { type: 'json' });
+        const raw: Settings | null = await withTimeout(
+            env.kv.get('proxySettings', { type: 'json' }),
+            KV_READ_TIMEOUT_MS,
+            'KV 设置读取'
+        );
         if (raw) {
             // P3-2: 读后重读版本，检测写入端竞态（cfnew: 重读 c_ver）
             let postVer = '';
             try {
-                postVer = (await env.kv.get('proxySettings_ver')) || '';
+                postVer = (await withTimeout(env.kv.get('proxySettings_ver'), KV_READ_TIMEOUT_MS, 'KV 设置版本复读')) || '';
             } catch {}
 
             if (postVer && postVer !== currentVer) {
                 // 版本在读取过程中变化 → 重新读取配置
-                const retry: Settings | null = await env.kv.get('proxySettings', { type: 'json' });
+                const retry: Settings | null = await withTimeout(
+                    env.kv.get('proxySettings', { type: 'json' }),
+                    KV_READ_TIMEOUT_MS,
+                    'KV 设置重读'
+                );
                 if (retry) {
                     store.settings = JSON.parse(JSON.stringify(retry));
                     store.version = postVer;

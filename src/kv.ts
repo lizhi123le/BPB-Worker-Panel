@@ -1,6 +1,6 @@
 import { fetchWarpAccounts, DEFAULT_WARP_ACCOUNTS } from '@warp';
 import { getDomain, parseHostPort, resolveDNS } from '@utils';
-import { base64DecodeUtf8, safeErrorMessage } from '@common';
+import { base64DecodeUtf8, KV_READ_TIMEOUT_MS, safeErrorMessage, withTimeout } from '@common';
 import { getKvCache, setKvCache, clearKvCache } from './kv-cache';
 // 零依赖的出厂默认值：只作「字段类型基准」，绝不写入 KV、也不当作当前值使用
 import { DEFAULT_SETTINGS } from './common/defaults';
@@ -56,7 +56,9 @@ let warpStaleMarkedAt = 0;
 
 async function readWarpStaleAt(env: Env): Promise<number> {
     try {
-        const raw = await env.kv.get(WARP_STALE_KV_KEY);
+        // 带超时：这条读在「KV 里没有有效账号」的分支上，是决定「要不要真去注册」的前置判断，
+        // 挂住它等于把整份订阅挂住（注册本身已有 8s×2 的上限）。
+        const raw = await withTimeout(env.kv.get(WARP_STALE_KV_KEY), KV_READ_TIMEOUT_MS, 'KV WARP 退避标记读取');
         const at = Number(raw);
         return Number.isFinite(at) ? at : 0;
     } catch {
@@ -95,7 +97,11 @@ export async function getDataset(
         // 对齐 cfnew：通过内存缓存读取，减少 KV 读取次数
         proxySettings = await getKvCache(env);
         // 读入即守卫：坏形状（reserved 空串 / 缺字段 / 账号数不足）→ null，走下面的重新获取
-        warpAccounts = normalizeWarpAccounts(await env.kv.get('warpAccounts', { type: 'json' }));
+        warpAccounts = normalizeWarpAccounts(await withTimeout(
+            env.kv.get('warpAccounts', { type: 'json' }),
+            KV_READ_TIMEOUT_MS,
+            'KV WARP 账号读取'
+        ));
 
         if (!proxySettings) {
             // KV 尚无配置（首次部署）→ 写入默认值

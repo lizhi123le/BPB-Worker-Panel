@@ -1,4 +1,4 @@
-import { evictOldest, withTimeout } from "@common";
+import { evictOldest, KV_READ_TIMEOUT_MS, withTimeout } from "@common";
 
 /**
  * 永久黑名单 — IP 累计违规超过阈值后永久封禁（内存缓存 + KV 持久化）。
@@ -63,7 +63,7 @@ const CACHE_RETRY_MS = 10000;
  */
 async function readPermanentBlacklist(kv: KVNamespace): Promise<Set<string> | null> {
     try {
-        const raw = await withTimeout(kv.get(BLACKLIST_KV_KEY), 3000, 'KV 永久黑名单读取');
+        const raw = await withTimeout(kv.get(BLACKLIST_KV_KEY), KV_READ_TIMEOUT_MS, 'KV 永久黑名单读取');
         const parsed = raw ? JSON.parse(raw) : [];
         // 非数组形态视为数据损坏：按读取失败处理，不据此覆写 KV
         if (!Array.isArray(parsed)) throw new Error('KV 永久黑名单数据格式异常');
@@ -135,7 +135,7 @@ export async function recordViolationAndMaybeBan(
         if (now - record.loadedAt >= VIOLATION_MEMORY_TTL_MS) {
             record.loadedAt = now;
             try {
-                const raw = await withTimeout(kv.get(key), 3000, 'KV 违规计数读取');
+                const raw = await withTimeout(kv.get(key), KV_READ_TIMEOUT_MS, 'KV 违规计数读取');
                 record.count = Math.max(record.count, raw ? (Number(raw) || 0) : 0);
             } catch (e) {
                 console.warn('[永久黑名单] KV 违规计数读取失败，按内存计数继续:', (e as Error)?.message ?? String(e));

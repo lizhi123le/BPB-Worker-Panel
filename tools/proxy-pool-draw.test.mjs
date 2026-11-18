@@ -1,7 +1,7 @@
 /**
  * tools/proxy-pool-draw.test.mjs
  *
- * 反代池「全量入池 + 抽取时按临时黑名单过滤 + 随机抽 8 条 → 2 秒探测 → 分批竞速」的行为测试。
+ * 反代池「全量入池 + 抽取时按临时黑名单过滤 + 随机抽 6 条 → 可达性探测 → 分批竞速」的行为测试。
  * 运行：node tools/proxy-pool-draw.test.mjs
  *
  * 为什么需要它：这套逻辑全在 WS 内部（resolveProxyIPPool + connectWithRaceDial），smoke 用例
@@ -13,16 +13,20 @@
  * 覆盖：
  *   1. 解析出的候选**全部**入池：日志 `got 14 IPs`（改动前解析期 slice(0,8) 只留 8 条、
  *      其余 6 条连探测机会都没有，且这份残缺池被冻结 10 分钟）
- *   2. 每连接最多抽 8 条参与可达性探测
- *   3. 探测不通的候选进临时黑名单（30s 起指数退避）并从抽取集合隐退（日志 in backoff 计数到 6）
- *   4. 退避到期后重新回到池中参与抽取（等 31s 后再次被抽中）
- *   5. 大池不截断：实测地区池 SG/JP/通用有 50 条 A 记录，必须**全部**在对应地区池里
- *      （曾经按 32 条截断，被砍掉的 18 条连 2 秒探测机会都没有）
- *   6. 地区隔离：面板按 `@地区` 锚定的条目，wk=KR/SG 时各自只解析并抽取本地区的池，
+ *   2. 每连接最多抽 RACE_PROBE_COUNT=6 条参与可达性探测
+ *   3. 探测按 **3 条滚动窗口**限流：事件序列里开头连续 start 的次数必须是 3
+ *      （不是 6 —— 一次性全发会把峰值顶到运行时「单请求并发出站连接」配额的边界上，
+ *      改动前 8 条时超出的候选是被直接拒绝的：那种假失败会被当成「候选不通」记进黑名单，
+ *      连锁误杀好候选）
+ *   4. 探测不通的候选进临时黑名单（30s 起指数退避）并从抽取集合隐退（日志 in backoff 计数到 6）
+ *   5. 退避到期后重新回到池中参与抽取（等 31s 后再次被抽中）
+ *   6. 大池不截断：实测地区池 SG/JP/通用有 50 条 A 记录，必须**全部**在对应地区池里
+ *      （曾经按 32 条截断，被砍掉的 18 条连一次探测机会都没有）
+ *   7. 地区隔离：面板按 `@地区` 锚定的条目，wk=KR/SG 时各自只解析并抽取本地区的池，
  *      不混入其它地区的 IP
- *   7. 不砍 IPv6：解析 A + AAAA 时，AAAA 以 `[v6]` 入池并**同等参与**抽取与探测
+ *   8. 不砍 IPv6：解析 A + AAAA 时，AAAA 以 `[v6]` 入池并**同等参与**抽取与探测
  *      （回归钉：防止以后有人把 v6 候选过滤掉，或用 `split(':')` 之类把 v6 键解析坏）
- *   8. 指定地区 + 默认模式 + CF 目标：反代池（含内置兜底）应该是池首跳的**第一优先**，
+ *   9. 指定地区 + 默认模式 + CF 目标：反代池（含内置兜底）应该是池首跳的**第一优先**，
  *      成功即不再拨官方直连池（官方池只留在回退阶梯的下一级）
  *
  * 前提：先构建过（`NODE_ENV=mangle node scripts/build.js`），本测试加载
@@ -143,13 +147,33 @@ let dialedHostsThisConnection = [];
  *  表现是「反代（CF 目标）首跳连上但整条不通」。桩若不记录写入内容，这类回归会全绿通过
  *  （曾经真实发生过：R-03 合并把写入挪进候选内部，15/15 全绿但线上反代失效）。 */
 let firstPacketWritesThisConnection = [];
+/** 本次连接的事件序列，元素只有 `'start'` / `'settle'` 两种（`settle` = 该 socket 的 opened
+ *  有了结论，成功或失败都算）。用它量**探测窗口**：滚动窗口实现下序列开头必然是连续 3 个
+ *  `'start'`（第 4 个要等某一条 settle 才会发出）；一次性全发的旧实现开头会是连续 6 个。
+ *  只靠数组顺序判定 —— 不用时间戳（3ms 成功与同步失败都在同一毫秒内，分不开），
+ *  也不用额外序号或 host 字段（序号与下标同构、host 与 dialed 重复，都是纯冗余）。 */
+let eventsThisConnection = [];
+/** 当前在飞的 socket 数与其峰值。运行时对单请求的并发连接有配额（约 6 条），
+ *  这条峰值就是「会不会撞配额」的直接度量：探测 3 + 竞速 3 各自独立成峰，永远不该超过 3。
+ *  ⚠️ 名额在 `opened` 有结论时归还，所以它假设桩里的 socket 最终都会 settle（当前全部如此）。 */
+let inFlight = 0;
+let maxInFlight = 0;
 globalThis.connect = ({ hostname, port }) => {
     dialedThisConnection.push(`${hostname}:${port}`);
     dialedHostsThisConnection.push(hostname);
+    eventsThisConnection.push('start');
+    inFlight++;
+    if (inFlight > maxInFlight) maxInFlight = inFlight;
     let resolveOpened;
     let rejectOpened;
     const opened = new Promise((res, rej) => { resolveOpened = res; rejectOpened = rej; });
-    opened.catch(() => {}); // 未被 await 的分支也别变成 unhandled rejection
+    // 这一个 then 同时承担「记 settle 事件 + 归还在飞名额 + 处理 rejection」三件事，
+    // 所以不再需要额外的 opened.catch(() => {})（它原先只用来防未处理的 rejection）。
+    const onSettled = () => {
+        eventsThisConnection.push('settle');
+        inFlight--;
+    };
+    opened.then(onSettled, onSettled);
     const writeRecord = { host: hostname, writes: 0, bytes: [] };
     firstPacketWritesThisConnection.push(writeRecord);
     const socket = {
@@ -229,6 +253,7 @@ async function runConnection(query = '?qj=only', target = TARGET) {
     dialedThisConnection = [];
     dialedHostsThisConnection = [];
     firstPacketWritesThisConnection = [];
+    eventsThisConnection = [];
     logs.length = 0;
     const packet = target === TARGET ? PACKET : vlessDomainPacket(target, 443, PACKET_PAYLOAD);
     const earlyData = Buffer.from(packet).toString('base64url');
@@ -247,6 +272,12 @@ async function runConnection(query = '?qj=only', target = TARGET) {
     const m = /got (\d+) IPs for proxy .* drawing (\d+) \((\d+) in backoff\)/.exec(drawLog);
     // 首包写入总账：竞速时同一 ArrayBuffer 只能被写一次（write 会 detach 它）
     const wroteOnce = firstPacketWritesThisConnection.filter((w) => w.writes > 0);
+    // 事件序列开头连续 'start' 的个数 = 第一个窗口的宽度（滚动窗口 = 3；一次性全发 = 抽取条数）
+    let leadingStarts = 0;
+    for (const e of eventsThisConnection) {
+        if (e !== 'start') break;
+        leadingStarts++;
+    }
     return {
         status: response.status,
         dialed: [...dialedThisConnection],
@@ -255,30 +286,31 @@ async function runConnection(query = '?qj=only', target = TARGET) {
         drawn: m ? Number(m[2]) : null,
         inBackoff: m ? Number(m[3]) : null,
         drawLog,
+        leadingStarts,
         /** 首包字节数（应等于剥离 VLESS 头后的载荷长度，绝不是 0） */
         firstPacketBytes: wroteOnce.length ? wroteOnce[0].bytes[0] : null,
     };
 }
 
-// ── 阶段 A：全量入池 + 抽取上限 + 探测失败退避
-out(`— 阶段 A：解析池 ${POOL.length} 条（${FAILING.size} 条不通）→ 全量入池、抽 8 条、坏候选退避 —`);
+// ── 阶段 A：全量入池 + 抽取上限 + 探测窗口 + 探测失败退避
+out(`— 阶段 A：解析池 ${POOL.length} 条（${FAILING.size} 条不通）→ 全量入池、抽 6 条、探测窗口 3、坏候选退避 —`);
 
 const seenProbed = new Set();
 const retiredFailures = new Set();
 let firstConnection = null;
 let maxDrawn = 0;
-let maxPool = 0;
 let maxBackoff = 0;
 let lastFailObservedAt = 0;
 let cleanStreak = 0;
 let maxCleanStreak = 0;
 
-for (let i = 0; i < 22; i++) {
+// 30 次上限是「抽满覆盖」的余量：每连接随机抽 6/14，收到全部 14 条约需十几次连接
+// （每次漏掉某个候选的概率 0.571，30 次后 <1e-6）。
+for (let i = 0; i < 30; i++) {
     const r = await runConnection();
     if (i === 0) firstConnection = r;
     if (r.status !== 101) check(`第 ${i + 1} 次连接：升级返回 101`, false, `status=${r.status}`);
 
-    if (r.poolSize !== null) maxPool = Math.max(maxPool, r.poolSize);
     if (r.drawn !== null) maxDrawn = Math.max(maxDrawn, r.drawn);
     if (r.inBackoff !== null) maxBackoff = Math.max(maxBackoff, r.inBackoff);
 
@@ -293,19 +325,24 @@ for (let i = 0; i < 22; i++) {
     }
     for (const ip of r.probed) seenProbed.add(ip);
 
-    // 6 条坏候选全部退避过、且已经连续 4 次连接不再抽到它们 → 阶段 A 达标，提前收尾
-    if (retiredFailures.size === FAILING.size && cleanStreak >= 4) break;
+    // 收尾条件必须**含覆盖**：只按「坏候选都退避过 + 连续 4 次干净」判断，会在第 5~6 次连接
+    // 就退出，而那时「14 条全部被抽到过」还有约 3.5% 的概率不成立 —— 这就是下面两条覆盖断言
+    // 曾经偶发 FAIL 的原因（每连接只抽 6/14，coupon collector 还没收集完）。
+    if (retiredFailures.size === FAILING.size && cleanStreak >= 4 && seenProbed.size === POOL.length) break;
 }
 
 check('解析出的候选全部入池（日志 got 14，而不是被 slice(0,8) 砍成 8）',
     firstConnection?.poolSize === POOL.length,
     `poolSize=${firstConnection?.poolSize} log=${firstConnection?.drawLog}`);
-check('每连接抽取条数 ≤ 8',
-    maxDrawn > 0 && maxDrawn <= 8,
+check('每连接抽取条数 ≤ 6（= RACE_PROBE_COUNT）',
+    maxDrawn > 0 && maxDrawn <= 6,
     `maxDrawn=${maxDrawn}`);
-check('每连接抽取条数 = 8（可用候选充足时填满槽位）',
-    firstConnection?.drawn === 8,
+check('每连接抽取条数 = 6（可用候选充足时填满槽位）',
+    firstConnection?.drawn === 6,
     `firstConnection.drawn=${firstConnection?.drawn}`);
+check('探测按 3 条滚动窗口限流：事件序列开头是连续 3 个 start（一次性全发会是 6 个）',
+    firstConnection?.leadingStarts === 3,
+    `leadingStarts=${firstConnection?.leadingStarts} dialed=${firstConnection?.dialed.join(' | ')}`);
 check('抽取覆盖池内全部 14 条候选（改动前只有固定 8 条有机会被用到）',
     seenProbed.size === POOL.length,
     `probed=${[...seenProbed].sort().join(',')}`);
@@ -348,8 +385,8 @@ const big = await runConnection();
 check(`${BIG_POOL.length} 条全部入池（不再被任何条数上限截断）`,
     big.poolSize === BIG_POOL.length,
     `poolSize=${big.poolSize} log=${big.drawLog}`);
-check('大池仍只抽 8 条参与 2 秒探测',
-    big.drawn === 8,
+check('大池仍只抽 6 条参与可达性探测（抽取上限与池大小无关）',
+    big.drawn === 6,
     `drawn=${big.drawn}`);
 check('大池抽出的候选都来自该池',
     big.probed.size > 0 && [...big.probed].every((ip) => BIG_POOL.includes(ip)),
@@ -457,6 +494,13 @@ check('默认模式 + CF 目标：反代池成功后不再拨官方直连池',
 check('默认模式 + CF 目标：拨号候选来自反代池解析结果（不是官方直连 IP）',
     cfRun.probed.size > 0 && [...cfRun.probed].every((ip) => BIG_POOL.includes(ip)),
     `probed=${[...cfRun.probed].join(',')}`);
+
+// ── 并发总账：整场（14 条池 / 50 条大池 / 双栈 / 地区池 / CF 目标）都算上，在飞峰值不得超 3 ──
+//    这条是「探测窗口限流」的兜底：任何一条路径退回到「一次性全发」（大池 6 条、v6 池 6 条），
+//    峰值都会立刻超过 3 —— 运行时对单请求的并发连接有配额，撞上就是假失败 + 误判退避。
+check('全流程同时在飞的 socket 峰值 ≤ 3（没有哪条路径偷偷恢复成一次性全发）',
+    maxInFlight <= 3 && maxInFlight > 0,
+    `maxInFlight=${maxInFlight}`);
 
 // ── 首包写入总账（R-03 回归的守卫）──
 // 竞速时同一批候选共享**同一个** ArrayBuffer：只要「每个候选各写一次」，就会有多个 socket

@@ -950,11 +950,16 @@ export async function getURLConfigs() {
     });
 }
 
+/** 抓取并合并用户配置的自定义订阅（🔗 Subscriptions）。
+ *  ⚠️ 必须自带超时：这是订阅生成链路上**唯一**会 await 一条完全不可控的上游请求的地方。
+ *  裸 `fetch(url)` 时，上游「收下连接但不回包」会把整份订阅拖到平台放弃 —— 用户看到的就是无限转圈。
+ *  超时口径与地址列表 URL 的抓取（utils 的 resolveUrlEntries，10s）保持一致；
+ *  失败的 URL 返回空串，不影响其它自定义订阅，也不污染节点内容。 */
 async function fetchCustomSubs(subs: string[]): Promise<string> {
     const results = await Promise.all(
         subs.map(async (url) => {
             try {
-                const res = await fetch(url);
+                const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
                 if (!res.ok) return "";
 
                 const text = (await res.text()).trim();
@@ -969,7 +974,10 @@ async function fetchCustomSubs(subs: string[]): Promise<string> {
                 }
 
                 return text;
-            } catch {
+            } catch (error) {
+                // 留痕（对齐 utils 里地址列表抓取的 B-53 约定）：自定义订阅静默消失最难排查。
+                // 超时也走这条路径 —— 返回空串、不影响其它订阅。
+                console.warn(`[自定义订阅] ${url} 抓取失败（≤10s 超时或网络错误），已跳过：${safeErrorMessage(error)}`);
                 return "";
             }
         })

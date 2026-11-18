@@ -25,7 +25,14 @@ const PROXY_DIAL_TIMEOUT = 5000; // 代理竞速连接超时（对齐 cfnew 连�
 const UPSTREAM_HANDSHAKE_TIMEOUT = 8000;
 const RACE_DIAL_CONCURRENCY = 3; // 并发拨号数量，参考 cfnew
 const RACE_DIAL_MAX_BATCHES = 5; // 最大重试批次
-const RACE_PROBE_COUNT = 8; // 每连接从缓存池抽取参与 2 秒可达性探测的候选数（抽取在探测前、按黑名单过滤后进行）
+/**
+ * 每连接从缓存池抽取参与可达性探测的候选数（抽取在探测前、按黑名单过滤后进行）。
+ * 探测本身由 filterReachableEntries 按 3 条**滚动窗口**限流（见 utils 的 PROBE_CONCURRENCY），
+ * 所以这个数不再是并发连接数，而是**延迟预算**：全黑洞时最坏耗时 = ceil(6/3) × PROBE_TIMEOUT(2s)
+ * = 4s（两波）。同时必须满足 RACE_PROBE_COUNT ≤ RACE_DIAL_MAX_BATCHES × RACE_DIAL_CONCURRENCY
+ * （6 ≤ 15）：一旦抽取数超过批次窗口，尾部候选永远排不进批次（结构性饥饿，白抽 + 白探测）。
+ */
+const RACE_PROBE_COUNT = 6;
 
 // IP:port 黑名单：连续失败计数 + 指数退避冷却（对齐 edgetunnel 节点黑名单 250-253）
 const IP_BLACKLIST_TTL = 30 * 1000;          // 基础冷却 30 秒
@@ -135,7 +142,7 @@ async function connectWithRaceDial(
     // 3. 解析 IP 池（对齐 edgetunnel 解析地址端口 9895-10016）：
     //    逐项分流——IP 字面量直接入池（不 DoH），域名走 DoH 双源解析；
     //    整体排序 + LCG 确定性洗牌 + 带缓存的**全量**入池（解析出多少就存多少，不截断）；
-    //    「按黑名单过滤后随机抽 8 条去探测/竞速」在下方第 4/5 步做
+    //    「按黑名单过滤后随机抽 RACE_PROBE_COUNT 条去探测/竞速」在下方第 4/5 步做
     //    每项携带自身端口（显式端口 / .tpN 端口），无端口条目回退 targetPort（保持既有语义）
     log(`resolving proxy pool via DoH...`);
     const pool = await resolveProxyIPPool(poolInput.join(','), targetAddress, '');
@@ -153,19 +160,22 @@ async function connectWithRaceDial(
     const blacklistBypass = usableEntries.length === 0;
     const drawSource = blacklistBypass ? poolEntries : usableEntries;
 
-    // 洗牌抽 8 条参与探测：池内（本次可用的）全部候选都有机会被用到，
+    // 洗牌抽 RACE_PROBE_COUNT 条参与探测：池内（本次可用的）全部候选都有机会被用到，
     // 不再由解析期的 slice(0,8) 把其余候选结构性丢弃、锁死 10 分钟。
     const probeEntries = shuffleTake(drawSource, RACE_PROBE_COUNT);
 
     log(`got ${poolEntries.length} IPs for proxy ${proxyAddr}, drawing ${probeEntries.length} (${poolEntries.length - drawSource.length} in backoff), probing reachability...`);
 
-    // 5. 并发探测（每项用自身端口）—— 探测不通的记一次失败进临时黑名单，不再每连接为死候选白等 2 秒
+    // 5. 分批并发探测（每项用自身端口）—— 探测不通的记一次失败进临时黑名单，
+    //    不再每连接为死候选白等满一个探测超时。探针在 filterReachableEntries 内部按 3 条限流，
+    //    所以这里的「不通」是候选自身的结论，不是被自己的探测并发撞配额打出来的假失败。
     const probeFailed: [string, number][] = [];
     const reachableEntries = await filterReachableEntries(probeEntries, (entry, ok) => {
         if (!ok) probeFailed.push(entry);
     });
 
-    // 例外：本批抽取的候选**全部**探测不通 —— 这正是「2 秒探测超时、5 秒拨号仍可能连上」的边界情形，
+    // 例外：本批抽取的候选**全部**探测不通 —— 这是「整池集体抖动」的信号，而不是 6 个候选各自死了。
+    // 探测超时(2s)比拨号超时(5s)更严，「探测判死」本来就不等于「拨号连不上」：
     // filterReachableEntries 会把它们原样返回继续拨号，所以此时不记退避，免得一次集体抖动就把整池锁进黑名单
     //（真不通的候选会在拨号超时/写首包失败时按既有逻辑记账）。
     const allProbeFailed = probeEntries.length > 0 && probeFailed.length === probeEntries.length;
@@ -549,9 +559,10 @@ async function connectWithPrefixFallback(
 
     const prefix = getRandomValue(prefixes);
     
-    // 解析目标 IPv4。正常路径**逐字沿用** resolveDNS(targetAddress, true)：只查 A、不碰 AAAA、
-    // 不吃 resolveTargetDNS 的 10 分钟缓存 —— 即「有 A 记录的目标」在 prefix 模式下与改动前完全一致
-    // （含 IP 轮换的时效性，不会被缓存拖成 10 分钟前的地址）。NAT64 本身也只对 IPv4 目标成立。
+    // 解析目标 IPv4：只查 A、不碰 AAAA（NAT64 本身只对 IPv4 目标成立）。
+    // 注意「缓存」口径：resolveDNS 现在自带结果缓存（有结果 10 分钟 / 空结果 30 秒），
+    // prefix 模式因此不再享受「每次都拿最新 A 记录」的时效性 —— 换来的是同一请求里
+    // 目标分类、直连竞速、本路径共享一次 DoH 结果（此前是各打一轮，DNS 阶段上界成倍放大）。
     const { ipv4 } = await resolveDNS(targetAddress, true);
     if (!ipv4.length) {
         // ★ IPv6 修复（与 connectWithDirectRaceDial 同一类缺陷）：NAT64 只能把 **IPv4** 映射进前缀，
