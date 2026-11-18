@@ -574,13 +574,13 @@ const CF_DOH = 'https://cloudflare-dns.com/dns-query';
 //   实测 `https://dns.google/dns-query?name=ipv6.test-ipv6.com&type=AAAA` 恒返回 HTTP 400，响应体是
 //   HTML（"RFC8484 handler at /dns-query received parameter 'name', which it does not accept.
 //   Did you intend to pass the 'dns' parameter, or call the JSON handler at /resolve"），
-//   于是本文件 dohJsonQuery 里 response.json() 直接抛错 → dohAnswersDual 的 allSettled 把该源
-//   判为 rejected，**第二源从未生效**（dohQueryRaw 的 `.william` TXT 兜底同理，一直是死代码）。
+//   于是本文件 dohQueryRaw 里 response.json() 直接抛错 → 该源被吞成 []（不贡献答案），
+//   **第二源从未生效**（.william TXT 的 Google 兜底同理，一直是死代码）。
 //   但 dohAnswersDual 是「先 CF 后 Google，取第一个非空」，而 CF_DOH 这个 JSON DoH 端点本身可用
 //   （Cloudflare 官方文档的 dns-json 用法），所以生产上 A/AAAA 一直由 CF 提供：本改动只是**补回
 //   冗余**（CF DoH 取不到 / 被墙时还有 AAAA 来源），IPv6 症状的根因在
 //   protocols/websocket/common.ts#connectWithDirectRaceDial 丢掉 AAAA。
-//   代价（须知）：dohAnswersDual 用 Promise.allSettled 会等**两个源都返回**，改前死源是快速 400
+//   代价（须知）：dohAnswersDual 用 Promise.all 会等**两个源都返回**，改前死源是快速 400
 //   失败，改后若某机房到 dns.google 不通，每个记录类型最多多等一次 AbortSignal.timeout(10s)；
 //   该源是必要的冗余，但若想彻底零风险可只保留 CF 单源。
 //   正确值与 cfnew 一致（cfnew L193 `https://dns.google/resolve`）。
@@ -597,7 +597,7 @@ const GOOGLE_DOH = 'https://dns.google/resolve';
 //
 // 为什么只存**原始 Answer**、且只留一份：两个消费方要的形状不同 ——
 //   · resolveDNS 要「按记录类型过滤后的 v4/v6 字符串」（下面 answersToRecords 投影）；
-//   · 反代池要整份 Answer（CNAME 过滤、TXT 前缀展开、类型判断都在它那边做）。
+//   · 反代池要整份 Answer（TXT 前缀展开、v6 加方括号、域名回退等都在它那边做）。
 // 原先各存一个 Map（解析结果 / 原始记录），同一域名在两处各打一轮 DoH，两套空结果 TTL 还得
 // 各自维护；现在只缓存上游应答本身，形状差异由调用点投影 ——
 // 顺带让「反代池域名」与「目标域名」偶发相同时也只解析一次。
@@ -615,43 +615,38 @@ const _dohAnswerCache = new Map<string, { answers: any[]; time: number; empty: b
 const DNS_TYPE_CODE: Record<string, number> = { A: 1, AAAA: 28, TXT: 16 };
 
 /**
- * 单源 JSON DoH 取数（RFC 8484 的 /resolve 风格：accept: application/dns-json）。
- * 失败**一律抛错**：吞错还是上抛由调用方决定（dohQueryRaw 吞成 []）。
+ * 单源原始 Answer（RFC 8484 的 /resolve 风格：accept: application/dns-json）。
+ *
+ * **DoH 的最底层，也是唯一一处 fetch**：网络错误 / HTTP 错误 / JSON 解析失败一律吞成 [] ——
+ * 「两个源都失败」与「上游确实没有记录」在这里同形，区别只体现在缓存期限上（空结果 30s，
+ * 见 dohAnswersCached）。`dohUrl` 必填：唯一保留「裸单源」语义的地方是 `.william` TXT 的 Google 兜底。
  */
-async function dohJsonQuery(url: string): Promise<any[]> {
-    const response = await fetch(url, {
-        headers: { accept: 'application/dns-json' },
-        signal: AbortSignal.timeout(10_000),
-    });
-    const data: any = await response.json();
-    return data.Answer || [];
-}
-
-/**
- * 并发双源查询，取第一个「成功且非空」的结果；两个源都失败或都为空则返回 []。
- * 用 allSettled 等**两个源都结束**，而不是 Promise.any 提前返回 —— 慢源只在真的没有更快结果时才被等待。
- */
-async function firstNonEmptyResult<T>(promises: Promise<T[]>[]): Promise<T[]> {
-    const results = await Promise.allSettled(promises);
-    const first = results.find(r => r.status === 'fulfilled' && r.value.length > 0);
-    return first?.status === 'fulfilled' ? first.value : [];
-}
-
-/** 单源原始 Answer（吞错返回 []）。保留「裸单源」语义的唯一理由：`.william` TXT 的 Google 兜底。 */
 async function dohQueryRaw(domain: string, type: string, dohUrl: string): Promise<any[]> {
     try {
-        return await dohJsonQuery(`${dohUrl}?name=${encodeURIComponent(domain)}&type=${type}`);
+        const response = await fetch(`${dohUrl}?name=${encodeURIComponent(domain)}&type=${type}`, {
+            headers: { accept: 'application/dns-json' },
+            signal: AbortSignal.timeout(10_000),
+        });
+        const data: any = await response.json();
+        return data.Answer || [];
     } catch {
         return [];
     }
 }
 
-/** 双源原始 Answer（CF ‖ Google，取第一个非空；两源都失败/都空 → []）。**DoH 的唯一出站口**。 */
+/**
+ * 双源原始 Answer：CF ‖ Google 并发，取**第一个非空**的结果；两个源都空 → []。**DoH 的唯一出站口**
+ * （resolveDNS 与反代池解析都从这里取数）。
+ *
+ * 用 `Promise.all` 等**两个源都结束**，而不是 `Promise.any` 提前返回：CF 优先取用，但慢源只在
+ * 「CF 没给出结果」时才真正被需要 —— 提前丢弃它等于把补回的第二源又扔了。
+ */
 async function dohAnswersDual(domain: string, type: string): Promise<any[]> {
-    return await firstNonEmptyResult([
+    const [fromCf, fromGoogle] = await Promise.all([
         dohQueryRaw(domain, type, CF_DOH),
         dohQueryRaw(domain, type, GOOGLE_DOH),
     ]);
+    return fromCf.length ? fromCf : fromGoogle;
 }
 
 /**
@@ -687,7 +682,9 @@ async function dohAnswersCached(domain: string, type: string): Promise<any[]> {
     return answers;
 }
 
-/** Answer → 指定记录类型的字符串列表（CNAME / 无关记录一律丢弃，口径与旧的 fetchDNSRecords 一致） */
+/** Answer → 指定记录类型的字符串列表：CNAME（type 5）与其它无关记录一律丢弃。
+ *  `resolveDNS` 投影 v4/v6、`dohAnswersCached` 判空、反代池取 A/AAAA/TXT 都走它 ——
+ *  「按类型筛 + 取 data」这一句只保留这一份实现。 */
 function answersToRecords(answers: any[], recordType: number): string[] {
     return answers
         .filter((record: any) => record.type === recordType)
@@ -2071,12 +2068,10 @@ async function resolveProxyPoolUncached(
             // .william domain: DoH TXT query to expand prefix list (对齐 edgetunnel 9918-9935)
             try {
                 // 与 resolveDNS 共用同一份 Answer 缓存（键含查询类型，TXT 与 A/AAAA 互不覆盖）
-                let txtRecords = await dohAnswersCached(entry, 'TXT');
-                let txtData = txtRecords.filter((r: any) => r.type === 16).map((r: any) => r.data as string);
+                let txtData = answersToRecords(await dohAnswersCached(entry, 'TXT'), DNS_TYPE_CODE.TXT);
                 if (txtData.length === 0) {
-                    // Fallback to Google DoH
-                    txtRecords = await dohQueryRaw(entry, 'TXT', GOOGLE_DOH);
-                    txtData = txtRecords.filter((r: any) => r.type === 16).map((r: any) => r.data as string);
+                    // 双源都没给出 TXT 时才单独问一次 Google（这条兜底只对 .william 生效）
+                    txtData = answersToRecords(await dohQueryRaw(entry, 'TXT', GOOGLE_DOH), DNS_TYPE_CODE.TXT);
                 }
                 if (txtData.length > 0) {
                     let data = txtData[0];
@@ -2104,12 +2099,13 @@ async function resolveProxyPoolUncached(
             const ipv6Regex = /^\[?([a-fA-F0-9:]+)\]?$/;
 
             if (!ipv4Regex.test(host) && !ipv6Regex.test(host)) {
-                const [aRecords, aaaaRecords] = await Promise.all([
+                const [aAnswers, aaaaAnswers] = await Promise.all([
                     dohAnswersCached(host, 'A'),
                     dohAnswersCached(host, 'AAAA'),
                 ]);
-                const ipv4s = aRecords.filter((r: any) => r.type === 1).map((r: any) => r.data as string);
-                const ipv6s = aaaaRecords.filter((r: any) => r.type === 28).map((r: any) => `[${r.data}]`);
+                const ipv4s = answersToRecords(aAnswers, DNS_TYPE_CODE.A);
+                // 池内的 v6 一律以 [v6] 形式承载（与黑名单键、拨号前去括号同一口径）
+                const ipv6s = answersToRecords(aaaaAnswers, DNS_TYPE_CODE.AAAA).map((ip) => `[${ip}]`);
                 const ips = [...ipv4s, ...ipv6s];
                 if (ips.length > 0) {
                     for (const ip of ips) {
