@@ -255,23 +255,25 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                 if (acl.blockOutbound) config.outbounds.push(acl.blockOutbound as unknown as Outbound);
                 // C3：dns-remote 的 detour 原本指向被上面过滤掉的内置分组（✅ Selector / 各类「最佳延迟」），
                 // 接管后这些 tag 已不存在 → sing-box 启动期解析出站失败、整份配置加载失败。
-                // 改指向模板实际生成的默认分组（与 route.final 同义：由默认策略组解析 DoH）；
-                // 模板一个分组都没生成时退回内置直连出站 direct —— 它不在移除集合里，必然存在。
-                const aclGroupTags = new Set(acl.outboundGroups.map(g => g.tag));
-                const aclDnsDetour = aclGroupTags.has(acl.final)
-                    ? acl.final
-                    : (acl.outboundGroups[0]?.tag ?? 'direct');
-                retargetDnsDetour(config.dns, ACL_BUILTIN_GROUP_TAGS, aclDnsDetour);
+                //
+                // 取哪个模板分组（口径已定）：**模板第一个分组**，主流模板即「🚀 节点选择」。
+                // 不再用模板 FINAL 指向的组（ACL4SSR 默认模板是「🐟 漏网之鱼」）：那条 FINAL 规则表达的是
+                // 「其余流量的去向」，而 DNS detour / route.final 需要的是「默认上网策略」——用户面板上真正
+                // 会去点的也是节点选择。FINAL 规则本身仍由 buildAclSingbox 单独收口（不进 route.rules）。
+                // 兜底只有 direct：一个分组都没生成时（buildAclSingbox 的 final 此时也恒为 'direct'），
+                // 直接退回内置直连出站 —— 它不在 ACL_BUILTIN_GROUP_TAGS 里，必然存在。
+                const aclDefaultGroup = acl.outboundGroups[0]?.tag ?? 'direct';
+                retargetDnsDetour(config.dns, ACL_BUILTIN_GROUP_TAGS, aclDefaultGroup);
                 // C6：模板接管的是「分流」，不能连基础规则一起丢。原先只前置 Block/Bypass，
                 // sniff、hijack-dns（含 172.19.0.2 上游 DNS 劫持）、ip_is_private 直连、UDP reject
                 // 全被整表替换掉 → 接管后 DNS/局域网/嗅探行为静默改变（与 Clash 端 C5 对称）。
                 // 顺序与 Clash 端 ACL 分支逐条对齐：基础规则 → Block/Bypass 拦截 → 模板规则。
                 const baseRules = buildBaseRoutingRules(false);
                 // 基础规则里 clash_mode "Global" 原本指向内置 "✅ Selector"，而该分组正是被上面滤掉的那个；
-                // 悬空出站会让 sing-box 启动期解析失败 → 整份配置加载失败。改写为 aclDnsDetour（模板实际存在的
+                // 悬空出站会让 sing-box 启动期解析失败 → 整份配置加载失败。改写为 aclDefaultGroup（模板实际存在的
                 // 出站，与 C3 的 dns-remote detour 同一目标），使「全局模式」切换在 ACL 下仍然有效。
                 for (const rule of baseRules) {
-                    if (rule.clash_mode === "Global") rule.outbound = aclDnsDetour;
+                    if (rule.clash_mode === "Global") rule.outbound = aclDefaultGroup;
                 }
                 const blockBypass = buildBlockAndBypassRules();
                 config.route.rules = [
@@ -291,7 +293,9 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                     ruleSetTags.add(rs.tag);
                     return true;
                 });
-                config.route.final = acl.final;
+                // route.final 与 dns detour / Global 出站同一目标（模板第一个分组），三处必须同源：
+                // 任一处指向不存在的 tag，sing-box 启动期就加载失败；三者语义也应一致（默认上网策略）。
+                config.route.final = aclDefaultGroup;
             }
         } catch (error: any) {
             console.warn('[ACL Config] apply singbox template error:', error?.message || error);

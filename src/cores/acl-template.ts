@@ -676,7 +676,8 @@ export interface AclSingboxResult {
     rules: RoutingRule[];
     // 内含两类：URL provider 服务端内联（inline），以及 geoip 规则所需的 remote/binary 规则集
     ruleSets: Array<RuleSet | { type: 'inline'; tag: string; rules: Array<Record<string, string[]>> }>;
-    final: string;
+    // 不下发 `final`：模板的 `[]FINAL` 在 sing-box 端没有对应规则，默认去向由调用方取「模板第一个分组」
+    // （configs.ts#aclDefaultGroup，与 Clash 端一致）。原先这里回传过一个 final 字段，但已无消费者。
     /** 模板里有拦截组（成员含 REJECT）时给出承载它的 block 出站；调用方必须把它加进 config.outbounds */
     blockOutbound?: SbBlockOutbound;
 }
@@ -765,12 +766,11 @@ export async function buildAclSingbox(
 
     // inline 规则 → route rule
     const inlineRouteRules: RoutingRule[] = [];
-    let finalGroup = undefined as string | undefined;
     for (const rule of inlineRules) {
-        if (rule.ruleType.toUpperCase() === 'FINAL') {
-            finalGroup = rule.group || finalGroup;
-            continue;
-        }
+        // 模板的 `[]FINAL` 在 sing-box 端没有对应规则：真正的默认去向由调用方取「模板第一个分组」
+        // （configs.ts#aclDefaultGroup，Clash 端同一口径）。这里必须显式跳过 —— 落到下面的类型派发
+        // 会被当成未知类型打 warn（每份模板都带 FINAL，等于每次生成都刷一条噪音）。
+        if (rule.ruleType.toUpperCase() === 'FINAL') continue;
         // B-47：与 Clash 侧共用同一份修饰符剥离。`10.0.0.0/8,no-resolve` 若整串当 ip_cidr 值下发，
         // sing-box 启动期解析失败、整份配置不可用（修饰符在 sing-box 无对应写法，只能丢弃）。
         const { value: ruleVal } = splitRuleModifiers(rule.ruleVal);
@@ -814,22 +814,10 @@ export async function buildAclSingbox(
         inlineRouteRules.push(ruleObj);
     }
 
-    // FINAL 同理：它指向的组必须有定义，否则 route.final 悬空 → 退回下面的默认分组逻辑
-    if (finalGroup && !sbKnownGroups.has(finalGroup)) {
-        console.warn(`[ACL 分组] 丢弃引用未生成分组的规则 FINAL: ${finalGroup}`);
-        finalGroup = undefined;
-    }
-
-    // C3 同源兜底：模板只提供规则、一个分组都没生成时，默认 final 不能是「✅ Selector」——
-    // 接管后该出站已被 sing-box/configs.ts 移除 → route.final 悬空、整份配置加载失败。
-    // 退回 sing-box 一定存在的内置直连出站 direct（它不在 ACL_BUILTIN_GROUP_TAGS 中）。
-    const final = finalGroup || (groups.length > 0 ? groups[0].name : 'direct');
-
     return {
         outboundGroups,
         rules: [...urlRules, ...inlineRouteRules],
         ruleSets,
-        final,
         ...(hasBlockGroup ? { blockOutbound: { type: 'block' as const, tag: REJECT_OUTBOUND_TAG } } : {}),
     };
 }
