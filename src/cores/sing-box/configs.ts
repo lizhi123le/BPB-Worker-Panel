@@ -255,13 +255,9 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                 if (acl.blockOutbound) config.outbounds.push(acl.blockOutbound as unknown as Outbound);
                 // C3：dns-remote 的 detour 原本指向被上面过滤掉的内置分组（✅ Selector / 各类「最佳延迟」），
                 // 接管后这些 tag 已不存在 → sing-box 启动期解析出站失败、整份配置加载失败。
-                //
-                // 取哪个模板分组（口径已定）：**模板第一个分组**，主流模板即「🚀 节点选择」。
-                // 不再用模板 FINAL 指向的组（ACL4SSR 默认模板是「🐟 漏网之鱼」）：那条 FINAL 规则表达的是
-                // 「其余流量的去向」，而 DNS detour / route.final 需要的是「默认上网策略」——用户面板上真正
-                // 会去点的也是节点选择。FINAL 规则本身仍由 buildAclSingbox 单独收口（不进 route.rules）。
-                // 兜底只有 direct：一个分组都没生成时（buildAclSingbox 的 final 此时也恒为 'direct'），
-                // 直接退回内置直连出站 —— 它不在 ACL_BUILTIN_GROUP_TAGS 里，必然存在。
+                // 取值口径见 @cores/acl-template 的 AclSingboxResult.final 注释：detour 与 clash_mode Global
+                // 用「模板第一个分组」（默认上网策略），route.final 另走模板 FINAL（见下方赋值处）。
+                // 兜底 direct：一个分组都没生成时用它 —— 不在 ACL_BUILTIN_GROUP_TAGS 里，必然存在。
                 const aclDefaultGroup = acl.outboundGroups[0]?.tag ?? 'direct';
                 retargetDnsDetour(config.dns, ACL_BUILTIN_GROUP_TAGS, aclDefaultGroup);
                 // C6：模板接管的是「分流」，不能连基础规则一起丢。原先只前置 Block/Bypass，
@@ -293,9 +289,9 @@ export async function getSbCustomConfig(isFragment: boolean): Promise<Response> 
                     ruleSetTags.add(rs.tag);
                     return true;
                 });
-                // route.final 与 dns detour / Global 出站同一目标（模板第一个分组），三处必须同源：
-                // 任一处指向不存在的 tag，sing-box 启动期就加载失败；三者语义也应一致（默认上网策略）。
-                config.route.final = aclDefaultGroup;
+                // route.final 跟随模板 FINAL（与 Clash 的 `MATCH,<组>` 同口径）；模板没写 FINAL 或它指向
+                // 未生成的分组时，buildAclSingbox 已退化为第一个分组。
+                config.route.final = acl.final;
             }
         } catch (error: any) {
             console.warn('[ACL Config] apply singbox template error:', error?.message || error);

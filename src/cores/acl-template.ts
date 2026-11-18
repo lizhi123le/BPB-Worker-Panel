@@ -676,8 +676,13 @@ export interface AclSingboxResult {
     rules: RoutingRule[];
     // 内含两类：URL provider 服务端内联（inline），以及 geoip 规则所需的 remote/binary 规则集
     ruleSets: Array<RuleSet | { type: 'inline'; tag: string; rules: Array<Record<string, string[]>> }>;
-    // 不下发 `final`：模板的 `[]FINAL` 在 sing-box 端没有对应规则，默认去向由调用方取「模板第一个分组」
-    // （configs.ts#aclDefaultGroup，与 Clash 端一致）。原先这里回传过一个 final 字段，但已无消费者。
+    /**
+     * 模板 `[]FINAL` 指向的分组 → 调用方写成 `route.final`（与 Clash 的 `MATCH,<组>` 同口径）。
+     * 模板没写 FINAL 时退化为第一个分组；一个分组都没生成时为 `direct`（恒存在的内置出站）。
+     * 注意它**只**用于 route.final：DNS 的 detour 与 clash_mode Global 取的是「第一个分组」
+     * （configs.ts#aclDefaultGroup），两者不可混用 —— 前者是「其余流量的去向」，后者是「默认上网策略」。
+     */
+    final: string;
     /** 模板里有拦截组（成员含 REJECT）时给出承载它的 block 出站；调用方必须把它加进 config.outbounds */
     blockOutbound?: SbBlockOutbound;
 }
@@ -766,11 +771,14 @@ export async function buildAclSingbox(
 
     // inline 规则 → route rule
     const inlineRouteRules: RoutingRule[] = [];
+    let finalGroup = undefined as string | undefined;
     for (const rule of inlineRules) {
-        // 模板的 `[]FINAL` 在 sing-box 端没有对应规则：真正的默认去向由调用方取「模板第一个分组」
-        // （configs.ts#aclDefaultGroup，Clash 端同一口径）。这里必须显式跳过 —— 落到下面的类型派发
-        // 会被当成未知类型打 warn（每份模板都带 FINAL，等于每次生成都刷一条噪音）。
-        if (rule.ruleType.toUpperCase() === 'FINAL') continue;
+        // 模板的 `[]FINAL` 在 sing-box 端不是一条 route rule，而是 `route.final`（调用方写进配置）：
+        // 记下它指向的组后跳过 —— 落到下面的类型派发会被当成未知类型打 warn（每份模板都带 FINAL）。
+        if (rule.ruleType.toUpperCase() === 'FINAL') {
+            finalGroup = rule.group || finalGroup;
+            continue;
+        }
         // B-47：与 Clash 侧共用同一份修饰符剥离。`10.0.0.0/8,no-resolve` 若整串当 ip_cidr 值下发，
         // sing-box 启动期解析失败、整份配置不可用（修饰符在 sing-box 无对应写法，只能丢弃）。
         const { value: ruleVal } = splitRuleModifiers(rule.ruleVal);
@@ -814,10 +822,17 @@ export async function buildAclSingbox(
         inlineRouteRules.push(ruleObj);
     }
 
+    // route.final 的取值：模板 FINAL 指向的组必须真实存在（悬空 tag 会让内核启动失败）→ 复用上面的
+    // keepGroup，告警文案与其它规则一致；它没写 FINAL（或被丢弃）则退化为第一个分组，
+    // 一个分组都没生成时用 direct（恒存在的内置出站）。
+    if (finalGroup && !keepGroup(finalGroup, 'FINAL')) finalGroup = undefined;
+    const final = finalGroup || (groups.length > 0 ? groups[0].name : 'direct');
+
     return {
         outboundGroups,
         rules: [...urlRules, ...inlineRouteRules],
         ruleSets,
+        final,
         ...(hasBlockGroup ? { blockOutbound: { type: 'block' as const, tag: REJECT_OUTBOUND_TAG } } : {}),
     };
 }
