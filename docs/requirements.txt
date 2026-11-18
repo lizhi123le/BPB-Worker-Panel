@@ -1,0 +1,15 @@
+# GitHub Pages 文档站（docs/en + docs/fa）的 Python 依赖。
+#
+# 为什么锁定版本，而不是 CI 里直接 `pip install mkdocs-material`：
+#   docs/{en,fa}/mkdocs.yml 里的 theme.custom_dir 指向 ../assets，
+#   markdown_extensions 又通过 !!python/name:material.extensions.emoji.twemoji
+#   直接引用主题内部的 Python 路径（解析发生在构建期，而不是渲染期）。
+#   主题 9.x 的任意次版本都可能改动模板目录布局或 extensions API，
+#   浮动安装会让"昨天还绿的 Pages 部署"在某次上游发版后无故变红/变样。
+#
+# 为什么是 9.8.1：该版本 requires_python >=3.11（3.9 已 EOL，装不到这一版）。
+#
+# 升级流程：改下面的版本号 -> 本地 `python -m pip install -r docs/requirements.txt`
+# -> `python -m mkdocs build -f docs/en/mkdocs.yml` 与 fa 各跑一次，
+# 确认站点外观与导航无回归后再提交。
+mkdocs-material==9.8.1

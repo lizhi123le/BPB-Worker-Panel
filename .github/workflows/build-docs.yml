@@ -8,27 +8,53 @@ on:
 permissions:
   contents: write
 
+# 同一 ref 同时只允许一个 Pages 部署。peaceiris/actions-gh-pages 用 force_orphan
+# 推 gh-pages（整棵树重写），两次 push 撞在一起时后到的推送会覆盖前一次的结果，
+# 页面上就会出现「内容对不上最新 main」的假象。
+concurrency:
+  group: pages-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-deploy:
-    runs-on: ubuntu-latest
+    # 不用 ubuntu-latest：它会随 GitHub 的镜像轮换自动漂移（2026-11 已指向
+    # Ubuntu 26.04），而 actions/python-versions 只为较老的镜像预编译旧解释器，
+    # 于是 setup-python 在"本地缓存没命中"之后直接报
+    # `version '3.9' ... was not found for Ubuntu 26.04`。
+    # 固定镜像 = runner 环境可复现，升级镜像是一个显式的、需要重跑验证的决定。
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
-          python-version: 3.9
+          # 3.9 既已 EOL，也满足不了当前主题（mkdocs-material 9.8.x 要求 >=3.11）；
+          # 3.12 在 ubuntu-24.04 的预编译清单里存在，是这里最短的可用路径。
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
 
       - name: Install dependencies
-        run: pip install mkdocs-material
+        # 依赖清单见 docs/requirements.txt（锁定版本的说明也写在那里）。
+        # 用 `python -m pip` / `python -m mkdocs` 而不是裸命令：保证用的是
+        # setup-python 装的那套解释器和 console script，不受 runner 上其它
+        # Python 排序影响。
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r docs/requirements.txt
+          python -m mkdocs --version
 
       - name: Build English site
-        run: mkdocs build -f docs/en/mkdocs.yml
+        # 顺序有意义：en 的 site_dir 是 ../../site（相对 docs/en/mkdocs.yml），
+        # mkdocs 构建前会清空自己的 site_dir，所以 en 必须先构建，
+        # 否则会把 fa 已经写进 site/fa 的产物一并删掉。
+        run: python -m mkdocs build -f docs/en/mkdocs.yml
 
       - name: Build Farsi site
-        run: mkdocs build -f docs/fa/mkdocs.yml
+        run: python -m mkdocs build -f docs/fa/mkdocs.yml
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
