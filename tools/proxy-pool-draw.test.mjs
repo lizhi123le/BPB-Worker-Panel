@@ -31,9 +31,11 @@
  *  10. 探测即预连接：第一条候选一被测通，它那条**已建好的 socket** 直接接管成数据连接，首包在
  *      「等整批探测收口」之前就发出去 —— 日志是 `race dial winner (probe socket` 且没有
  *      `race dialing batch`；接管**不新开连接**（connect 次数 = 探测条数，峰值仍 ≤ 3）
- *  11. 探测总预算的 env 覆盖（`PROBE_PHASE_BUDGET_MS`）：默认 2000ms；设成低于下限 1000ms 的值
- *      会被钳到 1000ms 并告警 —— 此时慢候选（首连 1.4s）第一波全部探测超时判死、没有可接管对象，
- *      必须退回批次循环仍能连通（预算用尽/跳过的候选按 unknown 处理：不记退避、仍照常拨号）
+ *  11. 探测总预算的 env 覆盖与钳制（`PROBE_PHASE_BUDGET_MS`）：默认 1000ms、可调区间 50~3000ms。
+ *      过小值（10）钳到下限 50ms 并告警 —— 此时慢候选（首连 1.4s）第一波全部探测超时判死、
+ *      没有可接管对象，必须退回批次循环仍能连通（预算用尽/跳过的候选按 unknown 处理：不记退避、
+ *      仍照常拨号）；过大值（99999）反向钳到上限 3000ms 并告警，预算足时恢复「探测即预连接」。
+ *      区间内的边界值（3000）不钳制、不告警（阶段 H 就用它给慢候选留足预算）。
  *
  * 前提：先构建过（`NODE_ENV=mangle node scripts/build.js`），本测试加载
  * .build/worker.reference.js（混淆前产物，行为等价且可读）。
@@ -576,10 +578,18 @@ check('默认模式 + CF 目标：连接成功返回 101',
 //        （第一波探测 3 条，其中 1 条成为数据连接），而不是「3 探测 + 1 抢跑拨号」的 4。
 //    ⚠️ 这一阶段不再依赖预算：拦住第二波的是「已接管」，不是剩余预算（旧注释写错过一次）。
 //       预算本身由阶段 I 用 env 单独钉。
+//    ⚠️ 但预算要先给足：默认 1000ms **短于**这里的 SLOW_MS（1.4s），慢候选会在默认档被判死。
+//       本阶段考的是「接管」路径，所以显式用上限边界值 3000ms（顺带钉「区间内的边界值不钳制、
+//       不打告警」）。
 out(`— 阶段 H：${SLOW_POOL.length} 条慢候选（首连 ${SLOW_MS}ms）→ 探测即预连接（约 +1.6s）—`);
 env.PROXY_IP = SLOW_DOMAIN;
+env.PROBE_PHASE_BUDGET_MS = '3000';
 dohIps = SLOW_POOL;
 const slow = await runConnection('?qj=only', TARGET, SLOW_MS + 400);
+delete env.PROBE_PHASE_BUDGET_MS;
+check('慢候选：预算取上限边界值 3000ms 时不被钳制、不打告警',
+    !slow.logs.some((l) => l.includes('[探针预算]')),
+    `logs=${slow.logs.filter((l) => l.includes('探针预算')).join(' | ')}`);
 check('慢候选：接管后不再碰剩余候选（整场只碰过第一波的 3 条）',
     slow.probed.size > 0 && slow.probed.size <= 3,
     `probed=${[...slow.probed].join(',')} dialed=${slow.dialed.join(' | ')}`);
@@ -597,20 +607,22 @@ check('慢候选：连接成功返回 101',
     slow.status === 101,
     `status=${slow.status}`);
 
-// ── 阶段 I：探测总预算的 env 覆盖（约 +2.8s）──
-//    同一批慢候选（首连 1.4s），把 `PROBE_PHASE_BUDGET_MS` 设成 500（低于下限 1000）：
-//      · env 真的被读到 → 打一条「低于下限 → 按 1000ms 生效」的告警；
-//      · 生效预算 1000ms < 慢候选的 1.4s → 第一波探测**全部超时判死**，没有候选可接管
+// ── 阶段 I：探测总预算的 env 钳制（约 +4s）──
+//    I-1 同一批慢候选（首连 1.4s），把 `PROBE_PHASE_BUDGET_MS` 设成 10（低于下限 50）：
+//      · env 真的被读到 → 打一条「低于下限 → 按 50ms 生效」的告警；
+//      · 生效预算 50ms ≪ 慢候选的 1.4s → 第一波探测**全部超时判死**，没有候选可接管
 //        （日志里不该出现 `race dial winner (probe socket`）；
 //      · 于是必须走批次循环，由第二次建连（立即成功）连上 → 101 + `race dialing batch`。
-//    这一对（阶段 H 默认 2s → 接管 / 阶段 I 收紧 → 批次）就是预算开关的回归钉。
-out('— 阶段 I：PROBE_PHASE_BUDGET_MS=500（钳到 1000ms）→ 探测判死、改走批次（约 +2.8s）—');
-env.PROBE_PHASE_BUDGET_MS = '500';
-// 等待 = 探测超时(1s) + 批次里那几条候选的**首次**建连（桩里同样是 SLOW_MS）
+//    I-2 换成快候选池，把同一个 env 设成 99999（高于上限 3000）：反向钳到 3000ms 并告警，
+//        预算重新充足 → 回到「探测即预连接」（证明上限钳制不是把探测关掉）。
+//    这一对（阶段 H 边界内 → 接管 / 阶段 I 双向越界 → 钳制生效）就是预算开关的回归钉。
+out('— 阶段 I-1：PROBE_PHASE_BUDGET_MS=10（钳到 50ms）→ 探测判死、改走批次（约 +2.8s）—');
+env.PROBE_PHASE_BUDGET_MS = '10';
+// 等待 = 探测超时(50ms) + 批次里那几条候选的**首次**建连（桩里同样是 SLOW_MS）
 const tight = await runConnection('?qj=only', TARGET, SLOW_MS * 2);
 delete env.PROBE_PHASE_BUDGET_MS;
-check('预算 env：非法/过低值被钳到下限并打一条告警',
-    tight.logs.some((l) => l.includes('[探针预算]') && l.includes('按 1000ms 生效')),
+check('预算 env：过小值被钳到下限 50ms 并打一条告警',
+    tight.logs.some((l) => l.includes('[探针预算]') && l.includes('按 50ms 生效')),
     `logs=${tight.logs.filter((l) => l.includes('探针预算')).join(' | ')}`);
 check('预算 env：收紧后没有候选被接管（探测全部判死）',
     !tight.logs.some((l) => l.includes('race dial winner (probe socket')),
@@ -618,6 +630,19 @@ check('预算 env：收紧后没有候选被接管（探测全部判死）',
 check('预算 env：收紧后改走批次循环并连通',
     tight.logs.some((l) => l.includes('race dialing batch')) && tight.status === 101,
     `status=${tight.status} logs=${tight.logs.filter((l) => l.includes('race dial')).join(' | ')}`);
+
+out('— 阶段 I-2：PROBE_PHASE_BUDGET_MS=99999（钳到 3000ms）→ 告警 + 恢复探测即预连接 —');
+env.PROXY_IP = PROXY_DOMAIN;
+dohIps = POOL;
+env.PROBE_PHASE_BUDGET_MS = '99999';
+const oversized = await runConnection('?qj=only', TARGET, CONN_WAIT_MS);
+delete env.PROBE_PHASE_BUDGET_MS;
+check('预算 env：过大值被钳到上限 3000ms 并打一条告警',
+    oversized.logs.some((l) => l.includes('[探针预算]') && l.includes('按 3000ms 生效')),
+    `logs=${oversized.logs.filter((l) => l.includes('探针预算')).join(' | ')}`);
+check('预算 env：钳回上限后仍在探测并连通（上限钳制没把探测关掉）',
+    oversized.probed.size > 0 && oversized.status === 101,
+    `probed=${[...oversized.probed].join(',')} status=${oversized.status}`);
 
 // ── 并发总账（整场，含慢候选阶段）──
 //    这条是「探测窗口限流」的兜底：任何一条路径退回到「一次性全发」（大池 6 条、v6 池 6 条），
