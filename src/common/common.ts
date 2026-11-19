@@ -335,15 +335,18 @@ export async function crossRequestSingleFlight<T>(
     }
 }
 
-/** Build optional HSTS header object based on the HSTS_ENABLE flag (cfnew semantics). */export function hstsHeaders(env: Record<string, string | undefined> | undefined): Record<string, string> {
-    if (env && (env.HSTS_ENABLE === '1' || env.HSTS_ENABLE === 'true')) {
-        return { 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload' };
-    }
-    return {};
+/**
+ * Build optional HSTS header object based on the HSTS_ENABLE flag (cfnew semantics).
+ * 默认开启：未设置 / '1' / 'true' 都加 HSTS；只有显式 '0' / 'false' 才不加。
+ */
+export function hstsHeaders(env: Record<string, string | undefined> | undefined): Record<string, string> {
+    const flag = env?.HSTS_ENABLE;
+    if (flag === '0' || flag === 'false') return {};
+    return { 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload' };
 }
 
 /**
- * F13：面板/登录/密钥/错误页与 JSON 接口的通用安全响应头（HSTS 仍按 env 开关，默认不加）。
+ * F13：面板/登录/密钥/错误页与 JSON 接口的通用安全响应头（HSTS 按 env 开关，**默认加**）。
  *
  * CSP 刻意**只**含 `object-src` / `base-uri` / `frame-ancestors` 三条，不含 `default-src`/`script-src`：
  * 四个 index.html 大量依赖内联 `onclick`（panel/index.html 就有 59 处）与内联 `<script>`，

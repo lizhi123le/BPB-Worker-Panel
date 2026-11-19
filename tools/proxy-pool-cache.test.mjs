@@ -36,7 +36,7 @@ const BUNDLE_PATH = join(OUT_DIR, 'utils-bundle.mjs');
 
 const PROXY = 'ProxyIP.KR.CMLiussss.net:443';
 const TARGET = 'x.com';
-const TTL = 10 * 60 * 1000;
+const TTL = 12 * 60 * 1000;
 const IPV4 = ['1.2.3.4', '1.2.3.5', '1.2.3.6'];
 
 const { check, finish } = createReporter('proxy-pool-cache');
@@ -224,7 +224,7 @@ async function main() {
     const fetchBeforeTtl = fetchCount;
     for (const [url, entry] of ttlCache.store) {
         const parsed = JSON.parse(entry.body);
-        parsed.time -= 61 * 1000;   // 默认 10min TTL 下这仍新鲜，只有 env 生效才会过期
+        parsed.time -= 61 * 1000;   // 默认 12min TTL 下这仍新鲜，只有 env 生效才会过期
         ttlCache.store.set(url, { body: JSON.stringify(parsed), headers: entry.headers });
     }
     const t2 = await newIsolate();

@@ -391,9 +391,9 @@ for (let i = 0; i < 15; i++) {
     await sleep(100);
 }
 const defaultLines = logs.slice(logsBeforeDefaults).filter((l) => l.includes('downlink '));
-// 默认值已按业主指定调整为 20MB/s / 900MiB（突发 3MiB：见下一段的显式 env 用例，
+// 默认值已按业主指定调整为 20MiB/s（20971520 B/s）/ 900MiB（突发 3MiB：见下一段的显式 env 用例，
 // 这里只钉「未设 env 时生效的是哪个数」，所以断言的是 B/s 与预算的绝对值）。
-check('默认值：下行速率上限默认 20MB/s', defaultLines.some((l) => l.includes('cap=20000000B/s')),
+check('默认值：下行速率上限默认 20MiB/s', defaultLines.some((l) => l.includes('cap=20971520B/s')),
     `lines=${defaultLines.slice(-2).join(' | ')}`);
 check('默认值：会话字节预算默认 900MB', defaultLines.some((l) => l.includes('budget=943718400B')),
     `lines=${defaultLines.slice(-2).join(' | ')}`);
@@ -460,8 +460,8 @@ check('小块饱和喂入：字节总量与喂入量一致（不丢不重）', d
 // 现场依据（2026-11-16）：平台在 ~20 分钟窗口把长连接 load-shed 掉（`$workers.outcome = "loadShed"`，
 // wallTimeMs ≈ 1.17e6、cpuTimeMs ≈ 20），客户端拿到 1101 `internal error; reference = …`。
 // 这条用例钉住「服务端比平台先动手」：上限设 1s，看门狗粒度自动从 5s 降到 250ms。
-check('默认值：会话看门狗默认 idle=600s / max=900s',
-    logs.some((l) => l.includes('session guard: idle=600s max=900s')),
+check('默认值：会话看门狗默认 idle=599s / max=899s',
+    logs.some((l) => l.includes('session guard: idle=599s max=899s')),
     `guardLines=${logs.filter((l) => l.includes('session guard')).slice(-2).join(' | ')}`);
 
 plan = { mode: 'stream', queue: [] };

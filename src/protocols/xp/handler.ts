@@ -42,10 +42,10 @@ const XP_HEADER_LIMIT = 8 * 1024;
 /** 首包到达超时：客户端只建连接不发头时，不能让配额被无限占用（DoSing 本 isolate 的并发槽位，默认 32） */
 const XP_HEADER_TIMEOUT_MS = 30_000;
 /**
- * 空闲超时默认值（秒）：两个方向都无数据即主动断开（对齐参考实现 30s）。
+ * 空闲超时默认值（秒）：两个方向都无数据即主动断开（参考实现是 30s，本仓按业主指定取 52s）。
  * env `XP_IDLE_TIMEOUT_S` 可覆盖，**显式 0 = 关闭空闲断流**（长暂停/长缓冲的播放器需要）。
  */
-const XP_IDLE_TIMEOUT_S_DEFAULT = 30;
+const XP_IDLE_TIMEOUT_S_DEFAULT = 52;
 /**
  * 下行排队上限默认值（MB）：send() 是同步的，没法把背压反传给 remoteSocketToWS；
  * 超过这个积压量就收口，宁可断一个慢客户端也不让 isolate 内存被拖爆。
@@ -58,7 +58,7 @@ const XP_MAX_QUEUED_MB_DEFAULT = 8;
  * 旧行为是一越过上限立刻 terminate（短时抖动也断）；现在要求**持续超限**超过这个窗口才断，
  * 短暂尖峰（seek、切集、GC 抖动）能被吸收。env `XP_QUEUE_GRACE_S` 覆盖，0 = 立即断（旧行为）。
  */
-const XP_QUEUE_GRACE_S_DEFAULT = 15;
+const XP_QUEUE_GRACE_S_DEFAULT = 12;
 /** 下行流的排队策略上限：desiredSize 按字节计，send() 用它判断积压 */
 const XP_STREAM_HIGH_WATER = 64 * 1024;
 

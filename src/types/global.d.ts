@@ -78,7 +78,7 @@ declare global {
         readonly MASK_IMG_CACHE_MAX?: string;
         /** 伪装图片缓存总字节预算（默认 8388608；低于 65536 回退默认） */
         readonly MASK_IMG_CACHE_BYTES?: string;
-        /** 强制启用 HSTS（'1' / 'true'） */
+        /** HSTS 开关（默认开启；显式 '0' / 'false' 关闭） */
         readonly HSTS_ENABLE?: string;
         /** 反代池缓存的调试日志开关 */
         readonly DEBUG?: string;

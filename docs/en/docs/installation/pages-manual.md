@@ -138,18 +138,18 @@ These environment variables control the reverse-proxy used to disguise the panel
 | `MASK_CACHE_NOISE_EXTRA` | *(empty)* | Extra query parameters to ignore in the cache key. ⚠️ Only parameters that never change content — adding `id`/`page`/`token` merges different pages into one cache entry. |
 | `MASK_CACHE_TS_NORM` | `1` | `0` disables timestamp normalisation (rollback switch). |
 | `MASK_IMG_MODE` | `shell` | `data` restores the legacy inline `data:` URI image page (rollback switch). |
-| `WS_UPLINK_ISOLATE_MB` | `16` | Isolate-wide uplink buffering budget (MB), split across active WebSockets (per-connection floor 256 KiB). |
-| `WS_MAX_CONNECTIONS` | `128` | WebSocket connections per isolate (clamped 1–1024; `0`/invalid → default). ≈136 KiB of buffers per connection (worst ≈336 KiB), so 128 ≈ 17–43 MiB of the 128 MB isolate; raise it only if you watch memory. |
-| `WS_DOWNLINK_BPS` | `10000000` | Downlink rate cap in **bytes per second** (10 MB/s ≈ 80 Mbps) — the only downlink flow control that exists, since the Workers `WebSocket` has no `bufferedAmount` and `send()` returns `void`. Raise it for >80 Mbps links, or set `0` to disable. The burst allowance is a separate knob (`WS_DOWNLINK_BURST_KB`). |
-| `WS_DOWNLINK_BURST_KB` | `2048` | Per-connection burst allowance (bucket capacity) in KiB, floored at 256 KiB. Decoupled from the rate so that 8 parallel connections (e.g. a speed test) queue 16 MiB instead of `8 × rate`. `0` restores capacity = rate. |
+| `WS_UPLINK_ISOLATE_MB` | `32` | Isolate-wide uplink buffering budget (MB), split across active WebSockets (per-connection floor 256 KiB). |
+| `WS_MAX_CONNECTIONS` | `256` | WebSocket connections per isolate (clamped 1–1024; `0`/invalid → default). ≈136 KiB of buffers per connection (worst ≈336 KiB), so 256 ≈ 34–86 MiB of the 128 MB isolate; raise it only if you watch memory. |
+| `WS_DOWNLINK_BPS` | `20971520` | Downlink rate cap in **bytes per second** (20 MiB/s ≈ 168 Mbps) — the only downlink flow control that exists, since the Workers `WebSocket` has no `bufferedAmount` and `send()` returns `void`. Raise it for faster links, or set `0` to disable. The burst allowance is a separate knob (`WS_DOWNLINK_BURST_KB`). |
+| `WS_DOWNLINK_BURST_KB` | `3072` | Per-connection burst allowance (bucket capacity) in KiB, floored at 256 KiB. Decoupled from the rate so that 8 parallel connections (e.g. a speed test) queue 24 MiB instead of `8 × rate`. `0` restores capacity = rate. |
 | `WS_SESSION_MAX_MB` | `900` | Per-connection downlink byte budget; reaching it closes the connection cleanly so the client reconnects, instead of the platform killing the isolate. Set `0` to disable. |
-| `WS_IDLE_TIMEOUT_S` | `600` | Close a WebSocket session after this many seconds with no traffic in either direction. Guards slow/idle sessions that never trip the byte budget. Set `0` to disable. |
-| `WS_MAX_SESSION_S` | `900` | Hard cap on one WebSocket session's lifetime, kept below the platform's ~20 min grace window (Cloudflare otherwise ends long-lived connections with `outcome = loadShed` → client sees 1101). Closing first makes it a clean reconnect. Set `0` to disable. |
+| `WS_IDLE_TIMEOUT_S` | `599` | Close a WebSocket session after this many seconds with no traffic in either direction. Guards slow/idle sessions that never trip the byte budget. Set `0` to disable. |
+| `WS_MAX_SESSION_S` | `899` | Hard cap on one WebSocket session's lifetime, kept below the platform's ~20 min grace window (Cloudflare otherwise ends long-lived connections with `outcome = loadShed` → client sees 1101). Closing first makes it a clean reconnect. Set `0` to disable. |
 | `WS_DOWNLINK_STATS` | `0` | Set to `1` to emit the per-second `downlink …` throughput line without setting the whole panel to Log Level = debug. |
 | `XP_MAX_CONNECTIONS` | `32` | Concurrent XHTTP tunnels per isolate (clamped 1–1024). |
-| `XP_IDLE_TIMEOUT_S` | `30` | Close an XHTTP tunnel after this many seconds with no traffic in either direction; `0` disables (needed for long pauses/buffering on 4K). |
+| `XP_IDLE_TIMEOUT_S` | `52` | Close an XHTTP tunnel after this many seconds with no traffic in either direction; `0` disables (needed for long pauses/buffering on 4K). |
 | `XP_MAX_QUEUED_MB` | `8` | Downlink queue limit per XHTTP tunnel; `0` disables. |
-| `XP_QUEUE_GRACE_S` | `15` | Grace before closing a tunnel whose queue stays above the limit (rate-limiting already applies); `0` = close immediately. |
+| `XP_QUEUE_GRACE_S` | `12` | Grace before closing a tunnel whose queue stays above the limit (rate-limiting already applies); `0` = close immediately. |
 
 ## Updating the Panel
 

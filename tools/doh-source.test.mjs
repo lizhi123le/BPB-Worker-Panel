@@ -10,11 +10,11 @@
  *        A5 宽限期显式 0 → 谁先到用谁（关掉 CF 优先）
  *   B. 三个 env 旋钮的钳制 / 回退 / 派生关系，以及「超时真的接到 AbortSignal.timeout 上」
  *        `DOH_TIMEOUT_MS`（默认 500，区间 50~6000）
- *        `DOH_SOURCE_GRACE_MS`（默认 260，区间 0~2000；显式 0 = 关掉 CF 优先）
- *        `DOH_WAIT_STALL_MS`（默认 260，区间 50 ~ min(3000, 超时 − 50)）
+ *        `DOH_SOURCE_GRACE_MS`（默认 300，区间 0~2000；显式 0 = 关掉 CF 优先）
+ *        `DOH_WAIT_STALL_MS`（默认 300，区间 50 ~ min(3000, 超时 − 50)）
  *        `DOH_WAIT_BUDGET_MS`（默认 1000，区间 50~10000；单飞等待的总上界）
  *   C. 单飞等待方的进展感知
- *        C1 无进展（所有 DoH 都挂住）→ 260ms 就自己上（4+4=8 次，而不是干等满总上界）
+ *        C1 无进展（所有 DoH 都挂住）→ 300ms 就自己上（4+4=8 次，而不是干等满总上界）
  *        C2 有进展（同一轮解析里陆续有 DoH 完成）→ 继续等，仍只解析一次（4 次）
  *        C3 阈值调大后，慢但会完成的解析不再被重复（4 次）
  *        C4 总上界（env `DOH_WAIT_BUDGET_MS`）比 stall 更紧时，由预算先到
@@ -120,7 +120,7 @@ async function main() {
         check('A2 耗时不随 CF 的计时增长（≈ Google 的 60ms）', () => assert.ok(t2.ms < 400, `耗时 ${t2.ms}ms`));
     }
 
-    // ── A3：Google 先答非空、CF 在宽限期（260ms）内到 → 仍用 CF ──
+    // ── A3：Google 先答非空、CF 在宽限期（300ms）内到 → 仍用 CF ──
     {
         const t = await resolveOnce('a3-pool.example.net', {
             [CF_HOST]: { A: { delay: 140, records: CF_A }, AAAA: { delay: 140, records: CF_AAAA } },
@@ -185,7 +185,7 @@ async function main() {
             check('B 高于上限 → 钳到 6000ms', () => assert.strictEqual(mod.dohTimeoutMs(), 6000));
 
             globalThis.env = undefined;
-            check('B 未设 DOH_SOURCE_GRACE_MS → 默认 260ms', () => assert.strictEqual(mod.dohSourceGraceMs(), 260));
+            check('B 未设 DOH_SOURCE_GRACE_MS → 默认 300ms', () => assert.strictEqual(mod.dohSourceGraceMs(), 300));
             globalThis.env = { DOH_SOURCE_GRACE_MS: '100' };
             check('B DOH_SOURCE_GRACE_MS 区间内原样生效', () => assert.strictEqual(mod.dohSourceGraceMs(), 100));
             globalThis.env = { DOH_SOURCE_GRACE_MS: '0' };
@@ -194,7 +194,7 @@ async function main() {
             check('B DOH_SOURCE_GRACE_MS 高于上限 → 钳到 2000ms', () => assert.strictEqual(mod.dohSourceGraceMs(), 2000));
 
             globalThis.env = undefined;
-            check('B 未设 DOH_WAIT_STALL_MS → 默认 260ms', () => assert.strictEqual(mod.dohWaitStallMs(), 260));
+            check('B 未设 DOH_WAIT_STALL_MS → 默认 300ms', () => assert.strictEqual(mod.dohWaitStallMs(), 300));
             globalThis.env = { DOH_WAIT_STALL_MS: '150' };
             check('B DOH_WAIT_STALL_MS 区间内原样生效', () => assert.strictEqual(mod.dohWaitStallMs(), 150));
             globalThis.env = { DOH_WAIT_STALL_MS: '30' };
@@ -243,7 +243,7 @@ async function main() {
         });
     }
 
-    // ── C1：无进展 → 等待方 260ms 就自己上 ──
+    // ── C1：无进展 → 等待方 300ms 就自己上 ──
     {
         const SLOW = 700;
         plan = BOTH_SOURCES({ delay: SLOW, records: CF_A }, { delay: SLOW, records: [] });
@@ -255,12 +255,12 @@ async function main() {
         const second = mod.resolveProxyIPPool('c1-pool.example.net:443', 'c1.example.com', '');
         const [r1, r2] = await Promise.all([first, second]);
         const ms = Date.now() - startedAt;
-        check('C1 无进展 260ms：等待方自己上（4 + 4 = 8 次 DoH，而不是干等满总上界）', () => {
+        check('C1 无进展 300ms：等待方自己上（4 + 4 = 8 次 DoH，而不是干等满总上界）', () => {
             assert.strictEqual(callCount - before, 8, `实际 ${callCount - before} 次`);
         });
         check('C1 两条连接拿到同一份池，且总耗时不接近总上界（1000ms）', () => {
             assert.deepStrictEqual(asSet(r2), asSet(r1));
-            // 区分度：stall(260) 生效 → ≈700ms（两条管线并行跑完）；若 stall 失效、由总上界兜底
+            // 区分度：stall(300) 生效 → ≈700ms（两条管线并行跑完）；若 stall 失效、由总上界兜底
             // → 1000 + 700 = 1700ms。取 1200 作为分界，留 500ms 的 CI 抖动余量。
             assert.ok(ms < 1200, `耗时 ${ms}ms`);
         });
@@ -268,7 +268,7 @@ async function main() {
 
     // ── C2：有进展 → 继续等，仍只解析一次 ──
     {
-        // A 在 100ms 完成（两条源都算进展），AAAA 在 260ms 完成 —— 中间间隔 160ms < 260ms，
+        // A 在 100ms 完成（两条源都算进展），AAAA 在 260ms 完成 —— 中间间隔 160ms < 300ms，
         // 所以等待方应当继续等，最终命中生产者写入的一级缓存，而不是自己再解析一轮。
         plan = BOTH_SOURCES({ delay: 100, records: CF_A }, { delay: 260, records: [] });
         const mod = await loadModule();
@@ -286,7 +286,7 @@ async function main() {
     // ── C3：把阈值调大（env）后，慢但会完成的解析不再被重复 ──
     {
         // 阈值 900ms（派生上限 3000ms 内，允许）：生产者 700ms 完成，等待方应当等到它，而不是
-        // 在 260ms 处自己上。顺带钉住「阈值确实来自 env，而不是写死的 260」。
+        // 在 300ms 处自己上。顺带钉住「阈值确实来自 env，而不是写死的 300」。
         plan = BOTH_SOURCES({ delay: 700, records: CF_A }, { delay: 700, records: [] });
         globalThis.env = { DOH_TIMEOUT_MS: '6000', DOH_WAIT_STALL_MS: '900' };
         const mod = await loadModule();
@@ -304,10 +304,10 @@ async function main() {
 
     // ── C4：总上界 env 生效——预算小于 stall 时，由预算先到（谁更紧谁说话）──
     {
-        // DoH 700ms 挂住（无进展），stall 默认 260、预算压到 100 → 预算先到（100 < 260）：
-        // 等待方在 ~100ms 就自己上 → 4 + 4 = 8 次。若预算被忽略（仍是 1000），则 stall 在 260
+        // DoH 700ms 挂住（无进展），stall 默认 300、预算压到 100 → 预算先到（100 < 300）：
+        // 等待方在 ~100ms 就自己上 → 4 + 4 = 8 次。若预算被忽略（仍是 1000），则 stall 在 300
         // 才触发，两者都会给 8 次 —— 所以再加一条耗时断言来区分：总耗时应接近 700ms（两条管线
-        // 并行跑完），而不是 260 + 700 = 960ms。
+        // 并行跑完），而不是 300 + 700 = 1000ms。
         plan = BOTH_SOURCES({ delay: 700, records: CF_A }, { delay: 700, records: [] });
         globalThis.env = { DOH_WAIT_BUDGET_MS: '100' };
         const mod = await loadModule();
@@ -323,7 +323,7 @@ async function main() {
             assert.strictEqual(callCount - before, 8, `实际 ${callCount - before} 次`);
             assert.deepStrictEqual(asSet(r2), asSet(r1));
         });
-        check('C4 比 stall(260) 更早放手：总耗时接近 700ms 而不是 960ms', () => assert.ok(ms < 860, `耗时 ${ms}ms`));
+        check('C4 比 stall(300) 更早放手：总耗时接近 700ms 而不是 1000ms', () => assert.ok(ms < 860, `耗时 ${ms}ms`));
     }
 
     finish();

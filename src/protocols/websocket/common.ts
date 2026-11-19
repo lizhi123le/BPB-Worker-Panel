@@ -1474,9 +1474,9 @@ const WS_SESSION_MAX_MB_DEFAULT = 900;
  *
  * 默认值对 4K（25~50Mbps）有数倍余量，正常播放不会咬到它；它的作用是**兜底**：
  * 一旦客户端链路远低于这个值，无界排队就会被压成稳定速率，而不是一直涨到 isolate 被打死。
- * 链路更快（>80Mbps）的部署在跑大文件下载时会被这个上限压住，需要时上调或设 `0` 关闭。
+ * 链路更快（>160Mbps）的部署在跑大文件下载时会被这个上限压住，需要时上调或设 `0` 关闭。
  *
- * ⚠️ 现默认 20MB/s（按业主指定）。**这是本仓有过实机结论的一个值，务必读懂再改**：
+ * ⚠️ 现默认 20MiB/s = 20971520 B/s（按业主指定）。**这是本仓有过实机结论的一个值，务必读懂再改**：
  * `docs/analysis/worker-internal-error-1101-2026-11-15.md` §9/§9.3 记录，20MB/s 曾经让
  * 「令牌永远够用 → 节流从不等待 → isolate 发送队列无界堆积」，被平台以
  * `internal error; reference = …` 收口；降到 10MB/s 后同类报错在 10 分钟内明显减少。
@@ -1487,7 +1487,7 @@ const WS_SESSION_MAX_MB_DEFAULT = 900;
  *
  * ⚠️ 它是**全量下行**的上限，不分协议。
  */
-const WS_DOWNLINK_BPS_DEFAULT = 20 * 1000 * 1000;
+const WS_DOWNLINK_BPS_DEFAULT = 20 * 1024 * 1024;
 
 function sessionByteBudget(): number {
     return Math.floor(envNumber('WS_SESSION_MAX_MB', WS_SESSION_MAX_MB_DEFAULT, true) * 1024 * 1024);
@@ -1994,12 +1994,12 @@ export function runWsCleanupHooks(webSocket: WebSocket): void {
  * 客户端立刻自动重连（无错误页、无 1101），平台也就没机会 shed 它。
  *
  * 默认值都刻意小于平台的 ~20 分钟窗口：
- *   - `WS_IDLE_TIMEOUT_S` 600s：双向都无流量 10 分钟 → 判为死连接，关掉；
- *   - `WS_MAX_SESSION_S`  900s：单连接最长存活 15 分钟 → 强制换一条新连接。
+ *   - `WS_IDLE_TIMEOUT_S` 599s：双向都无流量 ≈10 分钟 → 判为死连接，关掉；
+ *   - `WS_MAX_SESSION_S`  899s：单连接最长存活 ≈15 分钟 → 强制换一条新连接。
  * 两者都可 env 覆盖，**显式 0 = 关闭该保护**（与其它 WS_* 旋钮同一套 envNumber 语义）。
  */
-const WS_IDLE_TIMEOUT_S_DEFAULT = 600;
-const WS_MAX_SESSION_S_DEFAULT = 900;
+const WS_IDLE_TIMEOUT_S_DEFAULT = 599;
+const WS_MAX_SESSION_S_DEFAULT = 899;
 
 /** 按连接登记看门狗。用 WeakMap：连接被回收时登记项自动消失，不需要显式遍历清理 */
 const wsSessionGuards = new WeakMap<WebSocket, SessionWatchdog>();
