@@ -290,7 +290,12 @@ export function createSignatureGate(): SignatureGate {
  * 这里改成只共享「谁正在取」这一**事实**（Set），不共享任何 Promise：
  *   - 生产者在拿到结果、写进缓存后清标记（含失败/异常路径）；
  *   - 等待方用**本请求内创建的定时器**轮询 `read()`，读到即返回；标记消失就自己取；
- *   - 有界等待（默认 40 × 25ms = 1s），绝不无限等。
+ *   - 有界等待（默认 40 × 25ms = 1s），绝不无限等；
+ *   - 等待方还能带一个 `abandonWhen()` 判据：调用方用它表达「生产者虽然还在跑，但没有进展」，
+ *     满足即提前放弃（等着等着发现没戏，比等满上界再重算更划算）。
+ *
+ * 标记的**所有权归先到者**：等待方即便放弃等待、自己取了一次，也不会摘掉生产者的标记 —
+ * 否则第三个调用者立刻看到「没人解析」再算一遍，正是本函数要防的放大。
  *
  * `read()` 必须是同步、幂等、只读已落地结果的函数（拿不到就返回 null）。
  */
@@ -299,7 +304,7 @@ export async function crossRequestSingleFlight<T>(
     key: string,
     read: () => T | null,
     produce: () => Promise<T | null>,
-    options: { tries?: number; delayMs?: number } = {}
+    options: { tries?: number; delayMs?: number; abandonWhen?: () => boolean } = {}
 ): Promise<T | null> {
     const ready = read();
     if (ready !== null) return ready;
@@ -309,6 +314,8 @@ export async function crossRequestSingleFlight<T>(
         const delayMs = options.delayMs ?? 25;
         for (let i = 0; i < tries; i++) {
             if (!markers.has(key)) break;
+            // 生产者没有进展就不再等（判据由调用方给，本函数不猜什么算「进展」）
+            if (options.abandonWhen?.()) break;
             await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
             const waited = read();
             if (waited !== null) return waited;
@@ -319,11 +326,12 @@ export async function crossRequestSingleFlight<T>(
         // 或它已卡住 —— 此时自己去取一次，绝不继续等别人的 Promise。
     }
 
-    markers.add(key);
+    const ownsMarker = !markers.has(key);
+    if (ownsMarker) markers.add(key);
     try {
         return await produce();
     } finally {
-        markers.delete(key);
+        if (ownsMarker) markers.delete(key);
     }
 }
 

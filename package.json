@@ -19,6 +19,7 @@
     "test:camouflage": "node tools/camouflage-cpu.test.mjs",
     "test:wslimit": "node tools/ws-connection-limit.test.mjs",
     "test:pool": "node tools/proxy-pool-draw.test.mjs",
+    "test:doh": "node tools/doh-source.test.mjs",
     "obfuscate": "node scripts/obfuscate.mjs",
     "verify": "node scripts/verify.mjs",
     "smoke": "node scripts/smoke.mjs",

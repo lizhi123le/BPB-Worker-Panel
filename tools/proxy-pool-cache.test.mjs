@@ -27,13 +27,10 @@
  *
  * 前提：`npm install`（需要 esbuild、html-minifier 之外的依赖不变）。不依赖 dist/ 与 .build/。
  */
-import { build } from 'esbuild';
-import { mkdirSync } from 'fs';
-import { dirname, join, resolve } from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
 import assert from 'node:assert';
+import { join } from 'path';
+import { ROOT, asSet, bundleUtils, createReporter, isolateLoader } from './lib/utils-bundle.mjs';
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT_DIR = join(ROOT, '.build/pool-cache-test');
 const BUNDLE_PATH = join(OUT_DIR, 'utils-bundle.mjs');
 
@@ -42,15 +39,7 @@ const TARGET = 'x.com';
 const TTL = 10 * 60 * 1000;
 const IPV4 = ['1.2.3.4', '1.2.3.5', '1.2.3.6'];
 
-let failures = 0;
-const out = (...args) => process.stdout.write(args.join(' ') + '\n');
-const check = (name, fn) => {
-    try { fn(); out(`PASS  ${name}`); }
-    catch (err) { out(`FAIL  ${name}\n      ${err.message}`); failures++; }
-};
-
-/** [ [host, port], ... ] 按集合比较：池本身是「排序 + 确定性洗牌」后的顺序，不能按字面顺序断言 */
-const asSet = (pool) => [...pool].map(([host, port]) => `${host}:${port}`).sort();
+const { check, finish } = createReporter('proxy-pool-cache');
 const EXPECT_IPS = asSet(IPV4.map((ip) => [ip, 443]));
 
 // ── 假 Cache API：只做「按 URL 存取」，读时返回全新的 Response（Response body 只能读一次）──
@@ -88,34 +77,13 @@ const cache = new FakeCache();
 globalThis.httpConfig = { hostName: 'panel.example.com' };
 globalThis.caches = { default: cache };
 
-let seq = 0;
 /** 每次调用都拿到一个全新的模块实例 = 模拟「连接落到了另一个 isolate」 */
-async function loadModule() {
-    seq++;
-    return await import(`${pathToFileURL(BUNDLE_PATH).href}?iso=${seq}`);
-}
-async function newIsolate() {
-    return (await loadModule()).resolveProxyIPPool;
-}
+const loadModule = isolateLoader(BUNDLE_PATH);
+const newIsolate = async () => (await loadModule()).resolveProxyIPPool;
 
 async function main() {
     // 0) 把 utils.ts 打成单文件（走 tsconfig 的 paths 别名，与构建链路一致）
-    mkdirSync(OUT_DIR, { recursive: true });
-    await build({
-        stdin: {
-            contents: "export { resolveProxyIPPool, poolNeedsDns } from './src/cores/utils';",
-            resolveDir: ROOT,
-            sourcefile: 'pool-cache-entry.ts',
-            loader: 'ts'
-        },
-        outfile: BUNDLE_PATH,
-        bundle: true,
-        format: 'esm',
-        platform: 'node',
-        target: 'esnext',
-        external: ['cloudflare:sockets'],
-        legalComments: 'none'
-    });
+    await bundleUtils({ outFile: BUNDLE_PATH, names: ['resolveProxyIPPool', 'poolNeedsDns'] });
 
     // 0b) 「池是否需要 DNS」的判据：IPv6 字面量不该被当成域名池
     //     （旧判据 /[a-z]/i 会命中 a–f，于是纯 IP 池白做一次 cache.match + 一次 cache.put）
@@ -341,12 +309,7 @@ async function main() {
 
     globalThis.fetch = realFetch;
 
-    out('');
-    if (failures) {
-        out(`proxy-pool-cache: FAILED（${failures} 项）`);
-        process.exit(1);
-    }
-    out('proxy-pool-cache: OK');
+    finish();
 }
 
 await main();

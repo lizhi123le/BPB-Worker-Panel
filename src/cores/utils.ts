@@ -1,4 +1,4 @@
-import { evictOldest, safeErrorMessage, crossRequestSingleFlight, createSignatureGate, envNumber } from "@common";
+import { evictOldest, safeErrorMessage, crossRequestSingleFlight, createSignatureGate, envNumber, withTimeout } from "@common";
 import { PUBLIC_PATH_POOL } from "../common/ratelimit";
 
 // ── H6：跨部署硬编码常量的 env 覆盖入口 ──
@@ -581,7 +581,7 @@ const CF_DOH = 'https://cloudflare-dns.com/dns-query';
 //   冗余**（CF DoH 取不到 / 被墙时还有 AAAA 来源），IPv6 症状的根因在
 //   protocols/websocket/common.ts#connectWithDirectRaceDial 丢掉 AAAA。
 //   代价（须知）：dohAnswersDual 用 Promise.all 会等**两个源都返回**，改前死源是快速 400
-//   失败，改后若某机房到 dns.google 不通，每个记录类型最多多等一次 AbortSignal.timeout(10s)；
+//   失败，改后若某机房到 dns.google 不通，每个记录类型最多多等一次 DoH 超时（见 dohTimeoutMs）；
 //   该源是必要的冗余，但若想彻底零风险可只保留 CF 单源。
 //   正确值与 cfnew 一致（cfnew L193 `https://dns.google/resolve`）。
 //   /resolve 实测：`https://dns.google/resolve?name=ipv6.test-ipv6.com&type=AAAA`
@@ -592,7 +592,7 @@ const GOOGLE_DOH = 'https://dns.google/resolve';
 // 为什么要有：一次请求里同一个域名会被解析**多次** —— 订阅生成先由 getConfigItems 解析节点域名，
 // sing-box 的 DNS 构建（resolveNodeIPs）再解析一次同一个域名；目标分类（isCloudflareTarget）
 // 与直连竞速（resolveTargetDNS）也各要一次；反代池解析（A/AAAA/TXT）同样走 DoH。
-// 没有缓存时这些是多次真实往返，而单次 DoH 的上限是 AbortSignal.timeout(10s) ——
+// 没有缓存时这些是多次真实往返，而单次 DoH 的上限是 `dohTimeoutMs()`（默认 500ms，env 可调）——
 // 重复解析会把 DNS 阶段的耗时上界成倍放大。
 //
 // 为什么只存**原始 Answer**、且只留一份：两个消费方要的形状不同 ——
@@ -614,6 +614,81 @@ const _dohAnswerCache = new Map<string, { answers: any[]; time: number; empty: b
  *  与「空结果只缓存 30s、让上游刚发布的记录能快速生效」的口径冲突。 */
 const DNS_TYPE_CODE: Record<string, number> = { A: 1, AAAA: 28, TXT: 16 };
 
+// ── DoH 出站的时间参数（四个旋钮都 env 可调）+ 一个进度信号 ──
+/** 「env 值被钳制」每个 name=原始值 只 warn 一次（全仓毫秒旋钮共用同一个闸门） */
+const envMsGate = createSignatureGate();
+
+/**
+ * 「env 毫秒旋钮」的**唯一实现**：四个 DoH 旋钮（超时 / 源宽限期 / 无进展阈值 / 等待总上界）、
+ * 探针总预算、反代池缓存 TTL 都走它。语义（顺序即判据，解析统一在 @common#envNumber）：
+ *   · 未设 / 空串 / 非数字 / 负数 → fallback；
+ *   · 显式 0 → zeroMeansOff 时原样返回 zeroValue（默认 0 = 关掉该特性；探针预算传 Infinity = 不限），
+ *     否则仍回落 fallback；
+ *   · 正值 → 钳到 [min, max]，越界按最近边界生效并 warn 一次（按 name=原始值 去重，不刷日志）。
+ * 每次调用现读 env（不缓存）：灰度与回滚都靠它，读一次 env 的成本可忽略。
+ */
+function envMsClamped(tag: string, name: string, fallback: number, min: number, max: number,
+    zeroMeansOff = false, zeroValue = 0): number {
+    const value = envNumber(name, fallback, zeroMeansOff);
+    if (zeroMeansOff && value === 0) return zeroValue;
+    const clamped = Math.min(max, Math.max(min, value));
+    if (clamped !== value && envMsGate.isNew(`${name}=${value}`)) {
+        console.warn(`[${tag}] ${name}=${value} 越界，按 ${clamped}ms 生效`);
+    }
+    return clamped;
+}
+
+/**
+ * 单源 DoH 超时（毫秒）：env `DOH_TIMEOUT_MS`，默认 500，区间 [50, 6000]。
+ * 原值硬编码 10s：DoH 正常 <300ms，10s 等于「挂死也不放手」，而这条最坏路径整段落在首包之前
+ * （反代池解析）或订阅生成里。代价：跨区到 dns.google 这类「慢但会成功」的源会被判空
+ * （空结果只缓存 30s，会自动自愈；池会退化成「域名本身」仍可拨号）。
+ * 注意上限 6000 已低于旧的硬编码 10s —— 「完整回滚到旧行为」得改本文件，不能靠 env。
+ */
+export function dohTimeoutMs(): number { return envMsClamped('DoH', 'DOH_TIMEOUT_MS', 500, 50, 6000); }
+
+/**
+ * 「CF 优先」的执行宽限期（毫秒）：env `DOH_SOURCE_GRACE_MS`，默认 260，区间 [0, 2000]。
+ * 非 CF 源先给出**非空**答案时，再给 CF 这么久；期内 CF 到了仍用 CF（两个源都健康时行为与
+ * 「等两个源」完全一致，只在 CF 慢/挂住时才退化）。**显式 0 = 谁先到用谁**（关掉 CF 优先）。
+ */
+export function dohSourceGraceMs(): number { return envMsClamped('DoH', 'DOH_SOURCE_GRACE_MS', 260, 0, 2000, true); }
+
+/**
+ * 单飞等待方的「无进展就自己上」阈值（毫秒）：env `DOH_WAIT_STALL_MS`，默认 260。
+ * 区间 [50, min(3000, 单源超时 − 50)] —— 上限与 `dohTimeoutMs()` 绑定：必须小于它，否则每条查询
+ * 都会在判据生效前就结束（成功或超时都记一次进展），这条闸门等于永不触发。
+ * 未设时与单源超时的默认档（500）配出 260。
+ */
+export function dohWaitStallMs(): number {
+    const cap = Math.max(50, Math.min(3000, dohTimeoutMs() - 50));
+    return envMsClamped('DoH', 'DOH_WAIT_STALL_MS', 260, 50, cap);
+}
+
+/** 单飞等待方的轮询粒度（毫秒）：25ms 是「发现生产者已写好」的最坏延迟，再细只会白烧定时器。 */
+const DOH_WAIT_POLL_MS = 25;
+
+/**
+ * 单飞等待的**总上界**（毫秒）：env `DOH_WAIT_BUDGET_MS`，默认 1000，区间 [50, 10000]。
+ * 这是「同键已有解析在飞」时等待方最多等多久；无进展时另有 `dohWaitStallMs()` 提前放手，
+ * 两者取先到者。为什么默认只给 1s：一次冷解析 = A/AAAA × 双源 = 4 次 DoH，单次上限 500ms，
+ * 常态总耗时在数百 ms 内；给到 1s 已覆盖常态，再长只是把「生产者卡住」的代价往后拖
+ * （那种情况本就该由 stall 闸门接管）。要更宽容的慢链路就把它调大。
+ */
+export function dohWaitBudgetMs(): number { return envMsClamped('DoH', 'DOH_WAIT_BUDGET_MS', 1000, 50, 10000); }
+
+/** 总上界 → 轮询次数：至少 1 次（预算被钳到下限 50ms 时正好 2 次）。 */
+function dohWaitTries(): number {
+    return Math.max(1, Math.ceil(dohWaitBudgetMs() / DOH_WAIT_POLL_MS));
+}
+
+/**
+ * 出站进度时间戳：每次 `dohQueryRaw` 结束（成功 / 失败 / 超时）都刷新。
+ * 单飞等待方用它判断「生产者还在推进吗」—— `dohWaitStallMs()` 内一条 DoH 都没完成，就判定这条
+ * 管线卡住了、不再白等（见 resolveProxyIPPool 的等待段）。跨请求共享的只有这个时间数字，不含 Promise。
+ */
+let _lastDohProgressAt = 0;
+
 /**
  * 单源原始 Answer（RFC 8484 的 /resolve 风格：accept: application/dns-json）。
  *
@@ -625,28 +700,52 @@ async function dohQueryRaw(domain: string, type: string, dohUrl: string): Promis
     try {
         const response = await fetch(`${dohUrl}?name=${encodeURIComponent(domain)}&type=${type}`, {
             headers: { accept: 'application/dns-json' },
-            signal: AbortSignal.timeout(10_000),
+            signal: AbortSignal.timeout(dohTimeoutMs()),
         });
         const data: any = await response.json();
         return data.Answer || [];
     } catch {
         return [];
+    } finally {
+        // 进度信号：无论成功、失败还是超时，这条管线都「动了一下」—— 单飞等待方据此决定是否继续等
+        _lastDohProgressAt = Date.now();
     }
 }
 
 /**
- * 双源原始 Answer：CF ‖ Google 并发，取**第一个非空**的结果；两个源都空 → []。**DoH 的唯一出站口**
+ * 双源原始 Answer：CF ‖ Google 并发，**先到先用**，同时保住「CF 优先」。**DoH 的唯一出站口**
  * （resolveDNS 与反代池解析都从这里取数）。
  *
- * 用 `Promise.all` 等**两个源都结束**，而不是 `Promise.any` 提前返回：CF 优先取用，但慢源只在
- * 「CF 没给出结果」时才真正被需要 —— 提前丢弃它等于把补回的第二源又扔了。
+ * 旧实现是 `Promise.all`（等两个源都结束）。问题是慢源**只在 CF 没给出结果时才真的被需要**：
+ * CF 100ms 就答完、Google 挂住到超时，这条连接也要等满 —— 白等它没有任何收益，而这整段
+ * 落在首包之前（反代池解析）与订阅生成里。
+ * 现在按 settle 顺序分三支，语义上等价于「CF 非空必胜」，但不再无条件等 CF：
+ *   1) CF 先回：非空即用；**空则必须等 Google**（CF 的优先权只对非空成立）。
+ *   2) Google 先回且非空：给 CF 一个宽限期（dohSourceGraceMs()），期内 CF 非空 → 仍用 CF，
+ *      否则用 Google（两个源都健康时结果与旧实现一致，只在 CF 慢/挂住时才退化）。
+ *   3) Google 先回但为空：等同「CF 还没答」→ 继续等 CF（它可能真有记录）。
+ * 两个源都不会 reject（dohQueryRaw 把一切错误吞成 []），所以这里只需处理 settle 顺序 ——
+ * 抢先返回也不会留下未处理的 rejection。
+ * 宽限期复用 @common#withTimeout（唯一的「竞速 + 超时」实现）：超时按“放弃等待”处理（catch → null），
+ * 不是失败；其定时器由它自己清理。显式 0 要短路，因为 withTimeout 对 ≤0 是“原样返回”。
  */
 async function dohAnswersDual(domain: string, type: string): Promise<any[]> {
-    const [fromCf, fromGoogle] = await Promise.all([
-        dohQueryRaw(domain, type, CF_DOH),
-        dohQueryRaw(domain, type, GOOGLE_DOH),
+    const fromCf = dohQueryRaw(domain, type, CF_DOH);
+    const fromGoogle = dohQueryRaw(domain, type, GOOGLE_DOH);
+
+    const first = await Promise.race([
+        fromCf.then(answers => ({ source: 'cf' as const, answers })),
+        fromGoogle.then(answers => ({ source: 'google' as const, answers })),
     ]);
-    return fromCf.length ? fromCf : fromGoogle;
+
+    // 1) CF 先回
+    if (first.source === 'cf') return first.answers.length ? first.answers : await fromGoogle;
+    // 3) Google 先回但空 → 仍等 CF
+    if (!first.answers.length) return await fromCf;
+    // 2) Google 先回且非空 → 宽限期内等 CF（保住「CF 优先」）；宽限期 0 直接取 Google
+    const grace = dohSourceGraceMs();
+    const cfWithinGrace = grace > 0 ? await withTimeout(fromCf, grace, 'DoH 宽限').catch(() => null) : null;
+    return cfWithinGrace && cfWithinGrace.length ? cfWithinGrace : first.answers;
 }
 
 /**
@@ -1731,22 +1830,11 @@ const PROBE_PHASE_BUDGET_DEFAULT_MS = 1000;
 const PROBE_PHASE_BUDGET_MIN_MS = 50;
 const PROBE_PHASE_BUDGET_MAX_MS = 3000;
 
-/** 「env 值被钳制」只在同一个原始值上打一条 warn（与仓库其它 env 旋钮同口径） */
-const probeBudgetGate = createSignatureGate();
-
-/** 探针总预算的生效值（毫秒；Infinity = 不限）。env 口径见 PROBE_PHASE_BUDGET_DEFAULT_MS 的注释。 */
+/** 探针总预算的生效值（毫秒；Infinity = 不限）。env 口径见 PROBE_PHASE_BUDGET_DEFAULT_MS 的注释；
+ *  解析 + 钳制 + 一次性 warn 都在 envMsClamped 里（显式 0 → zeroValue = Infinity = 不限）。 */
 function probePhaseBudgetMs(): number {
-    // 解析「未设 vs 显式 0」的判据统一在 @common#envNumber（zeroMeansOff = 显式 0 单独返回 0）
-    const value = envNumber('PROBE_PHASE_BUDGET_MS', PROBE_PHASE_BUDGET_DEFAULT_MS, true);
-    if (value === 0) return Number.POSITIVE_INFINITY;
-    const clamped = Math.min(PROBE_PHASE_BUDGET_MAX_MS, Math.max(PROBE_PHASE_BUDGET_MIN_MS, value));
-    if (clamped !== value && probeBudgetGate.isNew(String(value))) {
-        const verdict = value < PROBE_PHASE_BUDGET_MIN_MS
-            ? `低于下限 ${PROBE_PHASE_BUDGET_MIN_MS}ms`
-            : `高于上限 ${PROBE_PHASE_BUDGET_MAX_MS}ms`;
-        console.warn(`[探针预算] PROBE_PHASE_BUDGET_MS=${value} ${verdict}，按 ${clamped}ms 生效（显式 0 = 不限）`);
-    }
-    return clamped;
+    return envMsClamped('探针预算', 'PROBE_PHASE_BUDGET_MS', PROBE_PHASE_BUDGET_DEFAULT_MS,
+        PROBE_PHASE_BUDGET_MIN_MS, PROBE_PHASE_BUDGET_MAX_MS, true, Number.POSITIVE_INFINITY);
 }
 
 /** 单条探测的结论：true / false 是可信结论，'unknown' = 预算内没轮到它（未发起、零 socket） */
@@ -1941,26 +2029,15 @@ const PROXY_POOL_CACHE_TTL_MIN_MS = 60 * 1000;
 const PROXY_POOL_CACHE_TTL_MAX_MS = 24 * 60 * 60 * 1000;
 const PROXY_POOL_CACHE_MAX = 32;             // 键数量上限，防止长生命周期 isolate 中无界增长
 
-/** 「env 值被钳制」只在同一个原始值上打一条 warn（与 PROBE_PHASE_BUDGET_MS 同口径） */
-const poolCacheTtlGate = createSignatureGate();
-
 /**
- * 反代池结果 TTL 的生效值（毫秒）。env `PROXY_POOL_CACHE_TTL_MS` 可覆盖：
- *   · 未设 / 空串 / 非数字 / 负数 / 显式 0 → 默认 10min（fail-closed，判据统一在 @common#envNumber）；
- *   · 正值 → 生效，并钳到 [1min, 24h]：越界按最近的边界值生效并打一条 warn。
+ * 反代池结果 TTL 的生效值（毫秒）。env `PROXY_POOL_CACHE_TTL_MS`：默认 10min，钳到 [1min, 24h]，
+ * 未设/非数字/负数/显式 0 → 默认值（fail-closed）—— 解析、钳制与一次性 warn 都在 envMsClamped。
  * 三个消费点（一级新鲜度 / 二级新鲜度 / 二级 Cache-Control）都走本函数 —— 单一来源，
  * 否则「一级认为新鲜、二级认为过期」这类分叉足够让人查半天。
  */
 function proxyPoolCacheTtlMs(): number {
-    const value = envNumber('PROXY_POOL_CACHE_TTL_MS', PROXY_POOL_CACHE_TTL_DEFAULT_MS);
-    const clamped = Math.min(PROXY_POOL_CACHE_TTL_MAX_MS, Math.max(PROXY_POOL_CACHE_TTL_MIN_MS, value));
-    if (clamped !== value && poolCacheTtlGate.isNew(String(value))) {
-        const verdict = value < PROXY_POOL_CACHE_TTL_MIN_MS
-            ? `低于下限 ${PROXY_POOL_CACHE_TTL_MIN_MS}ms`
-            : `高于上限 ${PROXY_POOL_CACHE_TTL_MAX_MS}ms`;
-        console.warn(`[反代池缓存] PROXY_POOL_CACHE_TTL_MS=${value} ${verdict}，按 ${clamped}ms 生效`);
-    }
-    return clamped;
+    return envMsClamped('反代池缓存', 'PROXY_POOL_CACHE_TTL_MS', PROXY_POOL_CACHE_TTL_DEFAULT_MS,
+        PROXY_POOL_CACHE_TTL_MIN_MS, PROXY_POOL_CACHE_TTL_MAX_MS);
 }
 
 /** 反代池缓存诊断日志：仅当面板「Log Level」设为 debug 时输出（与 unified.ts 的 logDebug 同口径）。
@@ -2168,11 +2245,17 @@ export async function resolveProxyIPPool(
     // N 条连接会各自发起一遍 DoH。这里只共享「谁正在解析」这个事实：
     // 等待方轮询一级缓存（解析结束即写入），读不到就自己取 —— **绝不 await 别人的 Promise**。
     //
-    // 等待上界必须盖住**冷解析的常态耗时**：一次冷解析 = A/AAAA × 双源 = 4 次 DoH
-    // （单次上限 AbortSignal.timeout(10s)）。原先的 40×25ms = 1s 比典型冷解析（数百 ms）
-    // 余量太小：一次慢源抖动就会让同键其余 N-1 条连接全部判「等不到」→ 各自再解析一遍
-    // （DoH 瞬间放大 N 倍，也是日志里成簇出现的原因）。改为 120×25ms = 3s：
-    // 覆盖冷路径常态上界，又不超过首字节超时（6s）留给拨号的时间。
+    // 等待由两个上界共同约束，取先到者：
+    //   · **总上界** dohWaitBudgetMs()（env `DOH_WAIT_BUDGET_MS`，默认 1000ms）——「最多等多久」。
+    //     一次冷解析 = A/AAAA × 双源 = 4 次 DoH（单次上限 500ms），常态总耗时在数百 ms 内，
+    //     1s 已覆盖常态；再长只是把「生产者卡住」的代价往后拖。
+    //   · **无进展上界** dohWaitStallMs()（env `DOH_WAIT_STALL_MS`，默认 260ms）——「多久没动静就自己上」。
+    //     真正该判的是生产者还在不在推进，不是时间过了多久：260ms 内没有任何 DoH 完成
+    //     （成功/失败都算）说明这一轮多半卡在一个挂死的源上，此时白等满总上界再重算不如立刻并行上。
+    // 起点取「本次等待开始」与「最近一次进展」的较晚者：否则上一次解析留下的旧时间戳
+    // 会让新等待方在第一个 tick 就误判「卡住」。两个阈值都在等待开始时读一次（整段等待用同一组值）。
+    const waitStartedAt = Date.now();
+    const stallMs = dohWaitStallMs();
     const pool = await crossRequestSingleFlight<SortedPool>(
         _proxyPoolLoading,
         cacheKey,
@@ -2181,7 +2264,11 @@ export async function resolveProxyIPPool(
             return hit && isFreshPoolEntry(hit) ? hit.result : null;
         },
         () => resolveProxyPoolUncached(cacheKey, proxyIP, targetDomain),
-        { tries: 120, delayMs: 25 }
+        {
+            tries: dohWaitTries(),
+            delayMs: DOH_WAIT_POLL_MS,
+            abandonWhen: () => Date.now() - Math.max(_lastDohProgressAt, waitStartedAt) > stallMs,
+        }
     );
     // produce() 恒返回数组；null 只可能出现在"等待上界后仍读不到且已退出标记"的理论分支，
     // 这里兜底自己解析一次，避免把空池交给拨号。洗牌只在出口做一次（空池洗牌仍是空池）。
