@@ -1,4 +1,4 @@
-import { resolveDNS, resolveProxyIPPool, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes, isBareIPv4 } from '@utils';
+import { resolveDNS, resolveProxyIPPool, poolNeedsDns, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes, isBareIPv4 } from '@utils';
 import { evictOldest, safeErrorMessage, randomUserAgent, base64EncodeUtf8, createSessionWatchdog, createSignatureGate, envNumber, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
 
 // cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
@@ -15,6 +15,14 @@ export const connectSocket = (options: { hostname: string; port: number }, fetch
 
 export const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
+
+/** debug 级诊断日志（与 unified.ts 的 logDebug 同口径）：Log Level ≠ debug 时不落 Workers Logs。
+ *  用于「排障时要、日常不出现在日志里」的过程行 —— 尤其是那些**每连接一次**的弱信号行。
+ *  文本用惰性工厂：非 debug 时连字符串拼接与判据计算都不做（这些调用点就在拨号热路径上）。 */
+function logDebug(log: Function, build: () => string): void {
+    if (globalThis.settings?.logLevel === 'debug') log(build());
+}
+
 const DIRECT_DIAL_TIMEOUT = 5000; // 直连竞速与兜底直连连接超时（对齐 cfnew 连接超时值 = 5000）
 const PROXY_DIAL_TIMEOUT = 5000; // 代理竞速连接超时（对齐 cfnew 连接超时值 = 5000）
 /**
@@ -158,7 +166,11 @@ async function connectWithRaceDial(
     //    整体排序 + LCG 确定性洗牌 + 带缓存的**全量**入池（解析出多少就存多少，不截断）；
     //    「按黑名单过滤后随机抽 RACE_PROBE_COUNT 条去探测/竞速」在下方第 4/5 步做
     //    每项携带自身端口（显式端口 / .tpN 端口），无端口条目回退 targetPort（保持既有语义）
-    log(`resolving proxy pool via DoH...`);
+    // 诊断行**故意降到 debug**：原先无条件打印且文本恒为 `resolving proxy pool via DoH...`，
+    // 于是「L1/L2 缓存命中」与「纯 IP 池（官方直连池根本不发 DoH）」都会被读成解析很频繁。
+    // 真正能判断有没有发生解析的是 utils 的 `[proxy-pool] L1/L2/DoH` 分层日志；
+    // 这里只补一个「域名池 / 纯 IP 池」的定性，省得再去猜（条数不清单，避免把池内容写进日志）。
+    logDebug(log, () => `proxy pool entry: ${poolInput.length} entries, ${poolNeedsDns(poolInput.join(',')) ? 'domain pool (DoH-capable)' : 'ip-only (no DoH)'}`);
     const pool = await resolveProxyIPPool(poolInput.join(','), targetAddress, '');
     const poolEntries: [string, number][] = pool.map(([host, port]) => [host, port || targetPort]);
 
@@ -1265,7 +1277,7 @@ export async function handleTCPOutBound(
     // 为什么必须做目标识别：反代池与官方池都只承载 Cloudflare CDN 目标
     // （docs/configuration/vless-trojan「Proxy IP」节：for connecting to Cloudflare CDN addresses），
     // 拨号时写进池 socket 的载荷是 VLESS 头之后的字节、不含目标地址
-    // （resolveProxyIPPool 只把 targetDomain 当缓存键与洗牌种子，不参与路由）。
+    // （resolveProxyIPPool 只把 targetDomain 当洗牌种子 —— 既不是缓存键、也不参与路由）。
     // 对非 CF 目标，池 socket 的 TCP 可能是通的、还会有数据回来，6s 首字节兜底不触发、回退不发生，
     // 表现为节点整体不通 —— 所以非 CF 目标必须直连优先，CF 目标才先走池。
     const firstHopProxy = !proxyDegrade && (proxyOnly ? hasAnyProxy : hasUpstreamProxy);

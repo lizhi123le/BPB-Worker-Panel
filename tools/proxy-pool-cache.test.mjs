@@ -10,14 +10,18 @@
  * isolate（每个 import 都是全新模块实例、一级 Map 为空，但共享同一份 Cache API）。
  *
  * 覆盖：
- *   1. 一级（isolate 内 Map）命中不再打 DoH；不同目标不同键，互不串味
- *   2. 二级（Cache API）跨 isolate 复用：换一个 isolate 仍命中，且不再产生 DoH 请求
- *   3. 二级条目按体内时间戳判新鲜度：过期当未命中；结构不合法当未命中；空池不入缓存
+ *   0. 「池是否需要 DNS」判据：IPv6 字面量按纯 IP 处理（旧判据 /[a-z]/i 会把它当域名池，白跑 Cache API）
+ *   1. 一级（isolate 内 Map）命中不再打 DoH；缓存键只含 proxyIP（解析结果与目标无关），
+ *      顺序由 (targetDomain, uuid) 的确定性洗牌决定 —— 同目标顺序恒定、不同目标互不串味
+ *   2. 二级（Cache API）跨 isolate 复用：换一个 isolate 仍命中，且不再产生 DoH 请求；
+ *      换 targetDomain 也命中（不再重复解析）
+ *   3. 二级条目按体内时间戳判新鲜度：过期当未命中；结构不合法当未命中；空池不入缓存；
+ *      TTL 可被 env `PROXY_POOL_CACHE_TTL_MS` 覆盖并钳制
  *   4. 单飞：同一秒 N 条同键并发只解析一次（N=6 时 DoH 仍是 4 次，而不是 24 次），
- *      不同键各自解析；解析结束后单飞表不残留
+ *      不同 proxyIP 各自解析；解析结束后单飞表不残留
  *   5. 降级安全：没有 caches、没有 httpConfig.hostName、cache.match/put 抛错，都只是退化成
  *      一级缓存，不影响本次解析结果（smoke 的 Node 环境就是这种情况）
- *   6. 调试日志：Log Level=debug 时每次解析只落一行 `[proxy-pool] L1 hit|L1 stale|inflight|
+ *   6. 调试日志：Log Level=debug 时每次解析只落一行 `[proxy-pool] L1 hit|L1 stale|
  *      L2 hit|L2 miss|L2 skip|DoH`（按 layer 计数即可算命中率），且不打印反代池条目；
  *      非 debug 级别一行都不输出
  *
@@ -63,6 +67,9 @@ class FakeCache {
 }
 
 // ── 假 DoH：只认 A 记录，AAAA 恒空；可按场景切「空结果」与延迟 ──
+/** 二级缓存写入现在是「不 await」（不落在首包关键路径上），要断言/篡改缓存内容前必须先让
+ *  挂起的 put 跑完，否则会读到上一次（或被打桩前的）条目、或让迟到的写入覆盖本次篡改。 */
+const settle = () => new Promise((r) => setTimeout(r, 0));
 let dohMode = 'ok';
 let dohDelay = 0;
 let fetchCount = 0;
@@ -83,10 +90,12 @@ globalThis.caches = { default: cache };
 
 let seq = 0;
 /** 每次调用都拿到一个全新的模块实例 = 模拟「连接落到了另一个 isolate」 */
-async function newIsolate() {
+async function loadModule() {
     seq++;
-    const mod = await import(`${pathToFileURL(BUNDLE_PATH).href}?iso=${seq}`);
-    return mod.resolveProxyIPPool;
+    return await import(`${pathToFileURL(BUNDLE_PATH).href}?iso=${seq}`);
+}
+async function newIsolate() {
+    return (await loadModule()).resolveProxyIPPool;
 }
 
 async function main() {
@@ -94,7 +103,7 @@ async function main() {
     mkdirSync(OUT_DIR, { recursive: true });
     await build({
         stdin: {
-            contents: "export { resolveProxyIPPool } from './src/cores/utils';",
+            contents: "export { resolveProxyIPPool, poolNeedsDns } from './src/cores/utils';",
             resolveDir: ROOT,
             sourcefile: 'pool-cache-entry.ts',
             loader: 'ts'
@@ -106,6 +115,17 @@ async function main() {
         target: 'esnext',
         external: ['cloudflare:sockets'],
         legalComments: 'none'
+    });
+
+    // 0b) 「池是否需要 DNS」的判据：IPv6 字面量不该被当成域名池
+    //     （旧判据 /[a-z]/i 会命中 a–f，于是纯 IP 池白做一次 cache.match + 一次 cache.put）
+    const mod0 = await loadModule();
+    check('poolNeedsDns：域名池需要解析，IPv4 / IPv6 池不需要', () => {
+        assert.strictEqual(mod0.poolNeedsDns('pool.example.net:443'), true);
+        assert.strictEqual(mod0.poolNeedsDns('1.2.3.4:443'), false);
+        assert.strictEqual(mod0.poolNeedsDns('[2606:4700::]:443'), false);
+        assert.strictEqual(mod0.poolNeedsDns('2606:4700::1'), false);
+        assert.strictEqual(mod0.poolNeedsDns('1.2.3.4:443,pool.example.net:443'), true);
     });
 
     // 1) 首次解析：L1/L2 都没有 → 走 DoH，并写入二级缓存
@@ -127,10 +147,15 @@ async function main() {
     check('同 isolate 再调命中一级缓存', () => assert.deepStrictEqual(asSet(poolB2), asSet(poolA)));
     check('一级命中也不打 DoH', () => assert.strictEqual(fetchCount, fetchAfterFirst));
 
-    // 4) 不同目标域名 = 不同键 → 不能串味（会重新解析）
+    // 4) 解析结果与 targetDomain **无关**：换目标不再重复解析（命中同一份二级缓存）；
+    //    顺序只由 (targetDomain, uuid) 的确定性洗牌决定 —— 同一目标的顺序必须恒定（C-04 的真正诉求）
     const c = await newIsolate();
-    await c(PROXY, 'other.example.net', '');
-    check('不同目标各自解析（键含 targetDomain）', () => assert.ok(fetchCount > fetchAfterFirst));
+    const fetchBeforeOtherTarget = fetchCount;
+    const poolOtherTarget = await c(PROXY, 'other.example.net', '');
+    check('换目标不再重复解析（解析结果与 target 无关）', () => assert.strictEqual(fetchCount, fetchBeforeOtherTarget));
+    check('换目标拿到同一份池（集合一致）', () => assert.deepStrictEqual(asSet(poolOtherTarget), asSet(poolA)));
+    const poolSameTargetAgain = await c(PROXY, TARGET, '');
+    check('同一目标的洗牌顺序跨 isolate 恒定', () => assert.deepStrictEqual(poolSameTargetAgain, poolA));
 
     // 5) DoH 空结果：既有行为是回退成域名本身（不是空池），这条结果同样可以跨 isolate 复用
     dohMode = 'empty';
@@ -153,7 +178,8 @@ async function main() {
     check('DoH 抛错时回退成域名本身且不崩', () => assert.deepStrictEqual(asSet(errPool), ['dohfail.domain.test:443']));
     globalThis.fetch = dohStub;
 
-    // 7) 过期条目当未命中：把已存条目的时间戳往前挪 TTL+1s
+    // 7) 过期条目当未命中：把已存条目的时间戳往前挪 TTL+1s（先让挂起的写入落地，避免被覆盖）
+    await settle();
     for (const [url, entry] of cache.store) {
         try {
             const parsed = JSON.parse(entry.body);
@@ -169,6 +195,8 @@ async function main() {
     check('过期条目按未命中处理（重新 DoH）', () => assert.ok(fetchCount > fetchBeforeStale));
 
     // 8) 脏数据当未命中：体内容结构不合法
+    //    先等上一步那次解析的二级缓存写入落地，否则它会（迟到的）覆盖下面这份脏数据
+    await settle();
     for (const [url, entry] of cache.store) {
         cache.store.set(url, { body: '{"time":' + Date.now() + ',"pool":"oops"}', headers: entry.headers });
     }
@@ -218,6 +246,24 @@ async function main() {
     const poolJ = await j(PROXY, 'matchthrow.example.com', '');
     check('match 抛错退化为未命中且不崩', () => assert.strictEqual(poolJ.length, 3));
 
+    // 12b) TTL 可被 env 覆盖并钳制：PROXY_POOL_CACHE_TTL_MS=60000 时，61s 前的条目就算过期
+    const ttlCache = new FakeCache();
+    globalThis.caches = { default: ttlCache };
+    globalThis.env = { PROXY_POOL_CACHE_TTL_MS: '60000' };
+    const t1 = await newIsolate();
+    await t1('ttl.example.net:443', 'ttl.example.com', '');
+    await settle(); // 二级缓存写入已改为不 await，等它落地再改时间戳
+    const fetchBeforeTtl = fetchCount;
+    for (const [url, entry] of ttlCache.store) {
+        const parsed = JSON.parse(entry.body);
+        parsed.time -= 61 * 1000;   // 默认 10min TTL 下这仍新鲜，只有 env 生效才会过期
+        ttlCache.store.set(url, { body: JSON.stringify(parsed), headers: entry.headers });
+    }
+    const t2 = await newIsolate();
+    await t2('ttl.example.net:443', 'ttl.example.com', '');
+    check('env PROXY_POOL_CACHE_TTL_MS 生效（61s 前条目已过期 → 重新解析）', () => assert.ok(fetchCount > fetchBeforeTtl));
+    globalThis.env = undefined;
+
     // 13) 单飞：同键 N 条并发只解析一次（慢 DoH 保证并发窗口真实存在）
     dohDelay = 60;
     const sfCache = new FakeCache();
@@ -235,15 +281,15 @@ async function main() {
     });
     check('单飞：只写了一次二级缓存', () => assert.strictEqual(sfCache.puts, 1));
 
-    // 14) 单飞不串键：同时刻两个不同键各自解析（2 次解析 = 8 次 DoH）
+    // 14) 单飞按 key（= proxyIP）隔离：同时刻两个不同池各自解析（2 次解析 = 8 次 DoH）
     globalThis.caches = { default: new FakeCache() };
     const m = await newIsolate();
     const beforeTwo = fetchCount;
     await Promise.all([
         m('sf.example.net:443', 'a.example.com', ''),
-        m('sf.example.net:443', 'b.example.com', '')
+        m('sf2.example.net:443', 'b.example.com', '')
     ]);
-    check('单飞按 key 隔离：两个不同目标各自解析', () => assert.strictEqual(fetchCount - beforeTwo, 8));
+    check('单飞按 key 隔离：两个不同 proxyIP 各自解析', () => assert.strictEqual(fetchCount - beforeTwo, 8));
 
     // 15) 单飞表不残留：解析结束后再调（L1 已写入 → 命中，不再打 DoH）
     const beforeAfter = fetchCount;

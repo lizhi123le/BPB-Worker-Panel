@@ -1924,26 +1924,64 @@ export async function filterReachableEntries(
 }
 
 // ── Proxy IP pool resolution cache (对齐 edgetunnel 缓存反代IP 9896) ──
-// C-04：缓存键原先只有 proxyIP，且无 TTL → 同一 isolate 内第二个 targetDomain/uuid
-// 会拿到为第一个域名洗出的同一份 8 条子集，且首次降级结果被永久冻结。
-// 与解析依赖的 DoH 结果缓存同期限（直接引用，避免两处字面量各自漂移）
-const PROXY_POOL_CACHE_TTL = DOH_CACHE_TTL;
+// 键 = **只有归一化后的 proxyIP**。解析结果与 targetDomain / uuid 毫无关系 —— 那二者只决定末尾
+// 那次确定性洗牌的**顺序**（见 shuffleForTarget），因此同一份解析结果必须能服务任意目标。
+// 历史两头都踩过：
+//   · 缓存键曾只有 proxyIP 且无 TTL（C-04）→ 第二个 targetDomain 拿到为第一个目标洗出的池、
+//     首次降级结果被永久冻结；
+//   · 随后把 targetDomain/uuid 塞进键里 —— 确实「不串味」了，但 Cloudflare 目标每站点一个域名，
+//     于是「每个目标一个新键」把跨 isolate 的二级缓存复用稀释成 域名×目标，新 isolate 照样
+//     真打一轮 DoH。
+// 现在把「解析」与「洗牌」拆开：缓存里放**排序后（未洗牌）**的池，洗牌在返回前按 (target, uuid) 做。
+// 与解析依赖的 DoH 结果缓存同期限（直接引用，避免两处字面量各自漂移），env `PROXY_POOL_CACHE_TTL_MS` 可覆盖。
+const PROXY_POOL_CACHE_TTL_DEFAULT_MS = DOH_CACHE_TTL;
+/** 池 TTL 的可调区间：下限 1min（再短就别开缓存了），上限 24h（反代池常年不变，但「改面板 IP
+ *  后的生效时延」不能无限拉长）。 */
+const PROXY_POOL_CACHE_TTL_MIN_MS = 60 * 1000;
+const PROXY_POOL_CACHE_TTL_MAX_MS = 24 * 60 * 60 * 1000;
 const PROXY_POOL_CACHE_MAX = 32;             // 键数量上限，防止长生命周期 isolate 中无界增长
+
+/** 「env 值被钳制」只在同一个原始值上打一条 warn（与 PROBE_PHASE_BUDGET_MS 同口径） */
+const poolCacheTtlGate = createSignatureGate();
+
+/**
+ * 反代池结果 TTL 的生效值（毫秒）。env `PROXY_POOL_CACHE_TTL_MS` 可覆盖：
+ *   · 未设 / 空串 / 非数字 / 负数 / 显式 0 → 默认 10min（fail-closed，判据统一在 @common#envNumber）；
+ *   · 正值 → 生效，并钳到 [1min, 24h]：越界按最近的边界值生效并打一条 warn。
+ * 三个消费点（一级新鲜度 / 二级新鲜度 / 二级 Cache-Control）都走本函数 —— 单一来源，
+ * 否则「一级认为新鲜、二级认为过期」这类分叉足够让人查半天。
+ */
+function proxyPoolCacheTtlMs(): number {
+    const value = envNumber('PROXY_POOL_CACHE_TTL_MS', PROXY_POOL_CACHE_TTL_DEFAULT_MS);
+    const clamped = Math.min(PROXY_POOL_CACHE_TTL_MAX_MS, Math.max(PROXY_POOL_CACHE_TTL_MIN_MS, value));
+    if (clamped !== value && poolCacheTtlGate.isNew(String(value))) {
+        const verdict = value < PROXY_POOL_CACHE_TTL_MIN_MS
+            ? `低于下限 ${PROXY_POOL_CACHE_TTL_MIN_MS}ms`
+            : `高于上限 ${PROXY_POOL_CACHE_TTL_MAX_MS}ms`;
+        console.warn(`[反代池缓存] PROXY_POOL_CACHE_TTL_MS=${value} ${verdict}，按 ${clamped}ms 生效`);
+    }
+    return clamped;
+}
 
 /** 反代池缓存诊断日志：仅当面板「Log Level」设为 debug 时输出（与 unified.ts 的 logDebug 同口径）。
  *  一次解析只落一行，按 layer 计数即可算命中率：
  *    L1 hit    —— isolate 内 Map 命中（最热路径，零网络）
- *    L1 stale  —— 有但超过 10min，丢弃后继续往下
- *    inflight  —— 同键已有解析在飞，直接复用
+ *    L1 stale  —— 有但超过 TTL，丢弃后继续往下
  *    L2 hit    —— Cache API 命中（同一 PoP 其他 isolate 留下的结果）
- *    L2 miss   —— 二级也没有，准备走 DoH
+ *    L2 miss   —— 二级也没有，准备去解析
  *    L2 skip   —— 纯 IP 池（官方直连池），解析是内存计算，不碰二级缓存
- *    DoH       —— 真正发了 DNS（ms 是解析耗时） */
+ *    DoH       —— 池解析落地（两级池缓存都未命中；DNS 应答仍可能命中 isolate 内的答案缓存，
+ *                 所以这一行**不等于**真的出了网）
+ *  注：同键并发等待由 crossRequestSingleFlight 收口，等待方最终要么读到 L1 写成 L1 hit、
+ *  要么自己解析写成 DoH —— 没有单独的 inflight 行可打（Set 是纯事实标记，不回调）。 */
 function poolCacheLog(message: string): void {
     if (globalThis.settings?.logLevel === 'debug') console.log(`[proxy-pool] ${message}`);
 }
-/** 模块级缓存：isolate 生命周期内有效（键 = proxyIP|targetDomain|uuid），命中时校验 TTL，超限时按 LRU 淘汰 */
-const _proxyPoolCache = new Map<string, { result: [string, number][]; time: number }>();
+/** 缓存体的池形状：**排序后、未洗牌**的 [host, port]。洗牌只由 (targetDomain, uuid) 决定，
+ * 因此一份条目可以服务任意目标；二级缓存里存的也是它。 */
+type SortedPool = [string, number][];
+/** 模块级缓存：isolate 生命周期内有效（键 = proxyIP），命中时校验 TTL，超限时按 LRU 淘汰 */
+const _proxyPoolCache = new Map<string, { result: SortedPool; time: number }>();
 
 /**
  * 单飞标记：键 → 「谁正在进行中的解析」。**只存标记，不存 Promise**。
@@ -1957,15 +1995,57 @@ const _proxyPoolCache = new Map<string, { result: [string, number][]; time: numb
  */
 const _proxyPoolLoading = new Set<string>();
 
-/** 代理池缓存键：proxyIP 归一化（trim + 小写）与 targetDomain/uuid 一起参与，避免跨目标域名串味 */
-function proxyPoolCacheKey(proxyIP: string, targetDomain: string, uuid: string): string {
-    return `${proxyIP.trim().toLowerCase()}|${targetDomain}|${uuid}`;
+/** 代理池缓存键：**只有 proxyIP**（trim + 小写归一化）。为什么不含 target/uuid 见本节顶部注释。 */
+function proxyPoolCacheKey(proxyIP: string): string {
+    return proxyIP.trim().toLowerCase();
+}
+
+/**
+ * 确定性洗牌（对齐 edgetunnel 10006-10011）：同一 (有序池, targetDomain, uuid) 恒得同一顺序。
+ * 缓存里存的是**未洗牌**的池，每次命中后再按当前目标洗一遍 —— 于是：
+ *   · 不同目标共享同一份解析结果（不再重复 DoH），但顺序各自独立（不串味，C-04 的真正诉求）；
+ *   · 同一目标在不同 isolate / 同一 isolate 反复取，顺序恒定。
+ * `sort()` 的比较器刻意只看 seed 的推进（不看元素）：与改动前的实现逐字一致，
+ * 保证同一目标拿到的顺序没有变化（排序网络对固定入参是确定的）。
+ */
+function shuffleForTarget(pool: SortedPool, targetDomain: string, uuid: string): SortedPool {
+    const rootDomain = targetDomain.includes('.') ? targetDomain.split('.').slice(-2).join('.') : targetDomain;
+    let seed = [...(rootDomain + uuid)].reduce((a, c) => a + c.charCodeAt(0), 0);
+    return [...pool].sort(() =>
+        (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5
+    );
 }
 
 /** Parse a "host:port" or "[ipv6]:port" entry into [host, port] tuple, default port 0 */
 function parseHostPortEntry(entry: string): [string, number] {
     const { host, port } = parseHostPort(entry, true);
     return [host, port || 0]; // 0 = 无显式端口，由调用方决定缺省
+}
+
+// 池内 host 的「是不是 IP 字面量」判据：**唯一一份**，同时服务「二级缓存闸门」与「逐条解析分流」。
+// 曾经是两套（闸门用 /[a-z]/i、解析用一套内联正则），两处判据必然漂移：闸门说「纯 IP 池、别碰缓存」
+// 而解析器其实会去 DoH（或反之）时，既多打一轮 DNS、又把缓存层数算错。
+// IPv4 直接复用 isBareIPv4（就是 isIPv4 去 CIDR 后缀，与该内联正则逐字等价）；
+// IPv6 **刻意保留宽松判据**（只要求十六进制与冒号、允许方括号，因此单标签字符串也算字面量）——
+// 它决定的是「要不要去解析」，语义一改就会把既有输入的拨号行为一起改掉。
+const IPV6_LITERAL_RE = /^\[?([a-fA-F0-9:]+)\]?$/;
+
+/** host 是否为 IP 字面量（IPv6 允许带方括号）。只用于「是否需要 DNS 解析」的分流。 */
+function hostIsIPLiteral(host: string): boolean {
+    return isBareIPv4(host) || IPV6_LITERAL_RE.test(host);
+}
+
+/**
+ * 池是否需要 DNS：只有**全部条目都是 IP 字面量**时才不需要（那种池是纯内存计算）。
+ * 判据与解析器的逐条分流共用 `hostIsIPLiteral`，所以「闸门认为不用解析」与「解析器真的不去解析」
+ * 恒等价，不会出现一方认为该碰缓存、另一方直接算完的错位。
+ * 修的是 IPv6 误判：`[2606:4700::]` 含 a–f，旧闸门（`/[a-z]/i`）把纯 IP 池当域名池，
+ * 白做一次 `cache.match` + 一次 `cache.put`（两次 Cache API 往返）。
+ */
+export function poolNeedsDns(proxyIP: string): boolean {
+    const entries = proxyIP.split(',').map(s => s.trim()).filter(Boolean);
+    if (entries.length === 0) return false;
+    return entries.some(entry => !hostIsIPLiteral(parseHostPortEntry(entry)[0]));
 }
 
 // ── 反代池二级缓存：Cache API（同一数据中心内跨 isolate 共享） ──
@@ -1977,7 +2057,10 @@ function parseHostPortEntry(entry: string): [string, number] {
 //   2. 空池永不入缓存 —— 否则一次 DoH 失败会把「解析不到」冻结一整个 TTL；
 //   3. 响应体里带解析时间戳并校验 TTL。Cache-Control 只用来让 Cache API 愿意保留条目，
 //      它的 max-age 与我们的 TTL 语义并不等价，新鲜度一律以体内时间戳为准。
-const POOL_CACHE_API_PATH = '/__bpb_pool_cache/v1/';
+// 路径带版本号：键语义从「proxyIP|targetDomain|uuid」改成「proxyIP」、体内池从「洗牌后」改成
+// 「排序后」——语义变了就换命名空间，绝不复用旧条目（旧键含 target，本不会命中，但混在一起
+// 会让「缓存里到底是什么形状」变得无法推断）。
+const POOL_CACHE_API_PATH = '/__bpb_pool_cache/v2/';
 
 /** 二级缓存键的 URL：用 Worker 自己的 host 拼，保证 Key 落在本 zone 的 Cache 里。
  *  拿不到 host（异常早期路径）时返回 null → 调用方直接跳过二级缓存。 */
@@ -1996,7 +2079,7 @@ function poolCacheApiTarget(cacheKey: string): { cache: Cache; request: Request 
 }
 
 /** 读二级缓存：未命中 / 已过期 / 结构不符 / 任何异常一律返回 null（调用方继续走 DoH）。 */
-async function readProxyPoolCacheApi(cacheKey: string): Promise<{ result: [string, number][]; time: number } | null> {
+async function readProxyPoolCacheApi(cacheKey: string): Promise<{ result: SortedPool; time: number } | null> {
     try {
         const target = poolCacheApiTarget(cacheKey);
         if (!target) return null;
@@ -2006,7 +2089,7 @@ async function readProxyPoolCacheApi(cacheKey: string): Promise<{ result: [strin
 
         const body = await hit.json() as { time?: unknown; pool?: unknown };
         const time = body?.time;
-        if (typeof time !== 'number' || Date.now() - time >= PROXY_POOL_CACHE_TTL) return null;
+        if (typeof time !== 'number' || Date.now() - time >= proxyPoolCacheTtlMs()) return null;
 
         const pool = body.pool;
         if (!Array.isArray(pool) || pool.length === 0) return null;
@@ -2014,14 +2097,14 @@ async function readProxyPoolCacheApi(cacheKey: string): Promise<{ result: [strin
             // 结构必须与 [string, number][] 一致，否则当未命中处理，绝不把脏数据喂给拨号
             if (!Array.isArray(entry) || typeof entry[0] !== 'string' || !Number.isFinite(entry[1])) return null;
         }
-        return { result: pool as [string, number][], time };
+        return { result: pool as SortedPool, time };
     } catch {
         return null;
     }
 }
 
 /** 写二级缓存：只写非空池，TTL 与一级缓存同口径；写失败静默忽略。 */
-async function writeProxyPoolCacheApi(cacheKey: string, result: [string, number][], time: number): Promise<void> {
+async function writeProxyPoolCacheApi(cacheKey: string, result: SortedPool, time: number): Promise<void> {
     if (result.length === 0) return;
     try {
         const target = poolCacheApiTarget(cacheKey);
@@ -2030,7 +2113,7 @@ async function writeProxyPoolCacheApi(cacheKey: string, result: [string, number]
         await target.cache.put(target.request, new Response(JSON.stringify({ time, pool: result }), {
             headers: {
                 'content-type': 'application/json',
-                'cache-control': `public, max-age=${Math.round(PROXY_POOL_CACHE_TTL / 1000)}`
+                'cache-control': `public, max-age=${Math.round(proxyPoolCacheTtlMs() / 1000)}`
             }
         }));
     } catch {
@@ -2042,12 +2125,12 @@ async function writeProxyPoolCacheApi(cacheKey: string, result: [string, number]
  * Resolve proxy IP string into a pool of [host, port] entries.
  * Supports: .william domains (TXT prefix expansion), .tpN domains (port extraction),
  * normal domains (DoH A/AAAA dual-source), and direct IPs.
- * Results are cached per (proxyIP, targetDomain, uuid) with a TTL; the pool keeps **all**
- * resolved entries (sorted + deterministically shuffled)，单池不设条数上限 ——
- * 截断会让被砍掉的候选连一次探测的机会都没有（实测地区池 KR=14、SG/JP/通用=50）。
+ * 解析结果按 **proxyIP** 单键缓存（一级 isolate 内 Map → 二级 Cache API 跨 isolate），TTL 默认 10min、
+ * env `PROXY_POOL_CACHE_TTL_MS` 可覆盖；缓存与单飞表里存的是**排序后未洗牌**的池，
+ * 洗牌在返回前按 (targetDomain, uuid) 做（见 shuffleForTarget）—— 解析与目标无关，顺序与目标相关。
+ * 池内保留**全部**解析条目，不做条数截断（实测地区池 KR=14、SG/JP/通用=50）。
  * 抽取若干条参与「可达性探测 + 竞速拨号」的职责移到 connectWithRaceDial：那里按临时黑名单
  * 过滤后随机抽取（条数口径见该文件的 RACE_PROBE_COUNT，当前 6）。
- * 三级顺序：一级 isolate 内 Map → 二级 Cache API（同一 PoP 跨 isolate）→ DoH；
  * 同一键的并发调用走单飞，只解析一次。
  * Aligns with edgetunnel `解析地址端口` (9895-10016).
  */
@@ -2057,7 +2140,7 @@ async function writeProxyPoolCacheApi(cacheKey: string, result: [string, number]
  * "主路径认为过期、轮询却认为新鲜"这种难查的分叉）。
  */
 function isFreshPoolEntry(entry: { time: number }): boolean {
-    return Date.now() - entry.time < PROXY_POOL_CACHE_TTL;
+    return Date.now() - entry.time < proxyPoolCacheTtlMs();
 }
 
 export async function resolveProxyIPPool(
@@ -2065,14 +2148,14 @@ export async function resolveProxyIPPool(
     targetDomain: string,
     uuid: string
 ): Promise<[string, number][]> {
-    const cacheKey = proxyPoolCacheKey(proxyIP, targetDomain, uuid);
+    const cacheKey = proxyPoolCacheKey(proxyIP);
     const cachedPool = _proxyPoolCache.get(cacheKey);
     if (cachedPool && isFreshPoolEntry(cachedPool)) {
         // 命中即刷新 LRU 顺序，保证淘汰的是最久未用的键
         _proxyPoolCache.delete(cacheKey);
         _proxyPoolCache.set(cacheKey, cachedPool);
         poolCacheLog(`L1 hit target=${targetDomain} age=${Math.round((Date.now() - cachedPool.time) / 1000)}s n=${cachedPool.result.length}`);
-        return cachedPool.result;
+        return shuffleForTarget(cachedPool.result, targetDomain, uuid);
     }
     if (cachedPool) {
         poolCacheLog(`L1 stale target=${targetDomain} age=${Math.round((Date.now() - cachedPool.time) / 1000)}s`);
@@ -2084,41 +2167,49 @@ export async function resolveProxyIPPool(
     // （浏览器开一个页面就是几十条并发 WS，且每条连接还可能两次进池）。中间这段窗口里
     // N 条连接会各自发起一遍 DoH。这里只共享「谁正在解析」这个事实：
     // 等待方轮询一级缓存（解析结束即写入），读不到就自己取 —— **绝不 await 别人的 Promise**。
-    const pool = await crossRequestSingleFlight<[string, number][]>(
+    //
+    // 等待上界必须盖住**冷解析的常态耗时**：一次冷解析 = A/AAAA × 双源 = 4 次 DoH
+    // （单次上限 AbortSignal.timeout(10s)）。原先的 40×25ms = 1s 比典型冷解析（数百 ms）
+    // 余量太小：一次慢源抖动就会让同键其余 N-1 条连接全部判「等不到」→ 各自再解析一遍
+    // （DoH 瞬间放大 N 倍，也是日志里成簇出现的原因）。改为 120×25ms = 3s：
+    // 覆盖冷路径常态上界，又不超过首字节超时（6s）留给拨号的时间。
+    const pool = await crossRequestSingleFlight<SortedPool>(
         _proxyPoolLoading,
         cacheKey,
         () => {
             const hit = _proxyPoolCache.get(cacheKey);
             return hit && isFreshPoolEntry(hit) ? hit.result : null;
         },
-        () => resolveProxyPoolUncached(cacheKey, proxyIP, targetDomain, uuid),
-        { tries: 40, delayMs: 25 }
+        () => resolveProxyPoolUncached(cacheKey, proxyIP, targetDomain),
+        { tries: 120, delayMs: 25 }
     );
     // produce() 恒返回数组；null 只可能出现在"等待上界后仍读不到且已退出标记"的理论分支，
-    // 这里兜底自己解析一次，避免把空池交给拨号
-    return pool ?? await resolveProxyPoolUncached(cacheKey, proxyIP, targetDomain, uuid);
+    // 这里兜底自己解析一次，避免把空池交给拨号。洗牌只在出口做一次（空池洗牌仍是空池）。
+    const resolved = pool ?? await resolveProxyPoolUncached(cacheKey, proxyIP, targetDomain);
+    return shuffleForTarget(resolved, targetDomain, uuid);
 }
 
 /**
  * 真正的解析实现。调用前一级缓存已判定未命中，同键并发已由 resolveProxyIPPool 的单飞收口。
  * cacheKey 由调用方算好传进来，保证回写两级缓存时用的键与查一级缓存时完全一致。
+ * 返回**排序后（未洗牌）**的池：洗牌属于调用方（shuffleForTarget），这样同一份解析结果能服务
+ * 任意目标域名。targetDomain 只用于诊断日志 —— 它已不是缓存键的一部分。
  */
 async function resolveProxyPoolUncached(
     cacheKey: string,
     proxyIP: string,
-    targetDomain: string,
-    uuid: string
-): Promise<[string, number][]> {
+    targetDomain: string
+): Promise<SortedPool> {
     // 一级（isolate 内 Map）未命中 → 二级（Cache API，同一 PoP 跨 isolate 共享）。
-    // 只有含域名的池才需要 DoH（.william / .tpN / 普通域名）；纯 IP 字面量是纯内存计算，
-    // 走 Cache API 反而更贵，直接跳过二级缓存。
-    const poolNeedsDns = /[a-z]/i.test(proxyIP);
-    if (poolNeedsDns) {
+    // 只有含域名的池才需要解析（.william / .tpN / 普通域名）；纯 IP 字面量是纯内存计算，
+    // 走 Cache API 反而更贵，直接跳过二级缓存（判据见 poolNeedsDns：IPv6 字面量也算纯 IP）。
+    const needsDns = poolNeedsDns(proxyIP);
+    if (needsDns) {
         const sharedPool = await readProxyPoolCacheApi(cacheKey);
         if (sharedPool) {
             poolCacheLog(`L2 hit target=${targetDomain} age=${Math.round((Date.now() - sharedPool.time) / 1000)}s n=${sharedPool.result.length}`);
             // 用二级条目自己的时间戳回填一级：两层共用一个绝对 TTL，
-            // 不会因为「命中后回填」把 10 分钟续成 20 分钟。
+            // 不会因为「命中后回填」把 TTL 续成两倍。
             _proxyPoolCache.set(cacheKey, { result: sharedPool.result, time: sharedPool.time });
             evictOldest(_proxyPoolCache, PROXY_POOL_CACHE_MAX);
             return sharedPool.result;
@@ -2165,10 +2256,9 @@ async function resolveProxyPoolUncached(
             }
 
             // Domain (not IP literal): DoH A/AAAA dual-source (对齐 edgetunnel 9948-9999)
-            const ipv4Regex = /^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)$/;
-            const ipv6Regex = /^\[?([a-fA-F0-9:]+)\]?$/;
-
-            if (!ipv4Regex.test(host) && !ipv6Regex.test(host)) {
+            // 与二级缓存闸门共用 hostIsIPLiteral —— 两处判据必须是同一份，否则「闸门跳过缓存」
+            // 与「这里真的去解析」会错位。
+            if (!hostIsIPLiteral(host)) {
                 const [aAnswers, aaaaAnswers] = await Promise.all([
                     dohAnswersCached(host, 'A'),
                     dohAnswersCached(host, 'AAAA'),
@@ -2191,26 +2281,23 @@ async function resolveProxyPoolUncached(
         }
     }
 
-    // Sort + deterministic LCG shuffle (对齐 edgetunnel 10006-10011)
-    const sorted = [...allEntries].sort((a, b) => a[0].localeCompare(b[0]));
-    const rootDomain = targetDomain.includes('.') ? targetDomain.split('.').slice(-2).join('.') : targetDomain;
-    let seed = [...(rootDomain + uuid)].reduce((a, c) => a + c.charCodeAt(0), 0);
-    const shuffled = [...sorted].sort(() =>
-        (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5
-    );
+    // 只排序、不洗牌：排序让缓存体确定（同一份解析结果 ⇒ 同一份缓存体），
+    // 洗牌由调用方按 (targetDomain, uuid) 做 —— 那是「同一目标顺序恒定、不同目标互不串味」的实现位置。
+    const sorted: SortedPool = [...allEntries].sort((a, b) => a[0].localeCompare(b[0]));
 
     // 池内保留**全部**解析结果，不做任何条数截断：实测地区池 KR=14 条、SG/JP/通用=50 条，
     // 截断会让被砍掉的候选连一次探测的机会都没有（那正是本改动要消除的浪费）。
     // 真正的边界来自 DoH 应答本身（一次 DNS 报文 ≤64KB）与 _proxyPoolCache 的 32 键上限。
-    const result = shuffled;
     // C-04：写入带时间戳的键化缓存；超限时按插入顺序（LRU）淘汰最旧一条
     const resolvedAt = Date.now();
-    poolCacheLog(`DoH target=${targetDomain} ms=${resolvedAt - resolveStartedAt} n=${result.length}`);
-    _proxyPoolCache.set(cacheKey, { result, time: resolvedAt });
+    poolCacheLog(`DoH target=${targetDomain} ms=${resolvedAt - resolveStartedAt} n=${sorted.length}`);
+    _proxyPoolCache.set(cacheKey, { result: sorted, time: resolvedAt });
     evictOldest(_proxyPoolCache, PROXY_POOL_CACHE_MAX);
-    // 二级缓存：同一 PoP 内其它 isolate 直接复用这份结果（写失败只影响命中率，不影响本次返回）
-    if (poolNeedsDns) await writeProxyPoolCacheApi(cacheKey, result, resolvedAt);
-    return result;
+    // 二级缓存：同一 PoP 内其它 isolate 直接复用这份结果。**不 await** —— 它落在「首包之前」的
+    // 关键路径上，而写失败/被丢弃只影响下一个 isolate 的命中率，不影响本次返回。
+    // （writeProxyPoolCacheApi 内部已把异常全部吞掉，不会留下未处理的 rejection。）
+    if (needsDns) void writeProxyPoolCacheApi(cacheKey, sorted, resolvedAt);
+    return sorted;
 }
 
 /** Built-in fallback proxy IPs for all 14 regions (cfnew 备用地址列表 equivalent).
