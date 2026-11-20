@@ -463,8 +463,8 @@ async function obfuscateWithGates() {
         { script: 'tools/login-firstrun.test.mjs', label: '首访设置口令 / 登录 / 改密吊销旧会话' },
         { script: 'tools/proxy-ip-limit.test.mjs', label: '/proxy-ip 取数规则（A+AAAA 双栈 / 上限 100 / 超出 1:1 / 不足从多的那类补齐）' },
         { script: 'tools/proxy-pool-cache.test.mjs', label: '反代池缓存：isolate 内 Map / Cache API 跨 isolate 复用 / 同键并发单飞 / 降级安全 / debug 分层日志' },
-        { script: 'tools/doh-source.test.mjs', label: 'DoH 出站：双源先到先用 + CF 宽限期 / 四个 env 旋钮（超时 500、宽限 300、无进展 300、总上界 1000）的钳制与接线 / 单飞等待取先到者' },
-        { script: 'tools/proxy-pool-draw.test.mjs', label: '反代池：全量入池（含 A+AAAA，不砍 IPv6）/ 洗牌抽 6 / 探测窗口 3 + 探测即预连接（在飞 ≤ 3）/ 探测预算 300ms（env PROBE_PHASE_BUDGET_MS 可覆盖，钳到 50~3000ms）/ 退避隐退与回池 / 地区隔离（约 44s）' }
+        { script: 'tools/doh-source.test.mjs', label: 'DoH 出站：双源先到先用 + CF 宽限期 / 四个 env 旋钮（超时 800、宽限 300、无进展 500、总上界 1200）的钳制与接线 / 单飞等待取先到者' },
+        { script: 'tools/proxy-pool-draw.test.mjs', label: '反代池：全量入池（含 A+AAAA，不砍 IPv6）/ 洗牌抽 6 / 探测窗口 3 + 探测即预连接（在飞 ≤ 3）/ 探测预算 200ms（env PROBE_PHASE_BUDGET_MS 可覆盖，钳到 50~3000ms）/ 退避隐退与回池 / 地区隔离（约 44s）' }
     ].filter(({ script }) => (script.endsWith('proxy-pool-draw.test.mjs') ? poolGate : toolsGate));
 
     const run = (script, args = []) => {

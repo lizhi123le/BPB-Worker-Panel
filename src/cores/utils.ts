@@ -592,7 +592,7 @@ const GOOGLE_DOH = 'https://dns.google/resolve';
 // 为什么要有：一次请求里同一个域名会被解析**多次** —— 订阅生成先由 getConfigItems 解析节点域名，
 // sing-box 的 DNS 构建（resolveNodeIPs）再解析一次同一个域名；目标分类（isCloudflareTarget）
 // 与直连竞速（resolveTargetDNS）也各要一次；反代池解析（A/AAAA/TXT）同样走 DoH。
-// 没有缓存时这些是多次真实往返，而单次 DoH 的上限是 `dohTimeoutMs()`（默认 500ms，env 可调）——
+// 没有缓存时这些是多次真实往返，而单次 DoH 的上限是 `dohTimeoutMs()`（默认 800ms，env 可调）——
 // 重复解析会把 DNS 阶段的耗时上界成倍放大。
 //
 // 为什么只存**原始 Answer**、且只留一份：两个消费方要的形状不同 ——
@@ -639,13 +639,13 @@ function envMsClamped(tag: string, name: string, fallback: number, min: number, 
 }
 
 /**
- * 单源 DoH 超时（毫秒）：env `DOH_TIMEOUT_MS`，默认 500，区间 [50, 6000]。
+ * 单源 DoH 超时（毫秒）：env `DOH_TIMEOUT_MS`，默认 800，区间 [50, 6000]。
  * 原值硬编码 10s：DoH 正常 <300ms，10s 等于「挂死也不放手」，而这条最坏路径整段落在首包之前
  * （反代池解析）或订阅生成里。代价：跨区到 dns.google 这类「慢但会成功」的源会被判空
  * （空结果只缓存 30s，会自动自愈；池会退化成「域名本身」仍可拨号）。
  * 注意上限 6000 已低于旧的硬编码 10s —— 「完整回滚到旧行为」得改本文件，不能靠 env。
  */
-export function dohTimeoutMs(): number { return envMsClamped('DoH', 'DOH_TIMEOUT_MS', 500, 50, 6000); }
+export function dohTimeoutMs(): number { return envMsClamped('DoH', 'DOH_TIMEOUT_MS', 800, 50, 6000); }
 
 /**
  * 「CF 优先」的执行宽限期（毫秒）：env `DOH_SOURCE_GRACE_MS`，默认 300，区间 [0, 2000]。
@@ -655,27 +655,27 @@ export function dohTimeoutMs(): number { return envMsClamped('DoH', 'DOH_TIMEOUT
 export function dohSourceGraceMs(): number { return envMsClamped('DoH', 'DOH_SOURCE_GRACE_MS', 300, 0, 2000, true); }
 
 /**
- * 单飞等待方的「无进展就自己上」阈值（毫秒）：env `DOH_WAIT_STALL_MS`，默认 300。
+ * 单飞等待方的「无进展就自己上」阈值（毫秒）：env `DOH_WAIT_STALL_MS`，默认 500。
  * 区间 [50, min(3000, 单源超时 − 50)] —— 上限与 `dohTimeoutMs()` 绑定：必须小于它，否则每条查询
  * 都会在判据生效前就结束（成功或超时都记一次进展），这条闸门等于永不触发。
- * 未设时与单源超时的默认档（500）配出 300。
+ * 未设时与单源超时的默认档（800）配出 500。
  */
 export function dohWaitStallMs(): number {
     const cap = Math.max(50, Math.min(3000, dohTimeoutMs() - 50));
-    return envMsClamped('DoH', 'DOH_WAIT_STALL_MS', 300, 50, cap);
+    return envMsClamped('DoH', 'DOH_WAIT_STALL_MS', 500, 50, cap);
 }
 
 /** 单飞等待方的轮询粒度（毫秒）：25ms 是「发现生产者已写好」的最坏延迟，再细只会白烧定时器。 */
 const DOH_WAIT_POLL_MS = 25;
 
 /**
- * 单飞等待的**总上界**（毫秒）：env `DOH_WAIT_BUDGET_MS`，默认 1000，区间 [50, 10000]。
+ * 单飞等待的**总上界**（毫秒）：env `DOH_WAIT_BUDGET_MS`，默认 1200，区间 [50, 10000]。
  * 这是「同键已有解析在飞」时等待方最多等多久；无进展时另有 `dohWaitStallMs()` 提前放手，
- * 两者取先到者。为什么默认给 1s：一次冷解析 = A/AAAA × 双源 = 4 次 DoH，单次上限 500ms，
- * 常态总耗时在数百 ms 内；给到 1s 已覆盖常态，再长只是把「生产者卡住」的代价往后拖
+ * 两者取先到者。为什么默认给 1.2s：一次冷解析 = A/AAAA × 双源 = 4 次 DoH，单次上限 800ms，
+ * 常态总耗时在数百 ms 内；给到 1.2s 已覆盖常态，再长只是把「生产者卡住」的代价往后拖
  * （那种情况本就该由 stall 闸门接管）。要更宽容的慢链路就把它调大。
  */
-export function dohWaitBudgetMs(): number { return envMsClamped('DoH', 'DOH_WAIT_BUDGET_MS', 1000, 50, 10000); }
+export function dohWaitBudgetMs(): number { return envMsClamped('DoH', 'DOH_WAIT_BUDGET_MS', 1200, 50, 10000); }
 
 /** 总上界 → 轮询次数：至少 1 次（预算被钳到下限 50ms 时正好 2 次）。 */
 function dohWaitTries(): number {
@@ -932,7 +932,7 @@ export async function getConfigItems(isFragment: boolean): Promise<ConfigItem[]>
     // 对 DNS 解析出的 IP 做可达性探测，过滤不可达地址（两族并行：探测内部各自按 3 条滚动窗口
     // 限流，所以两族同时跑时峰值是 2 × 3 = 6 —— 与运行时「单请求并发出站连接」配额同量级，
     // 属于刻意接受的边界：订阅生成是低频的人机交互，优先让两族同时出结果，而不是把耗时翻倍。
-    // 每条 filter 调用另有探针总预算（默认 300ms，env `PROBE_PHASE_BUDGET_MS` 可覆盖，可调 50~3000ms）：主机名解析出的 IP 多于窗口时，
+    // 每条 filter 调用另有探针总预算（默认 200ms，env `PROBE_PHASE_BUDGET_MS` 可覆盖，可调 50~3000ms）：主机名解析出的 IP 多于窗口时，
     // 超出预算的候选按 'unknown' 保留（不判死），所以这里不会因为「没测完」而少给 IP。
     // 空数组不需要三元 + `Promise.resolve([] as string[])` 那种类型兼容写法：filterReachableIPs
     // 对空输入本来就返回 []（不发起任何连接），直接传进去语义等价。
@@ -1771,7 +1771,7 @@ export function stripRegionTag(entry: string): string {
  * 所以「探测判死」不等于「拨号一定连不上」：这正是 connectWithRaceDial 里 allProbeFailed 例外
  * （全部探测失败时不记退避、照常拨号）存在的原因。
  * 反面代价：黑洞候选在第一次遇到时要白等满 2 秒，之后进黑名单退避。
- * 整批耗时不靠「n × 本值」推导 —— 它由下方 probePhaseBudgetMs() 封顶（默认 300ms，env 可覆盖）；
+ * 整批耗时不靠「n × 本值」推导 —— 它由下方 probePhaseBudgetMs() 封顶（默认 200ms，env 可覆盖）；
  * 默认预算**小于本值**带来的取舍（慢候选会被判死）见 PROBE_PHASE_BUDGET_DEFAULT_MS 的注释。
  */
 const PROBE_TIMEOUT = 2000;
@@ -1793,7 +1793,7 @@ const PROBE_CONCURRENCY = 3;
  * 剩余预算低于它就不再发起新探测：只跑得满「半个单条超时」的探测拿不到可信结论 ——
  * 发起它既要白开一个 socket，判死时还会把好候选记进 30s 起指数退避的黑名单（误判链见下）。
  * 本值是**基准门槛**，实际门槛按当次预算缩放为 `min(本值, 预算 / 2)`（见 probeWithinBudget）：
- * 预算不到 2 × 本值时（默认 300，以及 env 下调的 50~300 档），固定门槛要么让第二波永远启动
+ * 预算不到 2 × 本值时（默认 200，以及 env 下调的 50~200 档），固定门槛要么让第二波永远启动
  * （退化成「只考前 3 个候选」），要么连第一波都发不出去（每次调用只剩 'unknown'，探测等于停用）。
  */
 const PROBE_MIN_LAUNCH_MS = PROBE_TIMEOUT / 2;
@@ -1804,10 +1804,10 @@ const PROBE_MIN_LAUNCH_MS = PROBE_TIMEOUT / 2;
  * 与 PROBE_TIMEOUT 分工不同：单条超时决定「一个候选多久判死」，总预算决定「整批最多占用多久」。
  * 为什么必须有总预算：这段耗时**整段落在首包之前**，而滚动窗口的天然上界是
  * ceil(n / PROBE_CONCURRENCY) × PROBE_TIMEOUT —— 反代池 n = 6、窗口 3 → 两波 = 4s，
- * 比「一次性全发」（8 条一波 = 2s）把最坏建连时延整整拉长一倍。预算取 300（按业主指定）：
+ * 比「一次性全发」（8 条一波 = 2s）把最坏建连时延整整拉长一倍。预算取 200（按业主指定）：
  *   - 候选够快（常态）：两波都在预算内跑完，逐条结论与「不限预算」完全一致；
  *   - 第一波拖过预算：第二波拿不到预算 → 那几条按 unknown 处理。
- * 代价（刻意接受）：默认值远低于单条超时（2000），所以「首连 > 300ms 才通」的慢候选会被判死 ——
+ * 代价（刻意接受）：默认值远低于单条超时（2000），所以「首连 > 200ms 才通」的慢候选会被判死 ——
  * 判死只影响「提前接管」，拨号侧有 allProbeFailed 例外保底；真在意慢链路就把 env 调大（≤ 3000）。
  *
  * unknown 的语义是**「没有结论」**，既不算通也不算不通：
@@ -1821,7 +1821,7 @@ const PROBE_MIN_LAUNCH_MS = PROBE_TIMEOUT / 2;
  *     越界按最近的边界值生效并打一条 warn（边界值仍是操作者的意图，只是收敛到能用的档位）。
  * 每个探测相位读一次（不缓存）：env 按请求注入，灰度/测试切换都靠它。
  */
-const PROBE_PHASE_BUDGET_DEFAULT_MS = 300;
+const PROBE_PHASE_BUDGET_DEFAULT_MS = 200;
 /**
  * 预算的可用区间（毫秒）。下限 50：再短连一次 TCP 握手都跑不完，探测只会把「还没来得及回
  * SYN-ACK」的候选判死（假失败 → 黑名单连锁误杀）。上限 3000：已超过 2 × 单条超时，
@@ -1844,7 +1844,7 @@ type ProbeVerdict = boolean | 'unknown';
  *  刻意不用「分块 Promise.all」：滚动窗口下快候选不必等慢候选那一整批结束
  *  （6 条里 4 条 3ms 通、2 条黑洞时，分块模式要等满一个探测超时才能开始第二批）。
  *  ⚠️ 滚动窗口本身**不封顶**总耗时（最坏是 ceil(n/3) × PROBE_TIMEOUT，6 条 = 两波 = 4s）。
- *  这个上界由调用方 probeWithinBudget 的探针预算（默认 300ms，env 可覆盖）压住 ——
+ *  这个上界由调用方 probeWithinBudget 的探针预算（默认 200ms，env 可覆盖）压住 ——
  *  所以这里的并发度只决定「一批里能并行几条」，不再决定「整批能拖多久」。 */
 async function mapWithConcurrency<T, R>(
     items: T[],
@@ -1876,7 +1876,7 @@ async function mapWithConcurrency<T, R>(
  * `shouldStop`：调用方已经拿到可用连接（探测即预连接）后由它返回 true —— 剩下的候选既不必再
  * 证明什么，也不该再开 socket，于是统一记 'unknown'（不判死、不进黑名单）。
  *
- * 预算是**每次调用现读**的（env `PROBE_PHASE_BUDGET_MS`，默认 300ms、可调区间 50~3000ms、显式 0 = 不限）。
+ * 预算是**每次调用现读**的（env `PROBE_PHASE_BUDGET_MS`，默认 200ms、可调区间 50~3000ms、显式 0 = 不限）。
  */
 async function probeWithinBudget<T>(
     items: T[],
@@ -2204,7 +2204,7 @@ async function writeProxyPoolCacheApi(cacheKey: string, result: SortedPool, time
  * Resolve proxy IP string into a pool of [host, port] entries.
  * Supports: .william domains (TXT prefix expansion), .tpN domains (port extraction),
  * normal domains (DoH A/AAAA dual-source), and direct IPs.
- * 解析结果按 **proxyIP** 单键缓存（一级 isolate 内 Map → 二级 Cache API 跨 isolate），TTL 默认 10min、
+ * 解析结果按 **proxyIP** 单键缓存（一级 isolate 内 Map → 二级 Cache API 跨 isolate），TTL 默认 12min、
  * env `PROXY_POOL_CACHE_TTL_MS` 可覆盖；缓存与单飞表里存的是**排序后未洗牌**的池，
  * 洗牌在返回前按 (targetDomain, uuid) 做（见 shuffleForTarget）—— 解析与目标无关，顺序与目标相关。
  * 池内保留**全部**解析条目，不做条数截断（实测地区池 KR=14、SG/JP/通用=50）。
@@ -2248,11 +2248,9 @@ export async function resolveProxyIPPool(
     // 等待方轮询一级缓存（解析结束即写入），读不到就自己取 —— **绝不 await 别人的 Promise**。
     //
     // 等待由两个上界共同约束，取先到者：
-    //   · **总上界** dohWaitBudgetMs()（env `DOH_WAIT_BUDGET_MS`，默认 1000ms）——「最多等多久」。
-    //     一次冷解析 = A/AAAA × 双源 = 4 次 DoH（单次上限 500ms），常态总耗时在数百 ms 内，
-    //     1s 已覆盖常态；再长只是把「生产者卡住」的代价往后拖。
-    //   · **无进展上界** dohWaitStallMs()（env `DOH_WAIT_STALL_MS`，默认 300ms）——「多久没动静就自己上」。
-    //     真正该判的是生产者还在不在推进，不是时间过了多久：300ms 内没有任何 DoH 完成
+    //   · **总上界** dohWaitBudgetMs()——「最多等多久」（env 名 / 默认值 / 区间 / 为什么给这个值见该函数注释）。
+    //   · **无进展上界** dohWaitStallMs()（env `DOH_WAIT_STALL_MS`，默认 500ms）——「多久没动静就自己上」。
+    //     真正该判的是生产者还在不在推进，不是时间过了多久：500ms 内没有任何 DoH 完成
     //     （成功/失败都算）说明这一轮多半卡在一个挂死的源上，此时白等满总上界再重算不如立刻并行上。
     // 起点取「本次等待开始」与「最近一次进展」的较晚者：否则上一次解析留下的旧时间戳
     // 会让新等待方在第一个 tick 就误判「卡住」。两个阈值都在等待开始时读一次（整段等待用同一组值）。

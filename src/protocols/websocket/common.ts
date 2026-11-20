@@ -36,7 +36,7 @@ const RACE_DIAL_MAX_BATCHES = 5; // 最大重试批次
 /**
  * 每连接从缓存池抽取参与可达性探测的候选数（抽取在探测前、按黑名单过滤后进行）。
  * 探测本身由 filterReachableEntries 按 3 条**滚动窗口**限流（见 utils 的 PROBE_CONCURRENCY），
- * 而**整批耗时默认封顶 1s**（env `PROBE_PHASE_BUDGET_MS` 可覆盖，可调 50~3000ms；预算内没轮到的候选按 unknown 处理：
+ * 而**整批耗时默认封顶 200ms**（env `PROBE_PHASE_BUDGET_MS` 可覆盖，可调 50~3000ms；预算内没轮到的候选按 unknown 处理：
  * 不记退避、照常拨号）—— 所以这个数不是并发连接数，也不是延迟上界，只是「一次能考几个候选」。
  * 同时必须满足 RACE_PROBE_COUNT ≤ RACE_DIAL_MAX_BATCHES × RACE_DIAL_CONCURRENCY
  * （6 ≤ 15）：一旦抽取数超过批次窗口，尾部候选永远排不进批次（结构性饥饿，白抽 + 白探测）。
@@ -192,7 +192,7 @@ async function connectWithRaceDial(
 
     log(`got ${poolEntries.length} IPs for proxy ${proxyAddr}, drawing ${probeEntries.length} (${poolEntries.length - drawSource.length} in backoff), probing reachability...`);
 
-    // 5. 探测（总预算默认 1s，env `PROBE_PHASE_BUDGET_MS` 可调 50~3000ms）+ **探测即预连接**：
+    // 5. 探测（总预算默认 200ms，env `PROBE_PHASE_BUDGET_MS` 可调 50~3000ms）+ **探测即预连接**：
     //    第一条被测通的候选，它那条**已经建立的 socket** 直接接管成数据连接，立刻写首包返回。
     //    为什么不「等整批探测跑完再拨」：那段等待整段落在首包之前，而探测只是筛选、不是裁决 ——
     //    只要有一条候选已被证明可达，就没有理由为「等最慢那条的结论」按住首包。
@@ -227,7 +227,7 @@ async function connectWithRaceDial(
     // 但「哪些候选是真的不通」仍必须落进黑名单（否则死候选每连接都要白探一次）。
     probePromise.then((entries) => {
         // 例外：本批抽取的候选**全部**探测不通 —— 这是「整池集体抖动」的信号，而不是 6 个候选各自死了。
-        // 探测超时（≤2s，默认档实际 ≤1s）比拨号超时(5s)更严，「探测判死」本来就不等于「拨号连不上」：
+        // 探测超时（≤2s，默认档实际 ≤200ms）比拨号超时(5s)更严，「探测判死」本来就不等于「拨号连不上」：
         // filterReachableEntries 会把它们原样返回继续拨号，所以此时不记退避，
         // 免得一次集体抖动就把整池锁进黑名单（真不通的候选会在拨号超时/写首包失败时按既有逻辑记账）。
         const allProbeFailed = probeEntries.length > 0 && probeFailed.length === probeEntries.length;
