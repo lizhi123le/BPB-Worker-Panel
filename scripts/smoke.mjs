@@ -408,7 +408,7 @@ function requests() {
   ];
 }
 
-async function runSession(modulePath, tag) {
+async function runSession(modulePath) {
   const restore = freezeEntropy(12345);
   installStubs();
 
@@ -684,7 +684,7 @@ async function main() {
   if (FLAGS.includes('--run')) {
     const bundlePath = POSITIONAL[0];
     const tag = POSITIONAL[1];
-    const session = await runSession(toModulePath(resolve(ROOT, bundlePath), tag), tag);
+    const session = await runSession(toModulePath(resolve(ROOT, bundlePath), tag));
     mkdirSync(TMP, { recursive: true });
     writeFileSync(join(TMP, `${tag}.json`), JSON.stringify(session));
     return;

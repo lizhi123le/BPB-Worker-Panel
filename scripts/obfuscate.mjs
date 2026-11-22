@@ -107,12 +107,6 @@ function num(value, fallback) {
   }
   return n;
 }
-function int(value, fallback) {
-  if (value === undefined || value === '') return fallback;
-  const n = Number(value);
-  if (!Number.isInteger(n) || n < 0) throw new Error(`Invalid integer "${value}"`);
-  return n;
-}
 function bool(value, fallback) {
   if (value === undefined || value === '') return fallback;
   return value !== 'false' && value !== '0';

@@ -254,7 +254,7 @@ export function hardenSource(code, options = {}) {
   try {
     parseModule(current);
   } catch (error) {
-    throw new Error(`harden-source: 改写后无法解析（${error.message}）—— 拒绝继续构建`);
+    throw new Error(`harden-source: 改写后无法解析（${error.message}）—— 拒绝继续构建`, { cause: error });
   }
   return { code: current, stats };
 }
