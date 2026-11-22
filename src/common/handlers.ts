@@ -301,7 +301,8 @@ async function getSettings(request: Request, env: Env): Promise<Response> {
     }
 
     try {
-        const dataset = await getDataset(request, env);
+        // needWarp=false：设置页只需要 settings，账号交给真正用到它的路径去读
+        const dataset = await getDataset(request, env, { needWarp: false });
         const { subPath } = globalThis.httpConfig;
 
         const data = {
@@ -370,7 +371,8 @@ async function getRegionInfo(request: Request, env: Env): Promise<Response> {
     if (denied) return denied;
 
     try {
-        await setSettings(request, env);
+        // needWarp=false：本接口只读 globalThis.settings 里的 wkRegion，与 WARP 账号无关
+        await setSettings(request, env, { needWarp: false });
 
         const cf = (request as any).cf || {};
         const country = cf.country || '';

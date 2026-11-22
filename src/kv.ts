@@ -1,4 +1,4 @@
-import { fetchWarpAccounts, DEFAULT_WARP_ACCOUNTS } from '@warp';
+import { fetchWarpAccounts, DEFAULT_WARP_ACCOUNTS, type WarpAccountsResult } from '@warp';
 import { getDomain, parseHostPort, resolveDNS } from '@utils';
 import { base64DecodeUtf8, KV_READ_TIMEOUT_MS, safeErrorMessage, withTimeout } from '@common';
 import { getKvCache, setKvCache, clearKvCache } from './kv-cache';
@@ -69,8 +69,11 @@ async function readWarpStaleAt(env: Env): Promise<number> {
 /**
  * 注册一次；失败时写退避标记。
  * 标记写失败（KV 写额度/临时故障）不得让请求失败 —— 退化成「下次再试」即可。
+ *
+ * 返回值带上 `fallback`：调用方据此决定要不要把结果放进内存缓存 ——
+ * 内置兜底账号**不能**缓存（它代表「注册失败」，见 loadWarpAccounts 的说明）。
  */
-async function registerWarpAccounts(env: Env): Promise<WarpAccount[]> {
+async function registerWarpAccounts(env: Env): Promise<WarpAccountsResult> {
     const { accounts, fallback } = await fetchWarpAccounts(env);
 
     if (fallback && Date.now() - warpStaleMarkedAt > WARP_STALE_TTL_MS / 2) {
@@ -82,26 +85,104 @@ async function registerWarpAccounts(env: Env): Promise<WarpAccount[]> {
         } catch { /* 标记写失败只影响退避效果，不影响本次请求 */ }
     }
 
+    return { accounts, fallback };
+}
+
+/**
+ * isolate 级 warpAccounts 内存缓存（TTL 与 kv-cache 的 300s 同量级）。
+ *
+ * 为什么需要：`warpAccounts` 原先在 getDataset 里**无条件直读 KV**，而 getDataset 被
+ * setSettings 在每条 WS 连接 / 每个 XHTTP 请求上调用（见上方 B-02 注释），于是配置本身有
+ * kv-cache 的 5 分钟内存缓存、账号却每请求都要付一次读；一次订阅拉取里
+ * getWarpConfigs / 各核心 configs 还会再各调一次 getDataset，同一份账号被重复读。
+ *
+ * 缓存**只装可信来源**：
+ *   · KV 里形状合法的账号（读一次即可撑满 TTL）；
+ *   · 新注册成功的账号（warp.ts 已写进 KV，回填与 KV 一致）。
+ * **内置兜底账号不入缓存**：它代表「注册失败」。缓存它会把「退避窗口结束后重新注册」
+ * 退化成「窗口外再等一个 TTL 才重试」，与 B-02 的意图相悖，也会让失败期行为与改动前不一致。
+ * 账号是长期凭据（只有重新注册才会变），TTL 内不读 KV 是安全的。
+ */
+const WARP_ACCOUNTS_CACHE_TTL_MS = 300_000;
+let cachedWarpAccounts: WarpAccount[] | null = null;
+let cachedWarpAccountsAt = 0;
+
+/** 账号是扁平对象：浅拷贝一份给调用方，避免下游改写污染缓存 */
+function cloneWarpAccounts(accounts: readonly WarpAccount[]): WarpAccount[] {
+    return accounts.map(account => ({ ...account }));
+}
+
+function rememberWarpAccounts(accounts: readonly WarpAccount[]): void {
+    cachedWarpAccounts = cloneWarpAccounts(accounts);
+    cachedWarpAccountsAt = Date.now();
+}
+
+function freshCachedWarpAccounts(): WarpAccount[] | null {
+    if (!cachedWarpAccounts || Date.now() - cachedWarpAccountsAt >= WARP_ACCOUNTS_CACHE_TTL_MS) return null;
+    return cloneWarpAccounts(cachedWarpAccounts);
+}
+
+/**
+ * 取 WARP 账号：内存缓存 → KV → （退避窗口内）内置账号 → 注册。
+ * 只有真的需要账号的路径才调用它（见 getDataset 的 needWarp）。
+ */
+async function loadWarpAccounts(env: Env): Promise<WarpAccount[]> {
+    const memo = freshCachedWarpAccounts();
+    if (memo) return memo;
+
+    // 读入即守卫：坏形状（reserved 空串 / 缺字段 / 账号数不足）→ null，走下面的重新获取
+    const fromKv = normalizeWarpAccounts(await withTimeout(
+        env.kv.get('warpAccounts', { type: 'json' }),
+        KV_READ_TIMEOUT_MS,
+        'KV WARP 账号读取'
+    ));
+    if (fromKv) {
+        rememberWarpAccounts(fromKv);
+        return cloneWarpAccounts(fromKv);
+    }
+
+    // B-02：先看退避标记。窗口内直接用内置账号（0 次网络请求、0 次密钥生成）；
+    // 标记缺失或已过期才真正去注册一次，注册失败会重新写标记。
+    // 这一支刻意**不写缓存**：内置账号是「失败态」，下次请求仍须重新判定（见上方 TTL 注释）。
+    const staleAt = await readWarpStaleAt(env);
+    if (staleAt && Date.now() - staleAt < WARP_STALE_TTL_MS) {
+        return [...DEFAULT_WARP_ACCOUNTS];
+    }
+
+    const { accounts, fallback } = await registerWarpAccounts(env);
+    if (!fallback) rememberWarpAccounts(accounts);
     return accounts;
+}
+
+/** getDataset 的调用选项 */
+export interface DatasetOptions {
+    /**
+     * 是否需要 WARP 账号（默认 true）。
+     *
+     * WS / XHTTP **数据面不需要**它们（WARP 只是订阅里的出站）：那两条热路径传 false，
+     * 一条代理连接就一次 KV 都不读（配置本身由 kv-cache 的 5 分钟内存缓存兜住）。
+     * 注意 false 时返回的 `warpAccounts` 恒为空数组 —— 需要账号的调用方（订阅生成、
+     * WARP 配置下载）必须保持默认值，否则会拿到空数组去解 `[0]` / `[1]`。
+     */
+    needWarp?: boolean;
 }
 
 export async function getDataset(
     request: Request,
-    env: Env
+    env: Env,
+    options: DatasetOptions = {}
 ): Promise<{ settings: Settings, warpAccounts: WarpAccount[] }> {
     const { httpConfig, settings } = globalThis;
     const panelVersion = httpConfig?.panelVersion;
-    let proxySettings: Settings | null, warpAccounts: WarpAccount[] | null;
+    const needWarp = options.needWarp !== false;
+    let proxySettings: Settings | null;
+    let warpAccounts: WarpAccount[] = [];
 
     try {
         // 对齐 cfnew：通过内存缓存读取，减少 KV 读取次数
         proxySettings = await getKvCache(env);
-        // 读入即守卫：坏形状（reserved 空串 / 缺字段 / 账号数不足）→ null，走下面的重新获取
-        warpAccounts = normalizeWarpAccounts(await withTimeout(
-            env.kv.get('warpAccounts', { type: 'json' }),
-            KV_READ_TIMEOUT_MS,
-            'KV WARP 账号读取'
-        ));
+        // 数据面不读账号：needWarp=false（WS / XHTTP）时这里是 0 次 KV 读
+        if (needWarp) warpAccounts = await loadWarpAccounts(env);
 
         if (!proxySettings) {
             // KV 尚无配置（首次部署）→ 写入默认值
@@ -136,15 +217,6 @@ export async function getDataset(
             (proxySettings as any).xpConfigs = typeof legacyXpConfigs === 'boolean'
                 ? legacyXpConfigs
                 : DEFAULT_SETTINGS.xpConfigs;
-        }
-
-        if (!warpAccounts) {
-            // B-02：先看退避标记。窗口内直接用内置账号（0 次网络请求、0 次密钥生成）；
-            // 标记缺失或已过期才真正去注册一次，注册失败会重新写标记。
-            const staleAt = await readWarpStaleAt(env);
-            warpAccounts = staleAt && Date.now() - staleAt < WARP_STALE_TTL_MS
-                ? [...DEFAULT_WARP_ACCOUNTS]
-                : await registerWarpAccounts(env);
         }
 
         if (panelVersion && panelVersion !== proxySettings.panelVersion) {

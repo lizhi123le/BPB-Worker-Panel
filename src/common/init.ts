@@ -1,4 +1,4 @@
-import { getDataset } from "@kv";
+import { getDataset, type DatasetOptions } from "@kv";
 import { isKvBound, isValidUUID } from "@common";
 import { applyAddressEnvOverrides } from "@utils";
 // 出厂默认值移至零依赖的 ./defaults，使 @kv 也能以它作校验基准而不产生循环依赖。
@@ -27,8 +27,12 @@ globalThis.dict = {
 
 globalThis.settings = structuredClone(DEFAULT_SETTINGS);
 
-export async function setSettings(request: Request, env: Env) {
-    const dataset = await getDataset(request, env);
+/**
+ * 把 KV 设置合并进 globalThis.settings。
+ * `options.needWarp` 的语义与取值理由见 @kv 的 DatasetOptions（默认 true = 读账号）。
+ */
+export async function setSettings(request: Request, env: Env, options?: DatasetOptions) {
+    const dataset = await getDataset(request, env, options);
     const settings = dataset.settings;
     if (settings) {
         // URL 不再在此解析（原会在每次请求都 fetch）；改为在订阅拉取 / 连接时按需解析并缓存

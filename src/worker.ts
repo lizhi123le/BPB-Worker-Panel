@@ -98,7 +98,8 @@ export default {
 				assertRequiredCredentials(env, wsPathName);
 
 				initWs(env);
-				await setSettings(request, env);
+				// needWarp=false：WS 数据面用不到 WARP 账号（语义见 @kv 的 DatasetOptions）→ 稳态 0 次 KV 读
+				await setSettings(request, env, { needWarp: false });
 				return await handleWebsocket(request, env);
 			} else {
 				await initHttp(request, env);
@@ -121,7 +122,8 @@ export default {
 						.replace(/^\//, '');
 					if (isXpPathAllowed(xpSegments, xpAdminPath, globalThis.globalConfig.userID || '')) {
 						initWs(env);
-						await setSettings(request, env);
+						// 与 WS 分支同口径：XHTTP 数据面也不需要 WARP 账号 → 0 次 KV 读
+						await setSettings(request, env, { needWarp: false });
 						if (globalThis.settings?.xpConfigs === true) {
 							// 出站策略与 WS 共用同一份推导（反代池 / 官方池 / 地区 / 出站模式），
 							// 两条入站必须看到同一份 wsConfig，否则出口行为会不一致。
