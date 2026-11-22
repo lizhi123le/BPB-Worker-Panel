@@ -9,10 +9,10 @@ import { fetchWarpAccounts } from "@warp";
 import { UnifiedWSHandler } from "@unified";
 import { XP_MODE, buildXpExtra, buildXpNodePath } from "@cores/xp";
 import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, htmlResponse, HttpStatus, isKvBound, respond, safeErrorMessage, securityHeaders } from "@common";
-import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, generateRemark, generateWsPath, getConfigItems, isBareIPv4, isBareIPv6, isTlsPort, parseHostPort, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectSniHost } from "@utils";
+import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, generateRemark, generateWsPath, getConfigItems, isBareIPv4, isBareIPv6, isTlsPort, OFFICIAL_DIRECT_IPS, parseHostPort, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, probeLatency, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectSniHost, splitEntryLine } from "@utils";
 import JSZip from "jszip";
 
-import { prepareWsRuntimeConfig } from "./ws-runtime";
+import { prepareWsRuntimeConfig, resolveProxyPoolSource } from "./ws-runtime";
 // S-03：IP 只取校验过的形态
 import { clientIp } from "./client-ip";
 
@@ -62,6 +62,9 @@ export async function handlePanel(request: Request, env: Env): Promise<Response>
 
         case '/panel/get-warp-configs':
             return await getWarpConfigs(request, env);
+
+        case '/panel/pool-probe':
+            return await poolProbe(request, env);
 
         default:
             return await fallback(request);
@@ -410,6 +413,152 @@ async function getRegionInfo(request: Request, env: Env): Promise<Response> {
     } catch (error) {
         console.error('Error fetching region info:', error);
         return respond(false, HttpStatus.INTERNAL_SERVER_ERROR, `Error fetching region info: ${safeErrorMessage(error)}`)
+    }
+}
+
+/** 池探针的护栏：最多探多少条（诊断用，不给自己留「被当成端口扫描器 / 撞并发连接配额」的口子） */
+const POOL_PROBE_MAX_ENTRIES = 50;
+const POOL_PROBE_TIMEOUT_DEFAULT_MS = 1500;
+const POOL_PROBE_TIMEOUT_MIN_MS = 300;
+const POOL_PROBE_TIMEOUT_MAX_MS = 3000;
+
+/**
+ * `ips=` 的解析：**每行一个条目**，行内再交给 `splitEntryLine`（与反代池 / 订阅侧同一条判据）。
+ * http(s) 行整行当一个**远程清单 URL** —— 查询串里的逗号（`?region=SG,HK`）属于 URL 本身，
+ * 绝不能按逗号拆；其余行按逗号 / 空白拆成多条。
+ * 拆法与面板 testPoolIPs 一致（前端用 `\n` 把条目拼回这个参数）。
+ */
+function parseProbeInput(raw: string): string[] {
+    const tokens: string[] = [];
+    for (const line of raw.split(/[\r\n]+/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        for (const token of splitEntryLine(trimmed)) {
+            // URL 原样收下（含空格也不切：URL 里不该有空格，切了只会得到两条废条目）
+            if (/^https?:\/\//i.test(token)) { tokens.push(token); continue; }
+            tokens.push(...token.split(/\s+/).filter(Boolean));
+        }
+    }
+    return tokens;
+}
+
+/**
+ * 池条目（字符串形态，可能带 `@地区` / `#备注` / 裸地址 / 域名）→ [host, port]。
+ * 归一化**完全依赖 parseHostPort**（C-05：`@地区`、`#备注`、首尾空白都在它内部吸收，
+ * 调用点不需要也不应该先 stripRegionTag），这里只补它不管的四件事：
+ * 裸地址补 :443、越界端口丢弃、按 host:port 去重、条数截断。
+ *
+ * 域名条目**不做 DoH**：诊断只回答「这一条现在通不通」，把域名直接交给 `connect()` 由运行时解析
+ * 最省事也最直观（拨号侧是「先 DoH 再拨 IP」，两者不完全等价，但一次调用就能摊开整池）。
+ *
+ * 返回 `requested`（去重后的候选总数，截断前）：响应里靠它说明「实际只探了前 N 条」，
+ * 否则远程清单返回 100 条时，前端看到的 50 条会被误读成「清单只有 50 条」。
+ */
+function toProbeEntries(raw: string[]): { entries: [string, number][]; requested: number } {
+    const seen = new Set<string>();
+    const entries: [string, number][] = [];
+    let requested = 0;
+    for (const item of raw) {
+        const { host, port } = parseHostPort(String(item), true);
+        if (!host) continue;
+        if (port !== 0 && (port < 1 || port > 65535)) continue; // 越界端口：当畸形条目丢弃
+        const entryPort = port || 443;
+        const key = `${host}:${entryPort}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        requested++;
+        if (entries.length >= POOL_PROBE_MAX_ENTRIES) continue; // 到上限后只数不收，保证 requested 准确
+        entries.push([host, entryPort]);
+    }
+    return { entries, requested };
+}
+
+/**
+ * 池探针（诊断用）：从**本 Worker 的网络位置**对池内每条地址做一次 TCP 探测，返回「通/不通 + 耗时」。
+ *
+ * 为什么需要它：池的可用性只能在 CF 侧测 —— 用户本机的连通性与 Worker 出站无关（实测同一批地址
+ * 「本机 4/19 可连」，而 Worker 侧 92ms 就拨通了其中本机不通的一条）。只看日志只能事后从
+ * `race dial winner` / `race dialing batch` 反推，这里一次调用就能把整池摊开。
+ *
+ * 池的来源（`pool=`），回落顺序与 ws-runtime 推导「本连接可拨的池」**逐字一致**：
+ *   · official（默认）—— 面板 `officialIPs` 有值用它，没设置则用**内置官方池**；
+ *   · proxy —— 面板 `proxyIPs`（URL 条目先解析）有值用它，否则 env `PROXY_IP`，
+ *     再否则用**内置反代池** `DEFAULT_PROXY_IPS`（内置池是域名，直接交给 connect() 让运行时解析）；
+ *   · ips=a,b,c —— 自定义列表（同一套归一化）；**也接受远程清单 URL**（每行一个），
+ *     走与池完全相同的 resolveUrlEntries（同一份 KV 缓存 / 逗号与花括号兼容 / 失败沿用上次结果）。
+ * 响应里的 `source` 用 `<池>:<出处>` 一次说清两件事，例如 `official:builtin`、`proxy:env`。
+ *
+ * 只读：不写 KV、不碰临时黑名单、不推进池游标，可反复调用；需要面板会话（GET）。
+ */
+async function poolProbe(request: Request, env: Env): Promise<Response> {
+    const denied = await requireSession(request, env, { method: 'GET' });
+    if (denied) return denied;
+
+    try {
+        // /panel 路由不像 /sub 那样预先 setSettings：面板值要先合并进 globalThis.settings
+        await setSettings(request, env, { needWarp: false });
+
+        const { searchParams } = new URL(request.url);
+        const pool = (searchParams.get('pool') || 'official').toLowerCase();
+        const customIPs = searchParams.get('ips');
+        const timeoutParam = Number(searchParams.get('timeout'));
+        const timeoutMs = Number.isFinite(timeoutParam) && timeoutParam > 0
+            ? Math.min(POOL_PROBE_TIMEOUT_MAX_MS, Math.max(POOL_PROBE_TIMEOUT_MIN_MS, Math.round(timeoutParam)))
+            : POOL_PROBE_TIMEOUT_DEFAULT_MS;
+
+        let source: 'official:panel' | 'official:builtin' | 'proxy:panel' | 'proxy:env' | 'proxy:builtin' | 'custom';
+        let entries: [string, number][];
+        let requested = 0;
+
+        if (customIPs) {
+            source = 'custom';
+            // 远程清单与裸地址走同一条解析：resolveUrlEntries 按行展开 http(s) 条目，
+            // 其余原样保留（并按 host:port 去重）。抓取失败会沿用上次结果，不会让整张表凭空清空。
+            const resolved = await resolveUrlEntries(parseProbeInput(customIPs), env);
+            ({ entries, requested } = toProbeEntries(resolved));
+        } else if (pool === 'proxy') {
+            // 来源链与 WS 出站推导共用一份（面板 > env PROXY_IP > 内置反代池），见 resolveProxyPoolSource。
+            // 内置池条目是域名（运行时拼出来的地区域名），按 toProbeEntries 的说明直接交给 connect()。
+            const { entries: raw, source: poolSource } = await resolveProxyPoolSource(env);
+            source = `proxy:${poolSource}`;
+            ({ entries, requested } = toProbeEntries(raw));
+        } else {
+            const panelIPs = globalThis.settings.officialIPs || [];
+            source = panelIPs.length > 0 ? 'official:panel' : 'official:builtin';
+            ({ entries, requested } = toProbeEntries(panelIPs.length > 0 ? panelIPs : OFFICIAL_DIRECT_IPS));
+        }
+
+        if (entries.length === 0) {
+            return respond(true, HttpStatus.OK, 'pool is empty', {
+                source, count: 0, requested: 0, ok: 0, timeoutMs, durationMs: 0, results: [], fastest: []
+            });
+        }
+
+        const startedAt = Date.now();
+        // fetcher 必须传：新版 Workers 运行时不一定挂全局 connect（见 @common#connectTCP）
+        const results = await probeLatency(entries, { timeoutMs, fetcher: (request as any).fetcher });
+        const durationMs = Date.now() - startedAt;
+        const okCount = results.filter(result => result.ok).length;
+
+        return respond(true, HttpStatus.OK, `${okCount}/${entries.length} reachable`, {
+            source,
+            count: entries.length,
+            // 去重后的候选总数（截断前）：远程清单可能返回上百条，前端据此说明「只探了前 N 条」
+            requested,
+            ok: okCount,
+            timeoutMs,
+            durationMs,
+            // 原始顺序：与池的顺序对照，方便看出「头几条是否可用」——拨号侧第一条会参与洗牌后的抽样
+            results: results.map(result => ({ ip: result.host, port: result.port, ok: result.ok, ms: result.ms })),
+            // 只含可用的，按耗时升序：直接当「优选子集」抄进面板
+            fastest: results
+                .filter(result => result.ok)
+                .sort((a, b) => a.ms - b.ms)
+                .map(result => ({ ip: result.host, port: result.port, ms: result.ms }))
+        });
+    } catch (error) {
+        console.log(error);
+        return respond(false, HttpStatus.INTERNAL_SERVER_ERROR, `Probe failed: ${safeErrorMessage(error)}`);
     }
 }
 

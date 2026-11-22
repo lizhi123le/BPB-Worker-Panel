@@ -28,7 +28,7 @@ declare global {
         workerRegion?: string;
         regionMatch?: boolean;
         wkRegion?: string;
-        // 官方直连 IP 池（面板 officialIPs，未配置则为内置 10 个），已在 handlers.ts 归一化。
+        // 官方直连 IP 池（面板 officialIPs，未配置则为内置池），已在 handlers.ts 归一化。
         // 出站模式的「CF 内置 IP 池」兜底层凭它拨号；CF 模式下它同时也是 panelIPs。
         officialPool?: string[];
         // 用户显式配置的反代池实体（不含内置 DEFAULT_PROXY_IPS，也不含 CF 模式的官方直连池）。

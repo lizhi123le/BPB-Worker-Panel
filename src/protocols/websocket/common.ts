@@ -1,17 +1,9 @@
 import { resolveDNS, resolveProxyIPPool, poolNeedsDns, filterReachableEntries, parseHostPort, stripRegionTag, DEFAULT_PROXY_IPS, resolveTargetDNS, isCloudflareTarget, ipv6ToBytes, isBareIPv4 } from '@utils';
-import { evictOldest, safeErrorMessage, randomUserAgent, base64EncodeUtf8, createSessionWatchdog, createSignatureGate, envNumber, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
+import { evictOldest, safeErrorMessage, randomUserAgent, base64EncodeUtf8, createSessionWatchdog, createSignatureGate, envNumber, connectTCP, WATCHDOG_INTERVAL_MS, type SessionWatchdog } from '@common';
 
-// cfnew 风格：每次调用时才从运行时全局查找 connect，避免模块加载时固化为 undefined
-// 核心修复：原写法 `export const connectSocket = getConnect()` 在模块加载期立即执行，
-// 此时 CF Workers 的 globalThis.connect 尚未挂载，导致 connectSocket === undefined。
-// 对齐 cfnew: const 连接 = (选项) => (typeof TCP拨号 !== 'undefined' ? TCP拨号 : connect)(选项)
-export const connectSocket = (options: { hostname: string; port: number }, fetcher?: any): Socket => {
-    // 对齐 cfnew d4b2b7f：优先 request.fetcher.connect，回退全局 connect()
-    // （新版 Workers 运行时可能没有全局 connect，必须用请求绑定的 fetcher 建连）
-    return fetcher && typeof fetcher.connect === 'function'
-        ? fetcher.connect(options)
-        : (globalThis as any).connect(options);
-};
+// 建连器解析统一在 @common#connectTCP：优先 request.fetcher.connect，回退运行时全局 connect，
+// 两者都没有会 warn 一次再抛错（新版 Workers 运行时不一定挂全局 connect —— 详见该函数注释）。
+// 本文件不再另设一层同名包装：调用点直接写 connectTCP(...)，避免两个名字指向同一件事。
 
 export const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
@@ -221,7 +213,7 @@ async function connectWithRaceDial(
     // 不是被自己的探测并发撞配额打出来的假失败；预算内没轮到的候选是 'unknown'（不上报、不判死）。
     const probePromise = filterReachableEntries(probeEntries, (entry, ok) => {
         if (!ok) probeFailed.push(entry);
-    }, claimProbeSocket);
+    }, claimProbeSocket, fetcher);
 
     // 记账挂在探测**完成**的回调里，不挂在主流程的 await 之后：接管成功会提前 return，
     // 但「哪些候选是真的不通」仍必须落进黑名单（否则死候选每连接都要白探一次）。
@@ -531,7 +523,7 @@ async function openCandidate(
     fetcher?: any,
     hooks?: { onSocket?: (socket: Socket) => void }
 ): Promise<Socket> {
-    const socket = connectSocket(target, fetcher);
+    const socket = connectTCP(target, fetcher);
 
     hooks?.onSocket?.(socket);
 
@@ -831,7 +823,7 @@ async function socks5Connect(
     const { username, password, hostname: proxyHost, port: proxyPort } = proxyConfig;
 
     // Connect to SOCKS5 proxy — aligned with cfnew 处理打开值套接字 L5528
-    const socket = connectSocket({ hostname: proxyHost, port: proxyPort }, fetcher);
+    const socket = connectTCP({ hostname: proxyHost, port: proxyPort }, fetcher);
 
     const writer = socket.writable.getWriter();
     const reader = socket.readable.getReader();
@@ -970,10 +962,8 @@ async function httpConnectTunnel(
     const connectOpts = kind === 'secure-tunnel' ? { secureTransport: 'on', allowHalfOpen: false } : undefined;
     const target = { hostname: proxyHost, port: proxyPort };
 
-    // Connect to proxy — cfnew L5612
-    const socket = (fetcher && typeof fetcher.connect === 'function')
-        ? (connectOpts ? fetcher.connect(target, connectOpts) : fetcher.connect(target))
-        : (connectOpts ? (globalThis as any).connect(target, connectOpts) : (globalThis as any).connect(target));
+    // Connect to proxy — cfnew L5612（建连器解析统一走 @common#connectTCP，不在各处重写 fallback）
+    const socket = connectTCP(target, fetcher, connectOpts);
 
     if (socket.opened) {
         // B-12：这条 await 原先在 try 之外 —— opened 被拒时 socket 无人关闭（清理只覆盖 try 之后）
@@ -1205,7 +1195,7 @@ export async function handleTCPOutBound(
                 }
             }
 
-            // 4. CF 内置 IP 池竞速回退（官方直连池：面板 officialIPs，未配置则内置 10 个）
+            // 4. CF 内置 IP 池竞速回退（官方直连池：面板 officialIPs，未配置则用内置池）
             if (hasOfficialPool && !triedHops.has('official')) {
                 triedHops.add('official');
                 try {

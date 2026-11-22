@@ -1,4 +1,4 @@
-import { evictOldest, safeErrorMessage, crossRequestSingleFlight, createSignatureGate, envNumber, withTimeout } from "@common";
+import { evictOldest, safeErrorMessage, crossRequestSingleFlight, createSignatureGate, envNumber, withTimeout, connectTCP } from "@common";
 import { PUBLIC_PATH_POOL } from "../common/ratelimit";
 
 // ── H6：跨部署硬编码常量的 env 覆盖入口 ──
@@ -25,8 +25,10 @@ function replaceList(target: string[], next: string[]): void {
 }
 
 // Cloudflare Workers runtime provides global connect function
-// D-03：原此处有一条 `declare const connect`，全文件从未使用（实现走 (globalThis as any).connect，
-// 且 @cloudflare/workers-types 已自带该全局声明），属纯噪音，已删除。
+// D-03：原此处有一条 `declare const connect`，全文件从未使用，属纯噪音，已删除。
+// 2026-11：建连器解析统一收到 @common#connectTCP（优先 request.fetcher.connect，回退全局 connect）——
+// 原先这里直写 `(globalThis as any).connect(...)`，在「运行时没有全局 connect」的部署上会同步抛错，
+// 被探测层的 catch 吞成「不可达」，表现为探测全判死、走批次兜底却又能连通。
 
 // ============================================================
 // 特征码字典 —— 内置代理域名生成字典（对齐 cfnew 特征码字典）
@@ -39,22 +41,32 @@ const 特征码域名前缀 = Proxy.name + "IP";                                
 const 特征码根域 = String.fromCharCode(67, 77) + URL.name[2] + (Infinity + '')[3]
     + URL.name[0].toLowerCase() + String.fromCharCode(115, 115, 115, 115);    // "CMLossss"
 
-// 内置 14 个跨地区备份域名（对齐 cfnew 14 地区）
+// 内置 22 个备份域名：1 个「全球（无地区）」+ 17 个地区 + 4 个云厂商（对齐 cfnew 14 地区）
 const 备用地址列表 = [
-    { domain: `${特征码域名前缀}.HK.${特征码根域}.net`, region: 'HK', regionCode: 'HK', port: 443 },
-    { domain: `${特征码域名前缀}.US.${特征码根域}.net`, region: 'US', regionCode: 'US', port: 443 },
-    { domain: `${特征码域名前缀}.SG.${特征码根域}.net`, region: 'SG', regionCode: 'SG', port: 443 },
-    { domain: `${特征码域名前缀}.JP.${特征码根域}.net`, region: 'JP', regionCode: 'JP', port: 443 },
-    { domain: `${特征码域名前缀}.KR.${特征码根域}.net`, region: 'KR', regionCode: 'KR', port: 443 },
-    { domain: `${特征码域名前缀}.DE.${特征码根域}.net`, region: 'DE', regionCode: 'DE', port: 443 },
-    { domain: `${特征码域名前缀}.SE.${特征码根域}.net`, region: 'SE', regionCode: 'SE', port: 443 },
-    { domain: `${特征码域名前缀}.NL.${特征码根域}.net`, region: 'NL', regionCode: 'NL', port: 443 },
-    { domain: `${特征码域名前缀}.FI.${特征码根域}.net`, region: 'FI', regionCode: 'FI', port: 443 },
-    { domain: `${特征码域名前缀}.GB.${特征码根域}.net`, region: 'GB', regionCode: 'GB', port: 443 },
-    { domain: `${特征码域名前缀}.Oracle.${特征码根域}.net`, region: 'Oracle', regionCode: 'Oracle', port: 443 },
-    { domain: `${特征码域名前缀}.DigitalOcean.${特征码根域}.net`, region: 'DigitalOcean', regionCode: 'DigitalOcean', port: 443 },
-    { domain: `${特征码域名前缀}.Vultr.${特征码根域}.net`, region: 'Vultr', regionCode: 'Vultr', port: 443 },
-    { domain: `${特征码域名前缀}.Multacom.${特征码根域}.net`, region: 'Multacom', regionCode: 'Multacom', port: 443 },
+    // 全球（无地区）：推荐的最快反代入口，也是 wkRegion=GL / 反代输入框 `@GL`（不分大小写）的锚定目标。
+    // 域名构造与其余条目同源（ProxyIP.<根域>.net，没有地区段）——不写静态字面量。
+    { domain: `${特征码域名前缀}.${特征码根域}.net`, regionCode: 'GL', port: 443 },
+    { domain: `${特征码域名前缀}.HK.${特征码根域}.net`, regionCode: 'HK', port: 443 },
+    { domain: `${特征码域名前缀}.US.${特征码根域}.net`, regionCode: 'US', port: 443 },
+    { domain: `${特征码域名前缀}.SG.${特征码根域}.net`, regionCode: 'SG', port: 443 },
+    { domain: `${特征码域名前缀}.JP.${特征码根域}.net`, regionCode: 'JP', port: 443 },
+    { domain: `${特征码域名前缀}.KR.${特征码根域}.net`, regionCode: 'KR', port: 443 },
+    { domain: `${特征码域名前缀}.DE.${特征码根域}.net`, regionCode: 'DE', port: 443 },
+    { domain: `${特征码域名前缀}.SE.${特征码根域}.net`, regionCode: 'SE', port: 443 },
+    { domain: `${特征码域名前缀}.NL.${特征码根域}.net`, regionCode: 'NL', port: 443 },
+    { domain: `${特征码域名前缀}.FI.${特征码根域}.net`, regionCode: 'FI', port: 443 },
+    { domain: `${特征码域名前缀}.GB.${特征码根域}.net`, regionCode: 'GB', port: 443 },
+    { domain: `${特征码域名前缀}.IN.${特征码根域}.net`, regionCode: 'IN', port: 443 },
+    { domain: `${特征码域名前缀}.FR.${特征码根域}.net`, regionCode: 'FR', port: 443 },
+    { domain: `${特征码域名前缀}.PL.${特征码根域}.net`, regionCode: 'PL', port: 443 },
+    { domain: `${特征码域名前缀}.RU.${特征码根域}.net`, regionCode: 'RU', port: 443 },
+    { domain: `${特征码域名前缀}.CH.${特征码根域}.net`, regionCode: 'CH', port: 443 },
+    { domain: `${特征码域名前缀}.LV.${特征码根域}.net`, regionCode: 'LV', port: 443 },
+    { domain: `${特征码域名前缀}.CA.${特征码根域}.net`, regionCode: 'CA', port: 443 },
+    { domain: `${特征码域名前缀}.Oracle.${特征码根域}.net`, regionCode: 'Oracle', port: 443 },
+    { domain: `${特征码域名前缀}.DigitalOcean.${特征码根域}.net`, regionCode: 'DigitalOcean', port: 443 },
+    { domain: `${特征码域名前缀}.Vultr.${特征码根域}.net`, regionCode: 'Vultr', port: 443 },
+    { domain: `${特征码域名前缀}.Multacom.${特征码根域}.net`, regionCode: 'Multacom', port: 443 },
 ];
 
 export function isDomain(address: string): boolean {
@@ -449,41 +461,74 @@ function parseUrlLines(text: string, url = ''): string[] {
 
             if (!addrPart) return;
 
-            let host = addrPart;
+            // `@地区` 必须在「判端口 / 补端口」之前剥掉：远程清单常返回 `ip:port@REGION`，
+            // 而末段是 `443@SG` 而不是纯数字 → 会被当成「没有端口」，拼成 `ip:443@SG:443`，
+            // 地区随之变成 `SG:443`，selectProxyIPByRegion 永远匹配不上（地区锚定退化成轮询）。
+            const atIdx = addrPart.lastIndexOf('@');
+            const regionPart = atIdx >= 0 ? addrPart.slice(atIdx).trim() : '';
+            const bareAddr = atIdx >= 0 ? addrPart.slice(0, atIdx).trim() : addrPart;
+
+            let host = bareAddr;
             let hasPort = false;
 
-            if (addrPart.startsWith('[')) {
-                hasPort = /\]:(\d+)$/.test(addrPart);
+            if (bareAddr.startsWith('[')) {
+                hasPort = /\]:(\d+)$/.test(bareAddr);
             } else {
-                const lastColon = addrPart.lastIndexOf(':');
-                hasPort = lastColon > -1 && /^\d+$/.test(addrPart.substring(lastColon + 1));
-                if (!hasPort && (addrPart.match(/:/g) || []).length >= 2) {
-                    host = `[${addrPart}]`;
+                const lastColon = bareAddr.lastIndexOf(':');
+                hasPort = lastColon > -1 && /^\d+$/.test(bareAddr.substring(lastColon + 1));
+                if (!hasPort && (bareAddr.match(/:/g) || []).length >= 2) {
+                    host = `[${bareAddr}]`;
                 }
             }
 
-            result.push(hasPort ? item : `${host}:${defaultPort}${namePart}`);
+            // 有显式端口：原样保留条目（`@地区` / `#备注` 都不动）；没有则补默认端口，
+            // 且必须把 `@地区` 放回端口之后（`host:port@REGION#comment`，与池的条目格式一致）。
+            result.push(hasPort ? item : `${host}:${defaultPort}${regionPart}${namePart}`);
         });
     });
 
     return result;
 }
 
-/** Resolve URL entries in an array — fetches http/https URLs and replaces them with their content lines.
- *  When an Env with a KV binding is provided, fetched results are cached in KV under a
- *  per-URL key for URL_RESOLVE_TTL: both the value's `ts` (read side) and the KV server-side
- *  `expirationTtl` (write side) carry the same window, so the key expires instead of accumulating.
- *  Applies IP:Port deduplication aligned with cfnew across all sources. */
+/**
+ * 一行 → 多个条目：逗号既是「多 IP / 多 URL 分隔符」，也可能**属于 URL 查询串**
+ * （远程清单常见 `?region=SG,HK&format={ip}:{port}@{region}`）。
+ *
+ * 判据：只有 http(s) 行才需要特殊对待 —— **每一段都是 URL** 时才当「多个清单」拆开；
+ * 否则整行原样保留（那逗号就是查询参数的一部分）。其余行（裸 IP / 域名列表）照旧按逗号拆。
+ * 前端 serializeForm 用的是同一套判据，两侧必须一致，否则面板一保存就把 URL 拆坏了。
+ *
+ * 导出给 `@handlers` 的池探针复用（`/panel/pool-probe?ips=`）：那边同样需要「URL 行不拆逗号」，
+ * 两处各写一份必然漂移（实测就漂过：一边会把 `a,https://b` 拆开、另一边不拆）。
+ */
+export function splitEntryLine(entry: string): string[] {
+    if (!entry.includes(',') || entry.startsWith('#') || entry.startsWith('//')) return [entry];
+
+    const parts = entry.split(',').map(s => s.trim()).filter(Boolean);
+    if (/^https?:\/\//i.test(entry)) {
+        const allUrls = parts.length > 1 && parts.every(part => /^https?:\/\//i.test(part));
+        return allUrls ? parts : [entry];
+    }
+
+    return parts;
+}
+
+/** 括号在 URL 的查询串里合法，但不少网关会拒收裸 `{` / `}` —— 发请求前只把这两个字符编码
+ *  （不碰已有的 `%` 序列，避免把 `%7B` 二次编码成 `%257B`）。缓存键与日志仍用原串。 */
+function encodeUrlForFetch(url: string): string {
+    return url.replace(/\{/g, '%7B').replace(/\}/g, '%7D');
+}
+
+/** 解析地址列表里的**远程清单**：`http(s)://…` 取回内容后按行替换成池条目。
+ *  env 有 KV 时按 URL 哈希缓存 URL_RESOLVE_TTL（读侧 `ts` 与写侧 `expirationTtl` 同一窗口，
+ *  过期即淘汰而不是无限累积）；抓取失败沿用上次解析结果并打 warn。
+ *  所有来源统一按 IP:Port 去重（对齐 cfnew）。 */
 export async function resolveUrlEntries(entries: string[], env?: Env): Promise<string[]> {
     // 1. 展开可能包含逗号分隔的多 URL / 多 IP 条目
     const expandedEntries: string[] = [];
     for (const e of entries) {
         if (!e) continue;
-        if (e.includes(',') && !e.startsWith('#') && !e.startsWith('//')) {
-            expandedEntries.push(...e.split(',').map(s => s.trim()).filter(Boolean));
-        } else {
-            expandedEntries.push(e.trim());
-        }
+        expandedEntries.push(...splitEntryLine(e.trim()));
     }
 
     // 2. 提取所有唯一 URL，并发拉取或读取 KV 缓存
@@ -518,7 +563,7 @@ export async function resolveUrlEntries(entries: string[], env?: Env): Promise<s
 
         // 缓存未命中或过期，并发发起网络请求
         try {
-            const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+            const res = await fetch(encodeUrlForFetch(url), { signal: AbortSignal.timeout(10_000) });
             if (!res.ok) {
                 console.warn(`[地址列表] ${url} 返回 ${res.status}，沿用上次解析结果（若有）`);
                 return;
@@ -1618,7 +1663,9 @@ export function omitEmpty<T extends object>(value: T): T | undefined {
 
 // ── Region matching for nearest proxy IP selection ──
 
-export const ALL_REGIONS = ['US', 'SG', 'JP', 'KR', 'DE', 'SE', 'NL', 'FI', 'GB', 'HK', 'ORACLE', 'DIGITALOCEAN', 'VULTR', 'MULTACOM'];
+/** 全部已知地区码：**直接从内置池派生**（池是唯一来源），顺序即「自身地区没命中时的兜底优先级」——
+ *  GL 在最前，云厂商码在最后。新增一个地区只需要往 备用地址列表 里加一行。 */
+export const ALL_REGIONS: string[] = 备用地址列表.map(item => item.regionCode.toUpperCase());
 
 export const REGION_NEIGHBORS: Record<string, string[]> = {
     US: ['SG', 'JP', 'KR'],
@@ -1634,6 +1681,7 @@ export const REGION_NEIGHBORS: Record<string, string[]> = {
 };
 
 const COUNTRY_TO_REGION: Record<string, string> = {
+    GL: 'GL',
     US: 'US',
     SG: 'SG',
     JP: 'JP',
@@ -1644,14 +1692,18 @@ const COUNTRY_TO_REGION: Record<string, string> = {
     FI: 'FI',
     GB: 'GB',
     HK: 'HK',
+    IN: 'IN',
+    FR: 'FR',
+    PL: 'PL',
+    RU: 'RU',
+    CH: 'CH',
+    LV: 'LV',
+    CA: 'CA',
     CN: 'SG',
     TW: 'JP',
     AU: 'SG',
-    CA: 'US',
-    FR: 'DE',
     IT: 'DE',
     ES: 'DE',
-    CH: 'DE',
     AT: 'DE',
     BE: 'NL',
     DK: 'SE',
@@ -1666,6 +1718,7 @@ const EMOJI_TO_COUNTRY: Record<string, string> = {
     '🇨🇳': 'CN', '🇹🇼': 'TW', '🇨🇦': 'CA', '🇫🇷': 'FR',
     '🇦🇺': 'AU', '🇮🇹': 'IT', '🇪🇸': 'ES', '🇨🇭': 'CH',
     '🇧🇪': 'BE', '🇩🇰': 'DK', '🇳🇴': 'NO', '🇮🇪': 'IE',
+    '🇮🇳': 'IN', '🇵🇱': 'PL', '🇷🇺': 'RU', '🇱🇻': 'LV',
 };
 /** Chinese country/region name → ISO 3166-1 alpha-2 country code */
 const CN_NAME_TO_COUNTRY: Record<string, string> = {
@@ -1675,6 +1728,7 @@ const CN_NAME_TO_COUNTRY: Record<string, string> = {
     '法国': 'FR', '澳大利亚': 'AU', '意大利': 'IT', '西班牙': 'ES',
     '瑞士': 'CH', '奥地利': 'AT', '比利时': 'BE', '丹麦': 'DK',
     '挪威': 'NO', '爱尔兰': 'IE', '俄罗斯': 'RU', '印度': 'IN',
+    '波兰': 'PL', '拉脱维亚': 'LV', '全球': 'GL',
 };
 
 /** Normalize a region tag (emoji flag, Chinese name, uppercase code, alias)
@@ -1692,7 +1746,8 @@ export function normalizeRegionTag(tag: string): string | undefined {
     const cnCC = CN_NAME_TO_COUNTRY[trimmed];
     if (cnCC) return COUNTRY_TO_REGION[cnCC] || (ALL_REGIONS.includes(cnCC) ? cnCC : undefined);
 
-    // 3. Uppercase country code or alias (e.g. UK → GB)
+    // 3. Uppercase country code or alias (e.g. UK → GB)；`@GL` 走下面的 COUNTRY_TO_REGION，
+    //    大小写不敏感（这里先 toUpperCase，@gl/@Gl/@GL 一律归一成 GL）
     const upper = trimmed.toUpperCase();
     const alias: Record<string, string> = { 'UK': 'GB' };
     const code = alias[upper] || upper;
@@ -1922,19 +1977,23 @@ function dialableFrom<T>(
  *
  * `handover`：连上的**那一刻**把这条已建立的 socket 交给调用方（探测即预连接）。
  * 返回 true = 调用方接管，本函数不再关闭它。这是「探测即预连接」的实现：不重复建连，
- * 不重复建连，探测用的连接直接变成数据连接。
+ * 探测用的连接直接变成数据连接。
+ *
+ * `fetcher`：请求绑定的建连器。**必须由调用方逐层传下来**：新版 Workers 运行时不一定挂全局
+ * `connect`，走过去只有同步抛错一条路，而这里的 catch 会把它吞成「不可达」——
+ * 那正是「探测全判死、拨号却成功」这个静默降级的成因（建连器解析收在 @common#connectTCP）。
  */
 async function probeIPReachability(
     hostname: string,
     port: number,
     timeoutMs: number,
-    handover?: (socket: Socket) => boolean
+    handover?: (socket: Socket) => boolean,
+    fetcher?: any
 ): Promise<boolean> {
     let socket: Socket | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-        // 使用与 connectSocket 相同的懒求值模式，避免被打包器优化掉
-        const createdSocket: Socket = (globalThis as any).connect({ hostname, port });
+        const createdSocket: Socket = connectTCP({ hostname, port }, fetcher);
         socket = createdSocket;
         await Promise.race([
             createdSocket.opened,
@@ -1963,9 +2022,47 @@ async function probeIPReachability(
     }
 }
 
+/** 诊断用的探测结论：每条候选自己的「通/不通 + 耗时」。
+ *  与拨号侧的 `ProbeVerdict` 刻意不同 —— 那个口径要兼顾预算、'unknown' 与全灭回退，
+ *  诊断要的只是「这一条现在通不通、多久」，见 probeLatency。 */
+export interface ProbeLatencyResult {
+    host: string;
+    port: number;
+    ok: boolean;
+    ms: number;
+}
+
+/**
+ * 诊断专用：对 [host, port] 条目逐个做 TCP 探测，返回每条**自己的**结论与耗时（保序）。
+ *
+ * 不复用 probeWithinBudget（理由见 ProbeLatencyResult）；但探测动作复用 probeIPReachability，
+ * 与拨号侧同一份实现（建连器 / connect 时机 / 超时 / 关闭口径），不另写一套。
+ * 并发用拨号侧的探测窗口 PROBE_CONCURRENCY：运行时对单请求的并发出站连接有配额，
+ * 诊断请求没有理由比拨号更激进。
+ *
+ * `fetcher` 必须由调用方把**请求绑定**的建连器传进来（`request.fetcher`）：新版 Workers
+ * 运行时不一定挂全局 `connect`，漏传就会每条都同步失败（见 @common#connectTCP）。
+ * IPv6 的方括号在这里剥掉再拨号：`connect()` 只吃裸地址（与 filterReachableIPs 同一口径）。
+ */
+export async function probeLatency(
+    entries: [string, number][],
+    options: { timeoutMs?: number; fetcher?: any } = {}
+): Promise<ProbeLatencyResult[]> {
+    const timeoutMs = options.timeoutMs ?? 1500;
+    return await mapWithConcurrency(entries, PROBE_CONCURRENCY, async ([host, port]) => {
+        const dialHost = host.replace(/^\[|\]$/g, '');
+        const startedAt = Date.now();
+        const ok = await probeIPReachability(dialHost, port, timeoutMs, undefined, options.fetcher);
+        return { host: dialHost, port, ok, ms: Date.now() - startedAt };
+    });
+}
+
 /**
  * 对 IP 数组做**预算内滚动窗口**探测，返回拨号可用的 IP 子集（保序）。
  * 取舍判据（只剔除确定不通 / 'unknown' 保留 / 全判死则回退原表）统一在 dialableFrom。
+ *
+ * 这条路径只服务订阅侧 IP 过滤，拿不到 request，因此建连器走 @common#connectTCP 的全局回退
+ * （没有全局 connect 时它会 warn 一次，探测全部判死 → dialableFrom 回退原表 = 不过滤，安全降级）。
  */
 export async function filterReachableIPs(
     ips: string[],
@@ -1988,7 +2085,8 @@ export async function filterReachableIPs(
 export async function filterReachableEntries(
     entries: [string, number][],
     onProbe?: (entry: [string, number], ok: boolean) => void,
-    onReachable?: (entry: [string, number], socket: Socket) => boolean
+    onReachable?: (entry: [string, number], socket: Socket) => boolean,
+    fetcher?: any
 ): Promise<[string, number][]> {
     /** 是否已有候选被接管（只交第一条：调用方只需要一条连接，多接管等于多占一条） */
     let claimed = false;
@@ -2001,7 +2099,8 @@ export async function filterReachableEntries(
                     claimed = onReachable(entry, socket);
                     return claimed;
                 }
-                : undefined
+                : undefined,
+            fetcher
         );
         return ok;
     }, () => claimed);
@@ -2387,16 +2486,20 @@ async function resolveProxyPoolUncached(
     return sorted;
 }
 
-/** Built-in fallback proxy IPs for all 14 regions (cfnew 备用地址列表 equivalent).
+/** Built-in fallback proxy IPs for all regions (cfnew 备用地址列表 equivalent).
  *  Used when the user's proxyIPs list is empty and no URL-resolved IPs are available.
  *  Generated from 备用地址列表 at runtime to avoid static signatures. */
 export const DEFAULT_PROXY_IPS: string[] = 备用地址列表.map(item => 
     `${item.domain}:${item.port}@${item.regionCode}`
 );
 
-// 官方直连地址池（对齐 cfnew v3.0）：10 个官方 Cloudflare 地址（10 个不同 /24 网段）
-// 运行时 base64 解码，避免静态特征被识别
-const 官方直连地址 = atob('MTcyLjcxLjIxOC4xOTAsMTYyLjE1OC4yMjguODcsMTYyLjE1OC4xODkuMTM0LDE2Mi4xNTguMjYuNjMsMTYyLjE1OC4yNS44NiwxNjIuMTU4LjI5LjIxNiwxNjIuMTU4LjIxOC4xNjAsMTYyLjE1OC4yMjcuMjE0LDE3Mi42OS4xMTguMTk4LDE3Mi42OS4xMTkuMTUw');
+// 官方直连地址池（对齐 cfnew v3.0）：全部是 CF 自己的段（AS13335），6 个不同 /24 网段。
+// 运行时 base64 解码，避免静态特征被识别。
+// 载荷里只放**裸主机**（不带端口）：端口由下面那行 map 统一补 `:443@CF`，
+// 写成 `host:8443` 会得到 `host:8443:443@CF` 这种坏条目。
+// 注意：这里只该放 **Cloudflare 边缘**。非 CF 的地址（Akamai / AWS / 其它托管商）拿 CF 域名的
+// SNI 去拨必然失败，只会白占每连接 6 个抽样名额 —— 要放别的中转地址请用面板的 Proxy IPs。
+const 官方直连地址 = atob('MTYyLjE1OC4xODkuMTM0LDE3Mi42OS4xMTguMTk4LDE2Mi4xNTguMjE4LjE2MCwxNzIuNzEuMjE4LjE5MCwxNjIuMTU4LjIyOC44NywxNzIuNjguMTczLjExMA==');
 export const OFFICIAL_DIRECT_IPS: string[] = 官方直连地址.split(',').map(ip => `${ip}:443@CF`);
 // ── H6：内置池的 env 覆盖入口 ──
 // 出厂内置值快照：在 env 覆盖**之前**捕获（上方原声明保持逐字不变），未设置 env 时用它还原。

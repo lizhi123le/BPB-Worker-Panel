@@ -49,6 +49,29 @@ export function normalizeOfficialIP(entry: string): string {
 }
 
 /**
+ * 反代池的来源链：KV `proxyIPs`（URL 条目先解析）→ env `PROXY_IP` → 内置 `DEFAULT_PROXY_IPS`
+ * （对齐 cfnew 的备用地址列表）。
+ *
+ * 为什么单独成函数：这条链有两个消费方 —— WS/XHTTP 的出站推导（prepareWsRuntimeConfig）与
+ * `/panel/pool-probe?pool=proxy` 的诊断。两端各写一遍必然漂移，而「诊断给出的池和真实拨号用的
+ * 池不是同一份」比没有诊断更糟。
+ *
+ * 直接读 `env.PROXY_IP` 而非 `globalThis.wsConfig.envProxyIPs`：面板路由不经过 initWs(env)，
+ * 那种请求里 wsConfig 没有这份值。
+ */
+export async function resolveProxyPoolSource(
+    env: Env
+): Promise<{ entries: string[]; source: 'panel' | 'env' | 'builtin' }> {
+    const panelIPs = await resolveUrlEntries(globalThis.settings.proxyIPs || [], env);
+    if (panelIPs.length > 0) return { entries: panelIPs, source: 'panel' };
+
+    const envProxyIP = String((env as any)?.PROXY_IP || '').trim();
+    if (envProxyIP) return { entries: [envProxyIP], source: 'env' };
+
+    return { entries: DEFAULT_PROXY_IPS, source: 'builtin' };
+}
+
+/**
  * 连通性运行时配置准备（WS 升级与 XHTTP 入站共用）。
  *
  * 此前这段逻辑内联在 handleWebsocket 里：解析 URL query（wk / rm / qj）→ 与 KV 设置合并出
@@ -76,8 +99,7 @@ export async function prepareWsRuntimeConfig(request: Request, env: Env): Promis
         proxyOnly: kvProxyOnly,
         proxyDegrade: kvProxyDegrade
     } = globalThis.settings;
-    const rawProxyIPs = globalThis.settings.proxyIPs || [];
-    const proxyIPs = await resolveUrlEntries(rawProxyIPs, env); // 连接时解析（带 KV 缓存）
+    const { entries: effectivePanelIPs, source: proxyPoolSource } = await resolveProxyPoolSource(env);
 
     // 1. wkRegion：URL query wk > KV wkRegion > 空（空 = 官方直连 CF，对齐 cfnew v3.0）
     const effectiveWkRegion = queryWk || kvWkRegion || '';
@@ -93,23 +115,18 @@ export async function prepareWsRuntimeConfig(request: Request, env: Env): Promis
     const effectiveProxyOnly = queryOnlyMode ? true : (kvProxyOnly ?? false);
     const effectiveProxyDegrade = queryOnlyMode ? false : (kvProxyDegrade ?? false);
 
-    // 3. proxyIPs：KV proxyIPs > envProxyIPs > DEFAULT_PROXY_IPS（对齐 cfnew 备用地址列表）
-    const envFallbackIPs = globalThis.wsConfig?.envProxyIPs
-        ? [globalThis.wsConfig.envProxyIPs]
-        : [];
-    // 自定义代理 = 面板手动设置的 proxyIPs 非空，或配置了 env PROXY_IP（envFallbackIPs 非空）。
-    // 仅用于区分「用户显式配置的反代池实体」与内置 DEFAULT_PROXY_IPS 公共备用中继：
+    // 3. proxyIPs 的来源链已收进 resolveProxyPoolSource（面板 > env PROXY_IP > 内置池）：
+    //    与 /panel/pool-probe 诊断共用同一份推导，避免「诊断探的池」与「真实拨号用的池」两处漂移。
+    // 自定义代理 = 池不来自内置 DEFAULT_PROXY_IPS。
+    // 仅用于区分「用户显式配置的反代池实体」与内置公共备用中继：
     // customProxyPool 只装前者（CF 模式下「仅走代理」拨它）；内置池经 panelIPs 兜底参与拨号。
-    const hasCustomProxyIPs = proxyIPs.length > 0 || envFallbackIPs.length > 0;
-    const effectivePanelIPs = proxyIPs.length > 0
-        ? proxyIPs
-        : (envFallbackIPs.length > 0 ? envFallbackIPs : DEFAULT_PROXY_IPS);
+    const hasCustomProxyIPs = proxyPoolSource !== 'builtin';
     // 用户显式配置的反代池实体（不含内置 DEFAULT_PROXY_IPS，也不含下方 CF 模式替换的官方直连池）。
     // CF 模式会把 panelIPs 整份换成官方池，而「仅走代理」要与指定地区保持同一套逻辑
     // （只要配了反代池就能用），因此单列一份供它拨号。
     const customProxyPool = hasCustomProxyIPs ? effectivePanelIPs : [];
 
-    // 官方直连 IP 池（面板 officialIPs，未配置则内置 10 个）：只归一化这一次，
+    // 官方直连 IP 池（面板 officialIPs，未配置则用内置池）：只归一化这一次，
     // 「CF 模式下的 panelIPs」与「出站模式的 CF 内置 IP 池兜底层」共用同一份结果，
     // 避免两处各算一遍导致内容/顺序不一致。
     const officialIPsRaw = globalThis.settings.officialIPs?.length
@@ -139,13 +156,13 @@ export async function prepareWsRuntimeConfig(request: Request, env: Env): Promis
     };
 
     // Detect worker region: manual wkRegion > 官方直连（CF，对齐 cfnew v3.0）
-    // wk 为空时不再用 cf.country 自动检测，而是走官方直连（内置 10 个官方 Cloudflare IP）
+    // wk 为空时不再用 cf.country 自动检测，而是走官方直连（内置官方直连池）
     // 自定义 proxyIP（面板手动设置）同样启用自动地区检测：列表带 @ 后缀码时
     // 按访客地区匹配对应域名（对齐用户需求：自动地区匹配/指定地区按 @ 后缀码匹配）
     globalThis.wsConfig.workerRegion = effectiveWkRegion || 'CF';
 
     // 官方直连（对齐 cfnew v3.0）：workerRegion = 'CF'（wk 留空）时，
-    // 出口语义 = 官方 Cloudflare IP（内置 10 个，或面板自定义 officialIPs），
+    // 出口语义 = 官方 Cloudflare IP（内置池，或面板自定义 officialIPs），
     // 与自定义反代 proxyIPs 无关 —— 反代仅在显式指定地区（wk 非空）时生效。
     if (globalThis.wsConfig.workerRegion === 'CF') {
         globalThis.wsConfig.panelIPs = officialPool;

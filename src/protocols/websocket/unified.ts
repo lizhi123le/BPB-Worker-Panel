@@ -7,10 +7,9 @@ import {
     sendAndWaitIfPossible,
     envConnectionLimit,
     CONNECTION_LIMIT_RANGE,
-    WS_READY_STATE_OPEN,
-    connectSocket
+    WS_READY_STATE_OPEN
 } from './common';
-import { envNumber, evictOldest, safeErrorMessage, createSignatureGate } from '@common';
+import { envNumber, evictOldest, safeErrorMessage, createSignatureGate, connectTCP } from '@common';
 
 // 对齐 cfnew c0eb20c（明文源吗 L33-40）：隐私增强 —— 智能剥离随机填充前缀
 // 客户端首包可能携带 [0xED 0x7F][2 字节 padLen][padLen 字节随机填充]，若不剥离直接做
@@ -1215,7 +1214,7 @@ function getDNSCache(dnsQueryPacket: Uint8Array): Uint8Array | null {
  * 此时这条 socket 还没登记清理钩子（WS 也没关），不关就是半开残留（F-11）。
  */
 async function connectDnsUpstream(label: 'VLESS' | 'Trojan', log: Function, fetcher?: any): Promise<Socket> {
-    const socket = connectSocket({ hostname: '8.8.4.4', port: 53 }, fetcher);
+    const socket = connectTCP({ hostname: '8.8.4.4', port: 53 }, fetcher);
     try {
         await Promise.race([
             socket.opened,

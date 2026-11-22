@@ -8,6 +8,42 @@ export enum HttpStatus {
     INTERNAL_SERVER_ERROR = 500
 }
 
+/** 建连器缺失只报警一次（模块级 isolate 生命周期），别让每个候选/每条连接各刷一行 */
+let warnedMissingConnector = false;
+
+/**
+ * Workers 里**唯一**一处「拿 TCP 建连器」的实现：优先请求绑定的 `fetcher.connect`，
+ * 回退运行时全局 `connect`；两者都没有则报一条 warn 并抛错。
+ *
+ * 为什么必须收成一份：新版 Workers 运行时**不一定挂全局 `connect`** —— 实测某部署下
+ * 全局 connect 缺失，于是任何直接写 `globalThis.connect(...)` 的代码都会**同步**抛 TypeError。
+ * 这类失败落进各处 try/catch 后就变成「探测全判死」「池全不可达」的静默降级，
+ * 表面上有日志、实际上一件事都没做成（2026-11 的池探测就是这样一整个月没生效）。
+ * 请求对象上的 `fetcher` 才是该请求绑定的建连器（cfnew 同样这么取）。
+ *
+ * 懒求值：每次调用现查，绝不在模块加载期固化 —— 加载期全局 connect 还没挂上。
+ * `connectOptions` 只在 HTTPS CONNECT 隧道那条路径用到（`secureTransport: 'on'`）。
+ */
+export function connectTCP(
+    address: { hostname: string; port: number },
+    fetcher?: any,
+    connectOptions?: Record<string, unknown>
+): Socket {
+    const connector = fetcher && typeof fetcher.connect === 'function'
+        ? fetcher.connect.bind(fetcher)   // 保持方法调用语义（连接器可能依赖 this）
+        : (globalThis as any).connect;
+
+    if (typeof connector !== 'function') {
+        if (!warnedMissingConnector) {
+            warnedMissingConnector = true;
+            console.warn('[connect] 没有可用的 TCP 建连器：request.fetcher.connect 与 globalThis.connect 都不可用');
+        }
+        throw new Error('no TCP connector available (request.fetcher.connect / globalThis.connect)');
+    }
+
+    return connectOptions ? connector(address, connectOptions) : connector(address);
+}
+
 export function base64EncodeUtf8(str: string): string {
     const bytes = new TextEncoder().encode(str);
     const binary = Array.from(bytes, b => String.fromCharCode(b)).join("");
