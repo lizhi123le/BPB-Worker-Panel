@@ -1800,17 +1800,27 @@ async function testPoolIPs() {
         }
 
         const results = body?.results || [];
-        const reachable = results.filter((item) => item.ok).sort((a, b) => a.ms - b.ms);
+        // 「连通」列直接用服务端的 fastest（已按耗时升序），不再自己 filter+sort 一遍 ——
+        // 同一件事只在一处做，面板与 curl 调用看到的就是同一个顺序。
+        const reachable = body?.fastest || [];
         const unreachable = results.filter((item) => !item.ok);
+
+        // 服务端按字面量归类（不解析域名）：cf = CF 网段内的 IP、other = 非 CF 的 IP、domain = 域名。
+        // 标出来的用处很直接：官方直连池只该放 cf；other 放进官方池会白占每连接 6 个抽样名额。
+        const KIND_LABEL = { cf: 'CF', other: '非CF', domain: '域名' };
 
         const fill = (list, items, withLatency) => {
             for (const item of items) {
                 const row = document.createElement('li');
                 const address = document.createElement('span');
                 address.textContent = `${item.ip}:${item.port}`;
+                address.title = address.textContent;   // 长地址被省略号截断时仍可悬停看全
+                const kind = document.createElement('span');
+                kind.className = `ip-test-kind ${item.kind || 'domain'}`;
+                kind.textContent = KIND_LABEL[item.kind] || KIND_LABEL.domain;
                 const extra = document.createElement('span');
                 extra.textContent = withLatency ? `${item.ms}ms` : '—';
-                row.append(address, extra);
+                row.append(address, kind, extra);
                 list.append(row);
             }
         };

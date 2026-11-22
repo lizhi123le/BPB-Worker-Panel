@@ -985,15 +985,48 @@ table tr:not(:last-child) {
 
 .ip-test-list li {
     display: flex;
+    align-items: center;
     justify-content: space-between;
     gap: var(--space-sm);
     padding: 2px 0;
     color: var(--color-text-primary);
 }
 
+/* 地址占满剩余宽度，过长时省略（长域名 / IPv6），悬停有 title 兜底 */
+.ip-test-list li > span:first-child {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .ip-test-list li span:last-child {
     color: var(--color-text-muted);
     white-space: nowrap;
+}
+
+/* 条目归类徽标：CF / 非CF / 域名 —— 官方直连池只该出现 CF，非 CF 会白占抽样名额 */
+.ip-test-kind {
+    flex: none;
+    padding: 0 4px;
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    font-size: 10px;
+    line-height: 14px;
+    opacity: 0.85;
+}
+
+.ip-test-kind.cf {
+    color: var(--color-icon-green);
+}
+
+.ip-test-kind.other {
+    color: var(--color-text-muted);
+}
+
+.ip-test-kind.domain {
+    color: var(--color-brand-primary);
 }
 
 /* 标签放在输入框**上方**并居中：默认 .form-control 在 ≥600px 会切成左右并排

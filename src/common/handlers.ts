@@ -9,7 +9,7 @@ import { fetchWarpAccounts } from "@warp";
 import { UnifiedWSHandler } from "@unified";
 import { XP_MODE, buildXpExtra, buildXpNodePath } from "@cores/xp";
 import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, htmlResponse, HttpStatus, isKvBound, respond, safeErrorMessage, securityHeaders } from "@common";
-import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, generateRemark, generateWsPath, getConfigItems, isBareIPv4, isBareIPv6, isTlsPort, OFFICIAL_DIRECT_IPS, parseHostPort, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, probeLatency, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectSniHost, splitEntryLine } from "@utils";
+import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, generateRemark, generateWsPath, getConfigItems, isBareIPv4, isBareIPv6, isCloudflareIP, isTlsPort, OFFICIAL_DIRECT_IPS, parseHostPort, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, probeLatency, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectSniHost, splitEntryLine } from "@utils";
 import JSZip from "jszip";
 
 import { prepareWsRuntimeConfig, resolveProxyPoolSource } from "./ws-runtime";
@@ -474,6 +474,17 @@ function toProbeEntries(raw: string[]): { entries: [string, number][]; requested
 }
 
 /**
+ * 条目归类，供面板给每条结果打标：
+ *   · `cf`     —— IP 字面量且落在 CF 公布网段内（官方直连池里该出现的就是这种）
+ *   · `other`  —— IP 字面量但不在 CF 网段（当反代/中转用；拿 CF 目标的 SNI 去拨它不会通）
+ *   · `domain` —— 域名，未解析，无法凭字面量归类（拨号时才由 DoH 解析）
+ */
+function classifyProbeHost(host: string): 'cf' | 'other' | 'domain' {
+    if (!isBareIPv4(host) && !isBareIPv6(host)) return 'domain';
+    return isCloudflareIP(host) ? 'cf' : 'other';
+}
+
+/**
  * 池探针（诊断用）：从**本 Worker 的网络位置**对池内每条地址做一次 TCP 探测，返回「通/不通 + 耗时」。
  *
  * 为什么需要它：池的可用性只能在 CF 侧测 —— 用户本机的连通性与 Worker 出站无关（实测同一批地址
@@ -536,25 +547,33 @@ async function poolProbe(request: Request, env: Env): Promise<Response> {
 
         const startedAt = Date.now();
         // fetcher 必须传：新版 Workers 运行时不一定挂全局 connect（见 @common#connectTCP）
-        const results = await probeLatency(entries, { timeoutMs, fetcher: (request as any).fetcher });
+        const probed = await probeLatency(entries, { timeoutMs, fetcher: (request as any).fetcher });
         const durationMs = Date.now() - startedAt;
-        const okCount = results.filter(result => result.ok).length;
 
-        return respond(true, HttpStatus.OK, `${okCount}/${entries.length} reachable`, {
+        // 只映射一次：results（池顺序）与 fastest（延迟升序）是同一份数据的不同视图，
+        // 归类也只算一次 —— 两个 map 各算一遍是重复劳动，且容易改一处漏一处。
+        const rows = probed.map(result => ({
+            ip: result.host,
+            port: result.port,
+            ok: result.ok,
+            ms: result.ms,
+            // 面板据此打标「CF / 非CF / 域名」：非 CF 的地址放进官方池是白占抽样名额
+            kind: classifyProbeHost(result.host)
+        }));
+        const okCount = rows.filter(row => row.ok).length;
+
+        return respond(true, HttpStatus.OK, `${okCount}/${rows.length} reachable`, {
             source,
-            count: entries.length,
+            count: rows.length,
             // 去重后的候选总数（截断前）：远程清单可能返回上百条，前端据此说明「只探了前 N 条」
             requested,
             ok: okCount,
             timeoutMs,
             durationMs,
             // 原始顺序：与池的顺序对照，方便看出「头几条是否可用」——拨号侧第一条会参与洗牌后的抽样
-            results: results.map(result => ({ ip: result.host, port: result.port, ok: result.ok, ms: result.ms })),
-            // 只含可用的，按耗时升序：直接当「优选子集」抄进面板
-            fastest: results
-                .filter(result => result.ok)
-                .sort((a, b) => a.ms - b.ms)
-                .map(result => ({ ip: result.host, port: result.port, ms: result.ms }))
+            results: rows,
+            // 只含可用的，按耗时升序：面板的「连通」列直接用它（不再自己排一遍），也可当优选子集抄回面板
+            fastest: rows.filter(row => row.ok).sort((a, b) => a.ms - b.ms)
         });
     } catch (error) {
         console.log(error);

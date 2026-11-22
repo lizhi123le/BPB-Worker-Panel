@@ -85,6 +85,9 @@ check('自定义列表：source=custom / count=3 / ok=2',
 check('自定义列表：结果按入参顺序返回',
     (body.results || []).map((r) => r.ip).join(',') === '172.71.218.190,162.158.228.87,10.99.99.99',
     JSON.stringify(body.results));
+check('自定义列表：归类 cf / cf / other（CF 段 vs 非 CF）',
+    (body.results || []).map((r) => r.kind).join(',') === 'cf,cf,other',
+    JSON.stringify((body.results || []).map((r) => [r.ip, r.kind])));
 check('自定义列表：黑洞候选被标成 ok=false 且耗时接近 timeout',
     (() => {
         const dead = (body.results || []).find((r) => r.ip === '10.99.99.99') || {};
@@ -247,6 +250,13 @@ json = await res.json();
 body = json.body || {};
 check('上限 50：count=50 且 requested=60（截断但如实报告）',
     body.count === 50 && body.requested === 60, `count=${body.count} requested=${body.requested}`);
+
+// ── 11) 归类：域名标 domain（未解析，无法凭字面量判断是否 CF 段）
+res = await call('/panel/pool-probe?ips=example.com&timeout=300', { headers: auth });
+json = await res.json();
+body = json.body || {};
+check('归类：域名标 domain（不是 cf / other）',
+    (body.results || [])[0]?.kind === 'domain', JSON.stringify(body.results));
 
 globalThis.fetch = realFetch;
 
