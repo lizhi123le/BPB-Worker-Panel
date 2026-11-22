@@ -935,3 +935,84 @@ table tr:not(:last-child) {
     color: var(--color-text-secondary);
     margin: 0;
 }
+
+/* ── IP Test（/panel/pool-probe 的前端入口）：结果分「连通 / 不通」两列 ── */
+.ip-test-summary {
+    margin: var(--space-sm) 0;
+    font-size: var(--font-size-sm);
+    color: var(--color-text-secondary);
+    word-break: break-word;
+}
+
+.ip-test-results {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-md);
+}
+
+.ip-test-column {
+    padding: var(--space-md);
+    border: 1px solid var(--color-border-accent);
+    border-radius: var(--radius-ui);
+    background-color: var(--color-bg-input);
+    box-shadow: var(--shadow-input);
+    min-width: 0;
+}
+
+.ip-test-column h4 {
+    margin: 0 0 var(--space-xs);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+}
+
+.ip-test-column.ok h4 {
+    color: var(--color-icon-green);
+}
+
+.ip-test-column.fail h4 {
+    color: var(--color-icon-red);
+}
+
+.ip-test-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 260px;
+    overflow-y: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: var(--font-size-xs);
+}
+
+.ip-test-list li {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    padding: 2px 0;
+    color: var(--color-text-primary);
+}
+
+.ip-test-list li span:last-child {
+    color: var(--color-text-muted);
+    white-space: nowrap;
+}
+
+/* 标签放在输入框**上方**并居中：默认 .form-control 在 ≥600px 会切成左右并排
+   （见下方 min-width:600px 的 flex-direction:row）。用 ID 选择器提高优先级，
+   只影响本块；`:not(.apply)` 把「Test 按钮那一行」排除在外 —— 它是刻意的横排，
+   被这条 ID 规则覆盖掉虽然当下看不出差别（只有一个按钮），但会埋下误改的坑。 */
+#ip-test-container .form-control:not(.apply) {
+    flex-direction: column;
+    align-items: center;
+}
+
+#ip-test-container .form-control label {
+    flex: unset;
+    text-align: center;
+}
+
+/* 窄屏：两列改成一列上下排（与 .form-control 的 600px 断点同一档） */
+@media only screen and (max-width: 599px) {
+    .ip-test-results {
+        grid-template-columns: 1fr;
+    }
+}

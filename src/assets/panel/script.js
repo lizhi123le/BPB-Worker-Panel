@@ -1386,10 +1386,15 @@ function validateSettingsForm() {
         let items = value?.split('\n').map(val => val.trim()).filter(Boolean) || [];
         if (['cleanIPs', 'proxyIPs', 'customCdnAddrs', 'hostSniList'].includes(key)) {
             items = items.flatMap(line => {
-                if (line.includes(',') && !line.startsWith('#') && !line.startsWith('//')) {
-                    return line.split(',').map(s => s.trim()).filter(Boolean);
+                if (!line.includes(',') || line.startsWith('#') || line.startsWith('//')) return [line];
+                const parts = line.split(',').map(s => s.trim()).filter(Boolean);
+                // http(s) 行：只有「每一段都是 URL」时才当多个清单拆开 —— 否则 `?region=SG,HK`
+                // 这类查询串里的逗号会把一条远程清单拆成「一条坏 URL + 一条垃圾地址」。
+                // 判据必须与后端 resolveUrlEntries 的 splitEntryLine 一致。
+                if (/^https?:\/\//i.test(line)) {
+                    return parts.every(part => /^https?:\/\//i.test(part)) ? parts : [line];
                 }
-                return [line];
+                return parts;
             });
             // 去重（保持先后顺序），URL 或普通条目归一化防重
             // 代理条目大小写敏感（user/pass、#备注），整体 toLowerCase 会静默改坏它们。
@@ -1740,6 +1745,91 @@ async function fetchSystemStatus() {
             : '❌ Off');
     } catch (error) {
         console.error("System status fetch error:", error.message || error);
+    }
+}
+
+/**
+ * IP Test：把文本框里的条目用 `/panel/pool-probe?ips=…`（custom 模式）从 **Worker 侧**测连通性，
+ * 结果分「连通 / 不通」两列。
+ *
+ * 输入形态（**每行一个条目**）：
+ *   · 地址：`1.2.3.4`、`1.2.3.4:8443`、`proxy.example.com:443`、`[2606:4700::1]:443`、`1.2.3.4@SG`；
+ *   · 远程清单 URL：`https://…/api/nodes?region=SG,HK&format={ip}:{port}@{region}`
+ *     —— 整行当一个 URL（查询串里的逗号属于 URL 本身，绝不能拆），由服务端抓取后按行展开再探测。
+ * 同一行里用逗号/空格并列多个**地址**仍然可以；但 URL 必须独占一行。
+ *
+ * 为什么走 ips= 而不是选池：这里是临时清单体检（例如刚抄来一批优选 IP 或一个清单接口），
+ * 不该改动任何设置；接口本身只读（不写 KV、不碰黑名单、不推进池游标），所以可以反复点。
+ * 结果一律用 textContent 渲染：地址是用户输入，别让它有机会当 HTML 解释。
+ */
+async function testPoolIPs() {
+    const input = document.getElementById('ipTestInput');
+    const button = document.getElementById('ipTestButton');
+    const summary = document.getElementById('ipTestSummary');
+    const okList = document.getElementById('ipTestOkList');
+    const failList = document.getElementById('ipTestFailList');
+
+    // **不在前端拆条目**：原样把整段文本交给服务端，由 parseProbeInput → splitEntryLine 统一解析。
+    // 拆法只有一份（后端），前端再抄一遍必然漂移（URL 查询串里的逗号、`#` 注释行、空白分隔……）。
+    const rawInput = String(input?.value || '').trim();
+
+    if (!rawInput) {
+        summary.textContent = '⛔ Enter at least one address or list URL.';
+        return;
+    }
+
+    const originalLabel = button.innerHTML;
+    button.disabled = true;
+    button.innerHTML = '<span class="material-symbols-rounded">autorenew</span> Testing…';
+    okList.replaceChildren();
+    failList.replaceChildren();
+    document.getElementById('ipTestOkCount').textContent = '0';
+    document.getElementById('ipTestFailCount').textContent = '0';
+    summary.textContent = 'Testing from the Worker…';
+
+    try {
+        // 只传 ips：单条超时用服务端默认（响应里回显 timeoutMs），条数上限也由服务端截断 —— 不在前端
+        // 再存一份同样的魔数（后端 POOL_PROBE_TIMEOUT_DEFAULT_MS / POOL_PROBE_MAX_ENTRIES 是唯一来源）。
+        const params = new URLSearchParams({ ips: rawInput });
+        const response = await fetch(`/panel/pool-probe?${params.toString()}`, { method: 'GET', credentials: 'include' });
+        const { success, message, body } = await response.json();
+
+        if (!success) {
+            summary.textContent = `⛔ ${message || 'Probe failed.'}`;
+            return;
+        }
+
+        const results = body?.results || [];
+        const reachable = results.filter((item) => item.ok).sort((a, b) => a.ms - b.ms);
+        const unreachable = results.filter((item) => !item.ok);
+
+        const fill = (list, items, withLatency) => {
+            for (const item of items) {
+                const row = document.createElement('li');
+                const address = document.createElement('span');
+                address.textContent = `${item.ip}:${item.port}`;
+                const extra = document.createElement('span');
+                extra.textContent = withLatency ? `${item.ms}ms` : '—';
+                row.append(address, extra);
+                list.append(row);
+            }
+        };
+        fill(okList, reachable, true);
+        fill(failList, unreachable, false);
+
+        document.getElementById('ipTestOkCount').textContent = String(reachable.length);
+        document.getElementById('ipTestFailCount').textContent = String(unreachable.length);
+        // requested 是「去重后的候选总数（截断前）」：远程清单可能返回上百条，而服务端最多探 50 条。
+        const requestedCount = Number(body.requested) || results.length;
+        const truncated = requestedCount > results.length
+            ? ` · probed the first ${results.length} of ${requestedCount} (server cap)`
+            : '';
+        summary.textContent = `${reachable.length} / ${results.length} reachable · ${body.timeoutMs}ms timeout · ${body.durationMs}ms total${truncated}`;
+    } catch (error) {
+        summary.textContent = `⛔ ${error.message || error}`;
+    } finally {
+        button.disabled = false;
+        button.innerHTML = originalLabel;
     }
 }
 

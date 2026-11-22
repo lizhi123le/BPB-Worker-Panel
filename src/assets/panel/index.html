@@ -133,17 +133,36 @@
                         <label for="wkRegion">🌍 Worker Region</label>
                         <div>
                             <select id="wkRegion" name="wkRegion">
-                                <option value="">Official Direct (Default)</option>
-                                <option value="HK">🇭🇰 Hong Kong</option>
-                                <option value="US">🇺🇸 United States</option>
-                                <option value="SG">🇸🇬 Singapore</option>
-                                <option value="JP">🇯🇵 Japan</option>
-                                <option value="KR">🇰🇷 South Korea</option>
-                                <option value="DE">🇩🇪 Germany</option>
-                                <option value="SE">🇸🇪 Sweden</option>
-                                <option value="NL">🇳🇱 Netherlands</option>
-                                <option value="FI">🇫🇮 Finland</option>
-                                <option value="GB">🇬🇧 United Kingdom</option>
+                                <optgroup label="✨ Recommended">
+                                    <!-- 留空 = 官方直连：用 CF 官方 IP 池（面板 🛡️ Official Direct IPs / 内置 6 条） -->
+                                    <option value="">🌐 Global — Official Direct (CF IPs)</option>
+                                    <!-- GL = 无地区反代入口：内置 ProxyIP.&lt;根域&gt;.net（最快反代），不落具体地区；
+                                         反代输入框里用 `@GL` 锚定（不分大小写） -->
+                                    <option value="GL">⚡ Global (GL) — Reverse proxy (no region)</option>
+                                </optgroup>
+                                <optgroup label="🌏 Asia">
+                                    <option value="HK">🇭🇰 Hong Kong</option>
+                                    <option value="SG">🇸🇬 Singapore</option>
+                                    <option value="JP">🇯🇵 Japan</option>
+                                    <option value="KR">🇰🇷 South Korea</option>
+                                    <option value="IN">🇮🇳 India</option>
+                                </optgroup>
+                                <optgroup label="🌍 Europe">
+                                    <option value="GB">🇬🇧 United Kingdom</option>
+                                    <option value="FR">🇫🇷 France</option>
+                                    <option value="DE">🇩🇪 Germany</option>
+                                    <option value="NL">🇳🇱 Netherlands</option>
+                                    <option value="SE">🇸🇪 Sweden</option>
+                                    <option value="FI">🇫🇮 Finland</option>
+                                    <option value="PL">🇵🇱 Poland</option>
+                                    <option value="RU">🇷🇺 Russia</option>
+                                    <option value="CH">🇨🇭 Switzerland</option>
+                                    <option value="LV">🇱🇻 Latvia</option>
+                                </optgroup>
+                                <optgroup label="🌎 North America">
+                                    <option value="US">🇺🇸 United States</option>
+                                    <option value="CA">🇨🇦 Canada</option>
+                                </optgroup>
                             </select>
                         </div>
                     </div>
@@ -359,7 +378,8 @@
                                     </a>
                                 </label>
                                 <div>
-                                    <textarea type="text" id="proxyIPs" name="proxyIPs" rows="1"></textarea>
+                                    <textarea type="text" id="proxyIPs" name="proxyIPs" rows="1"
+                                        placeholder="ProxyIP.CMLiussss.net:443@GL&#10;1.2.3.4:443@HK"></textarea>
                                 </div>
                             </div>
                             <div class="form-control">
@@ -806,6 +826,48 @@
                 </button>
             </div>
         </form>
+    </div>
+    <!-- IP Test：把地址按行/逗号喂给 /panel/pool-probe?ips=…（custom 模式），结果分「连通 / 不通」两列。
+         刻意放在 #configForm **之外**：否则 textarea 会被 FormData 一起序列化进 /panel/update-settings，
+         后端会把它当未知字段告警，改动面板设置时还会连带提交这份临时文本。 -->
+    <div class="form-container container" id="ip-test-container">
+        <h2><span class="material-symbols-rounded">dns</span> IP Test</h2>
+        <details>
+            <summary>
+                <h3>Probe addresses from the Worker side
+                    <a href="https://bia-pain-bache.github.io/BPB-Worker-Panel/" target="_blank" title="Help">
+                        <span class="material-symbols-rounded">info</span>
+                    </a>
+                </h3>
+            </summary>
+            <div class="section">
+                <div class="form-control">
+                    <!-- max 50 与后端 POOL_PROBE_MAX_ENTRIES 对齐：服务端会截断并用 requested 如实回报，
+                         这里的数字只是提前告知（静态 HTML 引用不到后端常量）。 -->
+                    <label for="ipTestInput">Addresses or list URL (one per line, max 50)</label>
+                    <div>
+                        <textarea id="ipTestInput" rows="4"
+                            placeholder="172.68.173.110&#10;162.158.228.87:443&#10;example.com:8443&#10;https://proxy.example.cn/api/nodes?region=SG,HK&amp;format={ip}:{port}@{region}"></textarea>
+                    </div>
+                </div>
+                <div class="form-control apply">
+                    <button type="button" id="ipTestButton" class="button" onclick="testPoolIPs()">
+                        Test <span class="material-symbols-rounded">verified</span>
+                    </button>
+                </div>
+                <p id="ipTestSummary" class="ip-test-summary">Enter addresses above, then hit Test.</p>
+                <div class="ip-test-results">
+                    <section class="ip-test-column ok">
+                        <h4>✅ Reachable (<span id="ipTestOkCount">0</span>)</h4>
+                        <ul id="ipTestOkList" class="ip-test-list"></ul>
+                    </section>
+                    <section class="ip-test-column fail">
+                        <h4>❌ Unreachable (<span id="ipTestFailCount">0</span>)</h4>
+                        <ul id="ipTestFailList" class="ip-test-list"></ul>
+                    </section>
+                </div>
+            </div>
+        </details>
     </div>
     <div class="form-container container">
         <h2><span class="material-symbols-rounded">share</span> Subscriptions</h2>

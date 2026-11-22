@@ -20,6 +20,11 @@
  *
  * 顺带覆盖构建链路：这里的 HTML 装配 + html-minifier(minifyCSS) 与 scripts/build.js 的
  * processHtmlPages 完全同参，能同时验证「改过的 CSS 仍能过 clean-css、规则没被压没」。
+ *
+ * 另外钉两条 IP Test 悬浮块（/panel/pool-probe 的前端入口）的契约：
+ *   · 块必须在 `#configForm` **之外**、Subscriptions 之前 —— 塞进表单会让文本框被 FormData
+ *     一起序列化进 /panel/update-settings（后端未知字段告警 + 每次保存连带提交临时文本）；
+ *   · `.ip-test-results` 必须是两列网格（连通 / 不通并排），窄屏才降成一列。
  */
 import { readFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
@@ -103,6 +108,61 @@ check('5 个 .table-container 内部都包着 <table>（选择器没有悬空）
         const end = block.indexOf('</table>');
         if (end < 0) throw new Error(`第 ${index + 1} 个 .table-container 里没有 <table>`);
     });
+});
+
+// ── 契约 5：IP Test 悬浮块位于 Settings 表单**之外**、Subscriptions 之前 ──
+// 塞进 #configForm 的代价是：文本框会被 FormData 一起序列化进 /panel/update-settings，
+// 后端当未知字段告警、面板每次保存都连带提交这堆临时文本。
+check('IP Test 块在 #configForm 之外、Subscriptions 之前', () => {
+    const formEnd = html.indexOf('</form>');
+    const block = html.indexOf('id="ip-test-container"');
+    const subscriptions = html.indexOf('Subscriptions</h2>');
+    if (formEnd < 0 || block < 0 || subscriptions < 0) {
+        throw new Error(`定位失败：formEnd=${formEnd} block=${block} subscriptions=${subscriptions}`);
+    }
+    if (!(formEnd < block && block < subscriptions)) {
+        throw new Error(`顺序应为 formEnd(${formEnd}) < IP Test(${block}) < Subscriptions(${subscriptions})`);
+    }
+});
+
+// ── 契约 6：结果区是两列（连通 / 不通并排），压缩后规则仍在 ──
+const ipTestRule = rule(minified, '.ip-test-results');
+check('.ip-test-results 是两列网格（连通 / 不通并排）', () => {
+    if (!ipTestRule) throw new Error('找不到 .ip-test-results 规则');
+    const squashed = ipTestRule.replace(/\s+/g, '');
+    if (!squashed.includes('display:grid')) throw new Error(`缺 display:grid，实际：${ipTestRule}`);
+    if (!squashed.includes('grid-template-columns:1fr1fr')) throw new Error(`缺两列定义，实际：${ipTestRule}`);
+});
+
+// ── 契约 7：地区下拉分组（推荐 + 三大洲），并含 @GL 锚定项（不分大小写由后端 normalizeRegionTag 保证）──
+check('Worker Region 下拉分组（推荐 + 三大洲），并含 @GL 锚定项', () => {
+    const start = html.indexOf('<select id="wkRegion"');
+    const end = html.indexOf('</select>', start);
+    if (start < 0 || end < 0) throw new Error('找不到 wkRegion 下拉');
+    const select = html.slice(start, end);
+    const groups = select.match(/<optgroup /g) || [];
+    // 4 = ✨ Recommended + 🌏 Asia + 🌍 Europe + 🌎 North America
+    if (groups.length !== 4) throw new Error(`期望 4 个 optgroup（推荐 + 三大洲），实际 ${groups.length}`);
+    if (!select.includes('value="GL"')) throw new Error('缺少 value="GL" 的「全球反代（无地区）」选项');
+    if (!select.includes('value=""')) throw new Error('缺少 value="" 的「官方直连（CF IPs）」选项');
+});
+
+// ── 契约 8：反代输入框提示 `@GL` 锚定写法（不分大小写）──
+check('Proxy IPs 输入框 placeholder 提示 @GL', () => {
+    const match = html.match(/id="proxyIPs"[\s\S]{0,200}?placeholder="([^"]*)"/);
+    if (!match) throw new Error('proxyIPs 没有 placeholder');
+    if (!/@GL/.test(match[1])) throw new Error(`placeholder 里没有 @GL：${match[1]}`);
+});
+
+// ── 契约 9：IP Test 的标签必须在输入框**上方**并居中 ──
+// 默认 .form-control 在 ≥600px 会变成 flex-direction:row（标签与输入框左右并排），
+// 本块用 ID 选择器覆盖回竖排；缺了这条，桌面端标签就会跑到输入框左边。
+const ipTestControl = rule(minified, '#ip-test-container .form-control:not(.apply)');
+check('#ip-test-container .form-control 强制竖排（标签在输入框上方）', () => {
+    if (!ipTestControl) throw new Error('找不到 #ip-test-container .form-control:not(.apply) 规则');
+    const squashed = ipTestControl.replace(/\s+/g, '');
+    if (!squashed.includes('flex-direction:column')) throw new Error(`缺 flex-direction:column，实际：${ipTestControl}`);
+    if (!squashed.includes('align-items:center')) throw new Error(`缺 align-items:center（居中），实际：${ipTestControl}`);
 });
 
 out('');
