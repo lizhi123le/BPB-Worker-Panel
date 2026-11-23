@@ -9,10 +9,12 @@ import { fetchWarpAccounts } from "@warp";
 import { UnifiedWSHandler } from "@unified";
 import { XP_MODE, buildXpExtra, buildXpNodePath } from "@cores/xp";
 import { base64DecodeUtf8, base64EncodeUtf8, copySafeOutboundHeaders, escapeHtml, htmlResponse, HttpStatus, isKvBound, respond, safeErrorMessage, securityHeaders } from "@common";
-import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, generateRemark, generateWsPath, getConfigItems, isBareIPv4, isBareIPv6, isCloudflareIP, isTlsPort, OFFICIAL_DIRECT_IPS, parseHostPort, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, probeLatency, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectSniHost, splitEntryLine } from "@utils";
+import { buildEntryPortMap, countryToRegion, cleanProxyShareLink, generateRemark, generateWsPath, getConfigItems, isBareIPv4, isBareIPv6, isCloudflareIP, isCloudflareNetwork, isTlsPort, mapWithConcurrency, OFFICIAL_DIRECT_IPS, parseHostPort, pickEarlyData, pickRandomEch, portsForHost, prependUpstreamItem, probeLatency, PROBE_CONCURRENCY, resetRemarkCounter, resolveDNS, resolveUrlEntries, selectSniHost, splitEntryLine } from "@utils";
 import JSZip from "jszip";
 
 import { prepareWsRuntimeConfig, resolveProxyPoolSource } from "./ws-runtime";
+// P1：探测族短路的判据与出口（与 firstCheck 共用同一份，避免两处判据漂移）
+import { isProbePath, probeNotFoundResponse } from "./camouflage";
 // S-03：IP 只取校验过的形态
 import { clientIp } from "./client-ip";
 
@@ -321,6 +323,22 @@ async function getSettings(request: Request, env: Env): Promise<Response> {
 }
 
 export async function fallback(request: Request): Promise<Response> {
+    const { url, method, body } = request;
+    const newURL = new URL(url);
+
+    // P1：秘密文件 / 版本控制探测族（`/panel/.env`、`/sub/.git/config`、`/login/.env` …）。
+    //
+    // 这些请求先命中内置路由的首段（panel / sub / login / proxy-ip / dns-query），在各自 handler
+    // 的 default 分支里落到本函数 —— 也就是说它们**不经过** firstCheck 的探测族短路。
+    // 原实现把整条 URL（含探测路径）原样转给兜底域，于是 Cloudflare 的
+    // potentialvulnerabilityscan 检测把这次出站也算成「同族探测」：
+    // 线上样本里 `GET /panel/.env` 正是出现次数最多的触发器（3 次，见 docs/analysis）。
+    // 这里与 firstCheck 用同一判据、同一出口，保证「探测族永不出站」在两条入口上都成立。
+    // 复用上面已解析的 newURL（不再多一次 `new URL(request.url)`）。
+    if (isProbePath(newURL.pathname)) {
+        return probeNotFoundResponse((globalThis as any)?.env);
+    }
+
     // 伪装地址来源：FALLBACK 环境变量，支持 `a|b|c` 多地址随机（与 camouflage 伪装反代链路一致）
     const raw = String(globalThis.globalConfig?.fallbackDomain || '')
         .split('|')
@@ -330,9 +348,7 @@ export async function fallback(request: Request): Promise<Response> {
     const fallbackDomain = (raw.length > 0 ? raw[Math.floor(Math.random() * raw.length)] : DEFAULT_FALLBACK_DOMAIN)
         .replace(/^https?:\/\//i, '')
         .replace(/\/+$/, '');
-    const { url, method, body } = request;
 
-    const newURL = new URL(url);
     newURL.hostname = fallbackDomain;
     newURL.protocol = 'https:';
     const newRequest = new Request(newURL.toString(), {
@@ -474,15 +490,34 @@ function toProbeEntries(raw: string[]): { entries: [string, number][]; requested
 }
 
 /**
- * 条目归类，供面板给每条结果打标：
- *   · `cf`     —— IP 字面量且落在 CF 公布网段内（官方直连池里该出现的就是这种）
- *   · `other`  —— IP 字面量但不在 CF 网段（当反代/中转用；拿 CF 目标的 SNI 去拨它不会通）
- *   · `domain` —— 域名，未解析，无法凭字面量归类（拨号时才由 DoH 解析）
+ * 池探针的归类结论（面板据此给每条结果打标）：
+ *   · `cf`      —— IP 字面量且落在 CF **文档公布**网段内（官方直连池里该出现的就是这种）
+ *   · `cf-asn`  —— 不在文档网段，但 ASN 反查确认属于 Cloudflare（AS13335）：Cloudflare 实际宣告
+ *                  远大于官方公布段（如 `8.39.204.0/24`、`104.28.138.0/24`）
+ *   · `unknown` —— 该补判但没查出来（DoH 不通 / 子请求预算用尽）：**不是**「非 CF」
+ *   · `other`   —— IP 字面量且确认不属于 Cloudflare（当反代/中转用；拿 CF 目标的 SNI 去拨它不会通）
+ *   · `domain`  —— 域名，未解析，无法凭字面量归类（拨号时才由 DoH 解析）
  */
-function classifyProbeHost(host: string): 'cf' | 'other' | 'domain' {
+type ProbeKind = 'cf' | 'cf-asn' | 'other' | 'unknown' | 'domain';
+
+/**
+ * 字面量归类（同步、零出站）：只给出 `cf` / `other` / `domain` 三个**初始**结论 ——
+ * `other` 随后还会被 ASN 补判改写成 `cf-asn` / `unknown`（见 poolProbe 里的补判段）。
+ */
+function classifyProbeHost(host: string): ProbeKind {
     if (!isBareIPv4(host) && !isBareIPv6(host)) return 'domain';
     return isCloudflareIP(host) ? 'cf' : 'other';
 }
+
+/**
+ * 一次诊断最多发几次 ASN 反查的 DoH 出站（**按出站次数计**，缓存命中不占额度）。
+ *
+ * 单条地址通常 1 次；CF DoH 那一路不通时再退 Google，记第 2 次。Free 计划每请求只有 50 个子请求，
+ * 而本接口还要为每条候选开一条 TCP 连接、可能为远程清单抓一次 URL，所以取 24 留余量。
+ * 超出预算的地址标 `unknown`（**不**谎报「非CF」）：再点一次 Test 时前面那些已进 isolate 缓存、
+ * 不占额度，于是下一次又能多判几条。
+ */
+const POOL_PROBE_ASN_FETCH_MAX = 24;
 
 /**
  * 池探针（诊断用）：从**本 Worker 的网络位置**对池内每条地址做一次 TCP 探测，返回「通/不通 + 耗时」。
@@ -552,14 +587,32 @@ async function poolProbe(request: Request, env: Env): Promise<Response> {
 
         // 只映射一次：results（池顺序）与 fastest（延迟升序）是同一份数据的不同视图，
         // 归类也只算一次 —— 两个 map 各算一遍是重复劳动，且容易改一处漏一处。
+        // 元素类型由 classifyProbeHost 的返回类型（ProbeKind）推导，不再手写一份重复的注解。
         const rows = probed.map(result => ({
             ip: result.host,
             port: result.port,
             ok: result.ok,
             ms: result.ms,
-            // 面板据此打标「CF / 非CF / 域名」：非 CF 的地址放进官方池是白占抽样名额
+            // 面板据此打标「CF / CF·ASN / 未知 / 非CF / 域名」：非 CF 的地址放进官方池是白占抽样名额
             kind: classifyProbeHost(result.host)
         }));
+
+        // 文档网段未命中的 IP 再补一次 ASN 反查：Cloudflare 实际宣告（AS13335）远大于
+        // api.cloudflare.com/client/v4/ips 公布的 15+7 段（如 8.39.204.0/24、104.28.138.0/24），
+        // 只按文档网段判会把它们错标成「非CF」。判据与成本见 @utils#isCloudflareNetwork。
+        const asnBudget = { left: POOL_PROBE_ASN_FETCH_MAX };
+        await mapWithConcurrency(
+            rows.filter((row) => row.kind === 'other'),
+            PROBE_CONCURRENCY,
+            async (row) => {
+                const verdict = await isCloudflareNetwork(row.ip, asnBudget);
+                if (verdict === true) row.kind = 'cf-asn';
+                // null = 查不出来（预算用尽 / DoH 不通）：标「未知」，绝不退回「非CF」
+                else if (verdict === null) row.kind = 'unknown';
+                return null;
+            }
+        );
+
         const okCount = rows.filter(row => row.ok).length;
 
         return respond(true, HttpStatus.OK, `${okCount}/${rows.length} reachable`, {

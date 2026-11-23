@@ -1805,9 +1805,11 @@ async function testPoolIPs() {
         const reachable = body?.fastest || [];
         const unreachable = results.filter((item) => !item.ok);
 
-        // 服务端按字面量归类（不解析域名）：cf = CF 网段内的 IP、other = 非 CF 的 IP、domain = 域名。
-        // 标出来的用处很直接：官方直连池只该放 cf；other 放进官方池会白占每连接 6 个抽样名额。
-        const KIND_LABEL = { cf: 'CF', other: '非CF', domain: '域名' };
+        // 服务端按字面量归类（不解析域名）：cf = CF 文档网段内、cf-asn = 不在文档网段但
+        // ASN 反查确认属 Cloudflare（AS13335）、unknown = 反查没查出来、other = 非 CF、domain = 域名。
+        // 标出来的用处很直接：官方直连池只该放 cf / cf-asn；other 放进官方池会白占每连接 6 个抽样名额。
+        // unknown 是「不知道」而不是「不是」—— 再点一次 Test 会补判（服务端有 isolate 缓存）。
+        const KIND_LABEL = { cf: 'CF', 'cf-asn': 'CF·ASN', unknown: '未知', other: '非CF', domain: '域名' };
 
         const fill = (list, items, withLatency) => {
             for (const item of items) {

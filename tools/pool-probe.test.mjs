@@ -8,7 +8,9 @@
  *   1. 鉴权：没有面板会话一律 401（它是 GET，且会发起出站连接，不能裸奔）；
  *   2. 池来源口径：面板 `officialIPs` 有值探面板的，**没设置就探内置官方池**
  *      （否则「面板空池」会探出一张空表，等于这个诊断工具在最常见的情形下失效）；
- *   3. 结论口径：每条都要「通/不通 + 耗时」，且 timeout 参数被钳到 300~3000ms。
+ *   3. 结论口径：每条都要「通/不通 + 耗时」，且 timeout 参数被钳到 300~3000ms；
+ *   4. 归类口径：文档网段命中的标 cf，**文档网段之外**的再做一次 ASN 反查（Cloudflare 实际宣告
+ *      AS13335 远大于官方公布段），反查不出来标 unknown 而不是 other。
  *
  * 打桩：globalThis.connect 由本测试接管 —— 白名单里的 host 立刻 opened（通），
  * 其余返回一个**永不 resolve 的 opened**（模拟黑洞候选，靠探测超时收口）。
@@ -257,6 +259,104 @@ json = await res.json();
 body = json.body || {};
 check('归类：域名标 domain（不是 cf / other）',
     (body.results || [])[0]?.kind === 'domain', JSON.stringify(body.results));
+
+// ── 12) 文档网段之外的 CF 地址：ASN 反查补判
+// 背景：Cloudflare 实际宣告（AS13335）远大于 api.cloudflare.com/client/v4/ips 公布的 15+7 段
+// （实测差集 v4 566 段 / v6 47 段，例如 8.39.204.0/24、104.28.138.0/24、8.27.67.0/24）。
+// 只按文档网段判会把这类地址错标成「非CF」—— 本节钉住补判链路的三种结论：
+//   · AS13335            → cf-asn
+//   · 别的 ASN（15169）  → 仍 other
+//   · 反查失败（DoH 挂） → unknown（**绝不**退回 other：那正是要修的误判）
+const cymruFetch = globalThis.fetch;
+let dohHits = 0;
+globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes('origin.asn.cymru.com') || target.includes('origin6.asn.cymru.com')) {
+        dohHits += 1;
+        const txt = (data) => new Response(
+            JSON.stringify({ Answer: [{ type: 16, data: `"${data}"` }] }),
+            { headers: { 'content-type': 'application/dns-json' } });
+        // 八位组倒序：8.39.204.129 → 129.204.39.8
+        if (target.includes('129.204.39.8.origin')) return txt('13335 | 8.39.204.0/24 | US | arin | 1992-12-01');
+        if (target.includes('8.8.8.8.origin')) return txt('15169 | 8.8.8.0/24 | US | arin | 1992-12-01');
+        throw new Error('doh down');   // 其余一律「查不到」
+    }
+    return cymruFetch(url);
+};
+
+res = await call('/panel/pool-probe?ips=8.39.204.129,8.8.8.8,45.45.45.45&timeout=300', { headers: auth });
+json = await res.json();
+body = json.body || {};
+const kindOf = (ip) => (body.results || []).find((row) => row.ip === ip)?.kind;
+check('ASN 补判：8.39.204.129（文档段外、AS13335）标成 cf-asn',
+    kindOf('8.39.204.129') === 'cf-asn', JSON.stringify(body.results));
+check('ASN 补判：8.8.8.8（AS15169）仍标 other',
+    kindOf('8.8.8.8') === 'other', JSON.stringify(body.results));
+check('ASN 补判：反查失败标 unknown（不是 other）',
+    kindOf('45.45.45.45') === 'unknown', JSON.stringify(body.results));
+// 失败必须留痕：否则线上只剩一个「未知」，无从判断是超时、被墙还是上游真没记录
+check('ASN 补判：查不到时打一条 [CF-ASN] warn（含查询名与失败原因）',
+    logs.some((line) => line.includes('[CF-ASN]') && line.includes('origin.asn.cymru.com')),
+    logs.filter((line) => line.includes('[CF-ASN]')).slice(-3).join(' | ') || '没有 [CF-ASN] 日志');
+
+// CF 那一路不通、Google 通 → 顺序回退后仍应判出 cf-asn。
+// 这条对应线上「全部未知」的真实症状：A/AAAA 因为走双源竞速一直没暴露 CF DoH 单路失败。
+// 换一个**未被上面缓存**的地址（8.36.216.54 → 54.216.36.8.origin），否则会直接命中结论缓存、测不到回退。
+globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes('origin.asn.cymru.com')) {
+        if (target.includes('cloudflare-dns.com')) throw new Error('cf doh blocked');
+        if (target.includes('54.216.36.8.origin')) {
+            return new Response(
+                JSON.stringify({ Answer: [{ type: 16, data: '"13335 | 8.36.216.0/24 | US | arin | 1992-12-01"' }] }),
+                { headers: { 'content-type': 'application/dns-json' } });
+        }
+        throw new Error('google doh down');
+    }
+    return cymruFetch(url);
+};
+res = await call('/panel/pool-probe?ips=8.36.216.54&timeout=300', { headers: auth });
+json = await res.json();
+body = json.body || {};
+check('ASN 补判：CF DoH 不通时回退 Google，仍判出 cf-asn',
+    kindOf('8.36.216.54') === 'cf-asn', JSON.stringify(body.results));
+
+// 超时口径：**固定 2s**，不跟随 DOH_TIMEOUT_MS。
+// 那个变量是隧道内 A/AAAA 的旋钮（调小是为了缩短首包等待），跟着它一起变的话，
+// 冷门名（.asn.cymru.com 要现场递归）就会每条都超时、面板上全部显示「未知」。
+// 判据用**调大**方向：旧实现是 max(env, 2000) 且上限 5000，env=6000 时会变成 5000；
+// 固定值实现恒为 2000 —— 调小方向两者都是 2000，区分不出来，所以这里不用 100。
+const realTimeoutFn = AbortSignal.timeout;
+const seenTimeouts = [];
+AbortSignal.timeout = (ms) => { seenTimeouts.push(ms); return realTimeoutFn.call(AbortSignal, ms); };
+try {
+    // 换一个未缓存的地址（8.25.96.108 → 108.96.25.8.origin），确保真的会发 DoH
+    res = await handler.fetch(
+        new Request(ORIGIN + '/panel/pool-probe?ips=8.25.96.108&timeout=300',
+            { headers: { Host: 'panel.example.com', ...auth } }),
+        { ...env, DOH_TIMEOUT_MS: '6000' }, ctx);
+    json = await res.json();
+    body = json.body || {};
+} finally {
+    AbortSignal.timeout = realTimeoutFn;
+}
+check('ASN 反查超时固定 2000ms（DOH_TIMEOUT_MS=6000 也不受影响）',
+    seenTimeouts.length > 0 && seenTimeouts.every((ms) => ms === 2000),
+    `seen=${seenTimeouts.join(',') || '无'} kind=${kindOf('8.25.96.108')}`);
+
+// 私有地址不该发反查（省子请求）：dohHits 归零后再探一次 10.x —— 若它真的去查了，
+// 上面那个桩会抛错（结论变 unknown）且计数不为 0，两条断言都会红。
+globalThis.fetch = async (url) => {
+    if (String(url).includes('origin.asn.cymru.com')) { dohHits += 1; throw new Error('should not be queried'); }
+    return cymruFetch(url);
+};
+dohHits = 0;
+res = await call('/panel/pool-probe?ips=10.99.99.99&timeout=300', { headers: auth });
+json = await res.json();
+body = json.body || {};
+check('ASN 补判：私有地址不发反查（0 次 DoH，结论仍是 other）',
+    dohHits === 0 && kindOf('10.99.99.99') === 'other',
+    `dohHits=${dohHits} kind=${kindOf('10.99.99.99')}`);
 
 globalThis.fetch = realFetch;
 

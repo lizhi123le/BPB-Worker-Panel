@@ -740,16 +740,31 @@ let _lastDohProgressAt = 0;
  * **DoH 的最底层，也是唯一一处 fetch**：网络错误 / HTTP 错误 / JSON 解析失败一律吞成 [] ——
  * 「两个源都失败」与「上游确实没有记录」在这里同形，区别只体现在缓存期限上（空结果 30s，
  * 见 dohAnswersCached）。`dohUrl` 必填：唯一保留「裸单源」语义的地方是 `.william` TXT 的 Google 兜底。
+ *
+ * `options.timeoutMs` / `options.onFail` 是给 ASN 反查用的**诊断口**：失败原因（HTTP 状态 /
+ * 超时 / 无应答）在这里只有它知道，而上层需要把它打进日志 —— 否则线上表现只剩一个「未知」，
+ * 无从判断是「网络不通」「超时」还是「上游真没记录」。默认不传，行为与改动前逐字一致。
  */
-async function dohQueryRaw(domain: string, type: string, dohUrl: string): Promise<any[]> {
+async function dohQueryRaw(
+    domain: string,
+    type: string,
+    dohUrl: string,
+    options: { timeoutMs?: number; onFail?: (info: string) => void } = {}
+): Promise<any[]> {
     try {
         const response = await fetch(`${dohUrl}?name=${encodeURIComponent(domain)}&type=${type}`, {
             headers: { accept: 'application/dns-json' },
-            signal: AbortSignal.timeout(dohTimeoutMs()),
+            signal: AbortSignal.timeout(options.timeoutMs ?? dohTimeoutMs()),
         });
+        if (!response.ok) {
+            options.onFail?.(`HTTP ${response.status}`);
+            return [];
+        }
         const data: any = await response.json();
+        if (!data.Answer?.length) options.onFail?.('no-answer');
         return data.Answer || [];
-    } catch {
+    } catch (e) {
+        options.onFail?.((e as Error)?.message ?? String(e));
         return [];
     } finally {
         // 进度信号：无论成功、失败还是超时，这条管线都「动了一下」—— 单飞等待方据此决定是否继续等
@@ -833,6 +848,18 @@ function answersToRecords(answers: any[], recordType: number): string[] {
     return answers
         .filter((record: any) => record.type === recordType)
         .map((record: any) => record.data);
+}
+
+/**
+ * TXT 记录的引号剥离：不同 DoH 实现给出的 `data` 不一致 —— Google 的 `/resolve` 原样返回
+ * （`13335 | …`），Cloudflare 的会带一层引号（`"13335 | …"`，实测见 `.william` 与 ASN 反查）。
+ * 所有取 TXT 的地方都必须先过这里，否则同一个域名换个解析器就得到两种字符串。
+ *
+ * 只剥**首尾**那一对引号：TXT 内容本身可以合法包含引号，全局 replace 会把它们一起吃掉。
+ */
+function stripTxtQuotes(record: string): string {
+    const text = String(record ?? '').trim();
+    return text.startsWith('"') && text.endsWith('"') ? text.slice(1, -1) : text;
 }
 
 /**
@@ -1842,11 +1869,9 @@ const PROBE_TIMEOUT = 2000;
  * 回归钉：tools/proxy-pool-draw.test.mjs 钉两条 —— 事件序列开头连续 3 个 start（窗口宽度）、
  * 全程在飞峰值 ≤ 3（接管的是探测自己那条 socket，不新开连接；回到「一次性全发」立刻变 6）。
  */
-const PROBE_CONCURRENCY = 3;
-
+export const PROBE_CONCURRENCY = 3;
 /**
- * 剩余预算低于它就不再发起新探测：只跑得满「半个单条超时」的探测拿不到可信结论 ——
- * 发起它既要白开一个 socket，判死时还会把好候选记进 30s 起指数退避的黑名单（误判链见下）。
+ * 剩余预算低于它就不再发起新探测：只跑得满「半个单条超时」的探测拿不到可信结论 —— * 发起它既要白开一个 socket，判死时还会把好候选记进 30s 起指数退避的黑名单（误判链见下）。
  * 本值是**基准门槛**，实际门槛按当次预算缩放为 `min(本值, 预算 / 2)`（见 probeWithinBudget）：
  * 预算不到 2 × 本值时（默认 200，以及 env 下调的 50~200 档），固定门槛要么让第二波永远启动
  * （退化成「只考前 3 个候选」），要么连第一波都发不出去（每次调用只剩 'unknown'，探测等于停用）。
@@ -1901,7 +1926,7 @@ type ProbeVerdict = boolean | 'unknown';
  *  ⚠️ 滚动窗口本身**不封顶**总耗时（最坏是 ceil(n/3) × PROBE_TIMEOUT，6 条 = 两波 = 4s）。
  *  这个上界由调用方 probeWithinBudget 的探针预算（默认 369ms，env 可覆盖）压住 ——
  *  所以这里的并发度只决定「一批里能并行几条」，不再决定「整批能拖多久」。 */
-async function mapWithConcurrency<T, R>(
+export async function mapWithConcurrency<T, R>(
     items: T[],
     concurrency: number,
     worker: (item: T) => Promise<R>
@@ -2421,8 +2446,7 @@ async function resolveProxyPoolUncached(
                     txtData = answersToRecords(await dohQueryRaw(entry, 'TXT', GOOGLE_DOH), DNS_TYPE_CODE.TXT);
                 }
                 if (txtData.length > 0) {
-                    let data = txtData[0];
-                    if (data.startsWith('"') && data.endsWith('"')) data = data.slice(1, -1);
+                    const data = stripTxtQuotes(txtData[0]);
                     const prefixes = data.replace(/\\010/g, ',').replace(/\n/g, ',')
                         .split(',').map((s: string) => s.trim()).filter(Boolean);
                     for (const prefix of prefixes) {
@@ -2656,6 +2680,143 @@ export function isCloudflareIP(ip: string): boolean {
     const words = ipv6ToWords(clean);
     if (!words) return false;
     return CF_V6_RANGES.some(range => ipv6InPrefix(words, range.base, range.prefix));
+}
+
+/** Cloudflare 的 ASN：`isCloudflareNetwork` 的补判依据 */
+const CLOUDFLARE_ASN = '13335';
+
+/**
+ * ASN 反查结论缓存（isolate 内存，10min）。只缓存**有结论**的结果：
+ * `null`（DoH 不通 / 没有 TXT）不入缓存 —— 一次网络抖动不该把整批 IP 永久钉成「未知」。
+ */
+const ASN_CACHE_TTL_MS = 10 * 60 * 1000;
+const ASN_CACHE_MAX = 512;
+const asnVerdictCache = new Map<string, { cf: boolean; time: number }>();
+
+/**
+ * ASN 反查的 DoH 超时（**固定值，刻意不读 env**）。
+ *
+ * 为什么不复用 `DOH_TIMEOUT_MS`：那个变量是给隧道内的 A/AAAA 解析用的，调小它是为了缩短
+ * 「首包之前」的等待；而 `.asn.cymru.com` 是冷门名，冷启动要现场递归到权威，1~2s 是常态。
+ * 跟着它一起被调小，结果就是每条都超时、面板上全部显示「未知」—— 线上已经踩过一次。
+ * 面板诊断是人工触发的，多等 2 秒可以接受；`DOH_TIMEOUT_MS` 的默认值（800）保持不动。
+ */
+const ASN_DOH_TIMEOUT_MS = 2000;
+
+/**
+ * 私有 / 保留地址：不可能是 Cloudflare 边缘，直接跳过反查。
+ * 目的不是「正确」（它们本来就判非 CF），而是**省子请求** —— 诊断表里 `10.x`、`192.168.x`
+ * 这类占位地址很常见，为它们各发一次 DoH 是纯浪费。
+ */
+function isPrivateOrReservedV4(value: number): boolean {
+    const a = value >>> 24;
+    const b = (value >>> 16) & 255;
+    return a === 0 || a === 10 || a === 127 || a >= 224
+        || (a === 100 && b >= 64 && b <= 127)      // CGNAT（100.64/10）
+        || (a === 169 && b === 254)                // link-local
+        || (a === 172 && b >= 16 && b <= 31)       // 172.16/12
+        || (a === 192 && b === 168);               // 192.168/16
+}
+
+function isPrivateOrReservedV6(words: number[]): boolean {
+    if (words.slice(0, 7).every((w) => w === 0) && words[7] <= 1) return true;   // :: / ::1
+    if ((words[0] & 0xfe00) === 0xfc00) return true;                             // fc00::/7 ULA
+    if ((words[0] & 0xffc0) === 0xfe80) return true;                             // fe80::/10 link-local
+    return false;
+}
+
+/**
+ * Team Cymru 的 origin-ASN 查询名（公开 DNS 接口，无鉴权，应答几十字节）：
+ *   v4：`<d>.<c>.<b>.<a>.origin.asn.cymru.com`（八位组倒序）
+ *   v6：`<nibble 倒序>.origin6.asn.cymru.com`
+ * 应答形如 `13335 | 8.39.204.0/24 | US | arin | 1992-12-01`，第一段就是 origin ASN。
+ */
+function originAsnQueryName(value: number | null, words: number[] | null): string | null {
+    if (value !== null) {
+        return `${value & 255}.${(value >>> 8) & 255}.${(value >>> 16) & 255}.${value >>> 24}.origin.asn.cymru.com`;
+    }
+    if (!words) return null;
+    const nibbles = words.map((w) => w.toString(16).padStart(4, '0')).join('');
+    return `${[...nibbles].reverse().join('.')}.origin6.asn.cymru.com`;
+}
+
+/**
+ * 是否属于 Cloudflare 网络（AS13335）—— `isCloudflareIP` 的**补判**版本，两者分工明确：
+ *
+ *  · `isCloudflareIP`：Cloudflare **文档公布**的 15+7 段（api.cloudflare.com/client/v4/ips）。
+ *    同步、零出站 —— 所有热路径（首跳路由 `isCloudflareTarget`）只能用它。
+ *  · `isCloudflareNetwork`：在它之上补一次 **ASN 反查**，覆盖 AS13335 实际宣告、但不在文档里的
+ *    空间（实测差集：v4 566 段 ≈ 41 万个地址、v6 47 段，例如 `8.39.204.0/24`、`104.28.138.0/24`）。
+ *    只给面板诊断用，**绝不进热路径**。
+ *
+ * 为什么差集不能写死进 bundle：base64 后约 13.2 KB，而混淆产物体积是硬预算（见 harden.config.json）；
+ * 而且 AS13335 的宣告本身会变，写死等于注定过期。
+ *
+ * 成本与降级：
+ *  · 先查 **CF DoH**，空再退 **Google**（顺序回退，不是并发）—— 常态 1 次子请求，只在 CF 这一路
+ *    不通/超时时才付第 2 次。**不能只押单源**：线上实测出现过 CF 这一路查不到、于是所有地址都
+ *    显示「未知」的情况，而 A/AAAA 因为走双源竞速一直没暴露这个问题。
+ *  · 超时**固定 2s**（`ASN_DOH_TIMEOUT_MS`，刻意不跟随 `DOH_TIMEOUT_MS`）：`.asn.cymru.com`
+ *    不是热门名，递归解析冷启动经常超过默认的 800ms —— 线上「永远未知」最可能就是它。
+ *  · `budget` 由调用方给：每**实际出站**一次扣 1（缓存命中不扣），用于把子请求数压在计划配额内。
+ *  · 返回 `null` = **查不出来**（预算用尽 / 两个源都不通 / 无 TXT / 解析不出 ASN）。调用方必须把它
+ *    显示成「未知」，**绝不能**当成「非 CF」—— 那正是本次要修的那类误判。
+ */
+export async function isCloudflareNetwork(
+    ip: string,
+    budget?: { left: number }
+): Promise<boolean | null> {
+    const clean = String(ip ?? '').trim().replace(/^\[|\]$/g, '');
+    if (!clean) return false;
+    if (isCloudflareIP(clean)) return true;                 // 文档网段：命中即 CF，零出站
+
+    const cached = asnVerdictCache.get(clean);
+    if (cached && Date.now() - cached.time < ASN_CACHE_TTL_MS) return cached.cf;
+
+    const v4 = ipv4ToInt(clean);
+    const words = v4 === null ? ipv6ToWords(clean) : null;
+    if (v4 === null && !words) return false;                // 不是 IP 字面量（域名等）
+    if (v4 !== null ? isPrivateOrReservedV4(v4) : isPrivateOrReservedV6(words!)) return false;
+
+    const query = originAsnQueryName(v4, words);
+    if (!query) return null;
+
+    const asns = await lookupOriginAsns(query, budget);
+    const verdict = asns.length ? asns.includes(CLOUDFLARE_ASN) : null;
+
+    if (verdict !== null) {
+        asnVerdictCache.delete(clean);                      // 先删再插：按「最近结论」刷新淘汰顺序
+        evictOldest(asnVerdictCache, ASN_CACHE_MAX - 1);
+        asnVerdictCache.set(clean, { cf: verdict, time: Date.now() });
+    }
+    return verdict;
+}
+
+/**
+ * 取 origin ASN 列表（Cymru 的 TXT 应答第一段）。
+ * 返回空数组 = 两个源都拿不到（调用方按「未知」处理）；预算用尽时**不发请求**直接返回空。
+ * 失败原因只在这里能看到（`onFail`），所以这里必须留一条 warn —— 否则线上只剩一个「未知」。
+ */
+async function lookupOriginAsns(query: string, budget?: { left: number }): Promise<string[]> {
+    const timeoutMs = ASN_DOH_TIMEOUT_MS;
+    const reasons: string[] = [];
+    for (const [source, dohUrl] of [['cf', CF_DOH], ['google', GOOGLE_DOH]] as const) {
+        if (budget) {
+            if (budget.left <= 0) return [];
+            budget.left -= 1;
+        }
+        const answers = await dohQueryRaw(query, 'TXT', dohUrl, {
+            timeoutMs,
+            onFail: (info) => reasons.push(`${source}:${info}`),
+        });
+        const asns = answersToRecords(answers, DNS_TYPE_CODE.TXT)
+            // 引号剥离与 `.william` 的 TXT 展开共用 stripTxtQuotes（同一个 DoH 差异，只留一份实现）
+            .map((record: string) => stripTxtQuotes(record).split('|')[0].trim())
+            .filter(Boolean);
+        if (asns.length) return asns;
+    }
+    console.warn(`[CF-ASN] ${query} 查不到 ASN（${reasons.join(' | ') || '无应答'}，超时=${timeoutMs}ms）`);
+    return [];
 }
 
 /**

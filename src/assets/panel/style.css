@@ -1006,7 +1006,8 @@ table tr:not(:last-child) {
     white-space: nowrap;
 }
 
-/* 条目归类徽标：CF / 非CF / 域名 —— 官方直连池只该出现 CF，非 CF 会白占抽样名额 */
+/* 条目归类徽标：CF / CF·ASN / 未知 / 非CF / 域名 —— 官方直连池只该出现 CF 与 CF·ASN，
+   非 CF 会白占抽样名额；「未知」是 ASN 反查没查出来（再点一次 Test 会补判），不是「非CF」 */
 .ip-test-kind {
     flex: none;
     padding: 0 4px;
@@ -1019,6 +1020,21 @@ table tr:not(:last-child) {
 
 .ip-test-kind.cf {
     color: var(--color-icon-green);
+}
+
+/* ASN 补判出来的 CF 与「查不出来」共用虚线边框：两者都不是文档网段命中 */
+.ip-test-kind.cf-asn,
+.ip-test-kind.unknown {
+    border-style: dashed;
+    opacity: 0.7;
+}
+
+.ip-test-kind.cf-asn {
+    color: var(--color-icon-green);
+}
+
+.ip-test-kind.unknown {
+    color: var(--color-text-muted);
 }
 
 .ip-test-kind.other {

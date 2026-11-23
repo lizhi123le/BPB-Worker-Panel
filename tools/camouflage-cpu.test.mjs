@@ -15,6 +15,12 @@
  *      非噪声参数（如 `?page=2`）仍各自成为独立缓存条目。
  *   6. 资源形态阈值走 env 覆盖（`MASK_TEXT_REWRITE_MAX` / `MASK_IMG_CACHE_MAX` /
  *      `MASK_IMG_CACHE_BYTES`），非法值或低于下界一律回退默认，绝不 fail-open 成无上限。
+ *   7. **P0**：图片目标取图失败 → 本地页 + 30s 负缓存，**不得**回落全路径反代
+ *      （线上表现为 CF 的「An outbound fetch matched the same probe family」告警，
+ *      并且一次探测要白占 10s wall time + 2 次出站）；
+ *   8. **P1**：`.env` / `.git/HEAD` 这类探测族 → 朴素 404 且零出站；相似前缀
+ *      （`/.environment`、`/.gitignore`）与 `/.well-known/` 不得被误伤；
+ *   9. **P2**：取图出站超时 5s（原 10s）。
  *
  * 为什么需要它：这四条都靠「体积」和「次数」这类边界触发，手测很难稳定复现；
  * 而回归的方向又极其具体 —— 退化成「全部缓冲」就是 CPU 超限复发，
@@ -55,10 +61,18 @@ if (!existsSync(BUNDLE)) {
  */
 let plan = { mode: 'known', body: 'hello', extra: {} };
 let fetchCount = 0;
+/** 每次出站的完整 URL：P0/P1 的判据是「出站里到底有没有那条探测路径」 */
+const outboundUrls = [];
+/** P0 用例：命中该前缀的出站直接抛（模拟超时 / 网络错误）；null = 正常 */
+let imageFailTarget = null;
 
 globalThis.fetch = async (url) => {
     const u = String(url);
     fetchCount++;
+    outboundUrls.push(u);
+    if (imageFailTarget && u.startsWith(imageFailTarget)) {
+        throw new Error('The operation was aborted due to timeout');
+    }
     if (!u.includes(UPSTREAM_HOST)) {
         return new Response('{}', { headers: { 'content-type': 'application/json' } });
     }
@@ -714,6 +728,169 @@ await widenBudget();
 delete env.MASK_TEXT_REWRITE_MAX;
 delete env.MASK_IMG_CACHE_MAX;
 delete env.MASK_IMG_CACHE_BYTES;
+
+// ---------- 14. P0：图片目标取图失败不得回落全路径反代 ----------
+// 回归点（线上实证）：图源超时 → buildImagePageResponse 返回 null → 继续往下走到
+// 全路径伪装反代 → 出站 URL = `<伪装域><请求路径>`。Cloudflare 的 potentialvulnerabilityscan
+// 检测把这次出站也算成「同族探测」，后台因此出现
+// 「A request matched secret-files scanning patterns. **An outbound fetch matched the same
+// probe family**」；同时一次探测白占 10s wall time + 2 次出站。
+// 现在的契约：取图失败 → 本地 nginx 页（200 HTML），出站**只有取图那一次**，且 30s 负缓存。
+// 注意这里用字典内路径（`/hosting/tour`，即线上样本路径）：探测族已由 P1 在 firstCheck 拦掉，
+// 本用例要单独钉住「非探测路径也不能被转发」这条兜底。
+const FAIL_TARGET = 'https://upstream.example.net/photo-fail.jpg';
+const failEnv = { ...env, FALLBACK: FAIL_TARGET };
+imageFailTarget = FAIL_TARGET;
+
+const beforeFail = fetchCount;
+const failResp = await handler.fetch(imageReq('/hosting/tour'), failEnv, ctx);
+const failText = await failResp.text();
+check('P0：取图失败回本地页（200 HTML），不回落全路径反代',
+    failResp.status === 200
+    && (failResp.headers.get('content-type') || '').includes('text/html')
+    && failText.includes('Welcome to nginx'),
+    `status=${failResp.status} ct=${failResp.headers.get('content-type')} body=${failText.slice(0, 60)}`);
+check('P0：取图失败时只出站 1 次（取图本身），不再有第 2 次反代出站',
+    fetchCount === beforeFail + 1, `before=${beforeFail} now=${fetchCount}`);
+check('P0：出站 URL 里绝不出现被请求的路径',
+    outboundUrls.slice(beforeFail).every((u) => !u.includes('/hosting/tour')),
+    `outbound=${outboundUrls.slice(beforeFail).join(' | ')}`);
+
+// 负缓存：30s 内后续请求 0 次出站，且形态一致
+const beforeFailCached = fetchCount;
+const failAgain = await handler.fetch(imageReq('/hosting/tour'), failEnv, ctx);
+const failAgainText = await failAgain.text();
+check('P0：取图失败的负缓存生效（30s 内 0 次出站）',
+    fetchCount === beforeFailCached, `before=${beforeFailCached} now=${fetchCount}`);
+check('P0：负缓存期间返回同一张本地页', failAgainText === failText);
+
+// 负缓存按 url 计账：换一个能取到的图源必须照常返回壳页
+imageFailTarget = null;
+plan = { mode: 'known', body: IMAGE_BODY, extra: { 'content-type': 'image/jpeg' } };
+const afterFailText = await (await handler.fetch(
+    imageReq('/'), { ...env, FALLBACK: 'https://upstream.example.net/photo-after-fail.jpg' }, ctx
+)).text();
+check('P0：负缓存按 url 隔离（别的图源照常返回壳页）', afterFailText.includes('<img src="/?'),
+    afterFailText.slice(0, 120));
+
+// 假阳性（上游回 HTML）仍按原设计降级普通反代 —— 这是「伪装目标填错」的恢复路径，
+// 不能被 P0 顺手改掉（否则把 homepage 误填成图片时整站会永久变成 nginx 页）
+plan = { mode: 'known', body: '<html><body>not an image</body></html>', extra: {} };
+const beforeFalsePositive = fetchCount;
+await (await handler.fetch(
+    imageReq('/about?fp=1'), { ...env, FALLBACK: 'https://upstream.example.net/photo-html.jpg' }, ctx
+)).text();
+check('P0：假阳性（图源回 HTML）仍降级普通反代（原有语义未变）',
+    fetchCount === beforeFalsePositive + 2
+    && outboundUrls[outboundUrls.length - 1].includes('/about?fp=1'),
+    `before=${beforeFalsePositive} now=${fetchCount} last=${outboundUrls[outboundUrls.length - 1]}`);
+
+// ---------- 15. P1：秘密文件 / 版本控制探测族 → 朴素 404，零出站 ----------
+// 线上背景：这类路径既不是内置路由也不在伪装字典里，按原逻辑会被**原样转发**给伪装域。
+// 于是 CF 把出站也算进「同族探测」（potentialvulnerabilityscan / outbound matched），
+// 图片目标形态下它们还会拿到 200 壳页 ——「所有路径都 200」是最硬的指纹，
+// 扫描器会把 `.env` / `.git/config` 记成「存在(200)」。
+//
+// 两个入口都必须覆盖，判据强度不同，所以第三列显式区分：
+//  · 非内置路径 → firstCheck 短路，可钉更强的「零出站」；
+//  · 内置路由前缀（`/panel/.env` 是线上样本里出现最多的触发器）→ 先进各 handler 的 default
+//    分支落到 fallback()，而 `setSettings` 之类本来就有与请求路径无关的后台出站（WARP 注册），
+//    因此只能钉「不把探测路径转发出去」。
+// 每个用例用独立 IP：非字典路径每 IP 每窗口只有 6 次额度，混用会让后面的用例拿到 429 而不是 404。
+plan = { mode: 'known', body: '<html><body>page</body></html>', extra: {} };
+const probeCases = [
+    ['/.env', '192.0.2.11', false],
+    ['/.env.bak', '192.0.2.12', false],
+    ['/.git/HEAD', '192.0.2.13', false],
+    ['/.docker/config.json', '192.0.2.14', false],
+    ['/.pypirc', '192.0.2.15', false],
+    ['/.ssh/id_rsa', '192.0.2.16', false],
+    ['/panel/.env', '192.0.2.17', true],
+    ['/login/.env', '192.0.2.18', true],
+    ['/sub/.git/config', '192.0.2.19', true],
+    // 管理路径前缀：guardNonBuiltinPath 对「首段 = subPath」显式返回 null（豁免限流），
+    // 于是这类请求也落到 fallback() —— 第三个只能由 fallback 兜住的入口。
+    ['/p/.env', '192.0.2.20', false]
+];
+for (const [p, ip, backgroundAllowed] of probeCases) {
+    const c = fetchCount;
+    const r = await get(p, ip);
+    const t = await r.text();
+    const forwarded = outboundUrls.slice(c).filter((u) => u.includes(p));
+    check(`P1：${p} 直接 404 且不把探测路径转发出去`,
+        r.status === 404 && forwarded.length === 0 && !t.includes('1101')
+        && (backgroundAllowed || fetchCount === c),
+        `status=${r.status} fetches=${fetchCount - c} forwarded=${forwarded.join(' | ') || '无'} body=${t.slice(0, 40)}`);
+}
+
+// 负例：前缀相似但属于正常页面 / 真实存在的路径，不得被探测族短路吃掉。
+// 其中 `/.well-known/` 是**唯一契约**：源码里没有 startsWith 白名单（那是永远走不到的死分支），
+// 这条用例就是它的守卫 —— 将来往词表里加词若误伤它，这里会先红。
+const normalCases = [
+    ['/.environment', '192.0.2.21'],            // 与 `.env` 前缀相同，但不是秘密文件
+    ['/.gitignore', '192.0.2.22'],              // 同上
+    ['/.well-known/security.txt', '192.0.2.23'] // 真实存在的标准路径，404 反而是错的
+];
+for (const [p, ip] of normalCases) {
+    const c = fetchCount;
+    const r = await get(p, ip);
+    await r.text();
+    check(`P1 负例：${p} 不被短路（仍走伪装反代，1 次出站）`,
+        r.status !== 404 && fetchCount === c + 1,
+        `status=${r.status} fetches=${fetchCount - c}`);
+}
+
+// ---------- 16. P2：取图出站超时 10s → 5s ----------
+// 探测请求在图片目标形态下也会先走取图分支；让它占满 10 秒 wall time 没有收益
+// （失败后的出口已是本地页）。这里直接捕获 fetchWithTimeout 传给 AbortSignal.timeout 的毫秒数，
+// 避免用「等 10 秒」这种既慢又不稳的判据。
+const realAbortTimeout = AbortSignal.timeout;
+let capturedTimeoutMs = 0;
+if (typeof realAbortTimeout === 'function') {
+    AbortSignal.timeout = function (ms) {
+        capturedTimeoutMs = ms;
+        return realAbortTimeout.call(AbortSignal, ms);
+    };
+}
+try {
+    plan = { mode: 'known', body: IMAGE_BODY, extra: { 'content-type': 'image/jpeg' } };
+    await (await handler.fetch(
+        imageReq('/'), { ...env, FALLBACK: 'https://upstream.example.net/photo-timeout.jpg' }, ctx
+    )).text();
+} finally {
+    if (typeof realAbortTimeout === 'function') AbortSignal.timeout = realAbortTimeout;
+}
+check('P2：取图出站超时为 5000ms（原 10000ms）', capturedTimeoutMs === 5000, `captured=${capturedTimeoutMs}`);
+
+// ---------- 17. 双斜杠 login 路径：与 /login/... 同构，不受「字典外路径」限流 ----------
+// 守的是 firstCheck.ts 里那行 `if (segments[0] === 'login') return null;`。
+// 它看起来像死代码（`/login/x` 在 worker 的 switch 里就被接走了），但**双前导斜杠**会绕过 switch：
+// switch 取 `pathName.split('/')[1]`（得 ''），守卫取 `filter(Boolean)[0]`（得 'login'）。
+// 删掉那行 → `//login/x` 变成「字典外路径」：先吃每 IP 每小时 6 次的额度，第 7 次起 429。
+// 判据刻意用这个副作用（而不是响应体）：响应体两条路都是上游 HTML，分不出来。
+plan = { mode: 'known', body: '<html><body>login</body></html>', extra: {} };
+const DOUBLE_SLASH_IP = '192.0.2.31';
+const doubleSlashStatus = [];
+for (let i = 0; i < 8; i++) {
+    const r = await get(`//login/probe${i}`, DOUBLE_SLASH_IP);
+    await r.text();
+    doubleSlashStatus.push(r.status);
+}
+check('双斜杠 login 路径与 /login/... 同构（8 次连打不触发字典外路径限流）',
+    doubleSlashStatus.every((s) => s !== 429),
+    `statuses=${doubleSlashStatus.join(', ')}`);
+
+// 对照组：同一 IP 打真正的「字典外路径」，第 7 次起必须被限流。
+// 没有这一组，上面那条断言可能是空转（例如限流整体失效时它也会「通过」）。
+const dictionaryMissStatus = [];
+for (let i = 0; i < 8; i++) {
+    const r = await get(`/zz-not-in-dictionary-${i}`, DOUBLE_SLASH_IP);
+    await r.text();
+    dictionaryMissStatus.push(r.status);
+}
+check('对照：同一 IP 打字典外路径第 7 次起被限流（429）',
+    dictionaryMissStatus.filter((s) => s === 429).length >= 2,
+    `statuses=${dictionaryMissStatus.join(', ')}`);
 
 out(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);

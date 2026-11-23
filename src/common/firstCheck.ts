@@ -1,6 +1,12 @@
 import { isPermanentBlacklisted, recordViolationAndMaybeBan } from "./blacklist";
 import { isPathInDictionary, checkRateLimit, checkRateLimitShared, recordRateLimit, writeRateLimitKV } from "./ratelimit";
-import { camouflageProxy, cf1101RateLimitedResponse, STATIC_ASSET_PATH_RE } from "./camouflage";
+import {
+    camouflageProxy,
+    cf1101RateLimitedResponse,
+    isProbePath,
+    probeNotFoundResponse,
+    STATIC_ASSET_PATH_RE
+} from "./camouflage";
 // S-03：CF-Connecting-IP 的唯一取用点（含形态校验，非法即视为无 IP）
 import { clientIp } from "./client-ip";
 
@@ -10,7 +16,8 @@ import { clientIp } from "./client-ip";
  *     注意：根路径与「每段都在字典内」的随机路径组合豁免此步，见 guardPermanentBlacklist。
  *  2. 路径字典校验 + 速率限制（字典路径视为合法公开路径，不限流不计数；
  *     仅路径含字典外段才触发限流与违规计数，避免误伤伪装站点正常流量）
- *  3. 未命中限流 → 全路径伪装反代（字典内路径同样伪装）
+ *  3. **秘密文件 / 版本控制探测族短路**（`.env`、`.git/HEAD` …）→ 朴素 404，零出站（P1）
+ *  4. 未命中限流 → 全路径伪装反代（字典内路径同样伪装）
  *
  * 对齐 cfnew 排除语义：POST、根路径 /、首段为 login、首段为管理路径(UUID/SUB_PATH) 不进入守卫。
  */
@@ -62,7 +69,7 @@ export async function guardPermanentBlacklist(
 
 /**
  * 对非内置路径请求执行守卫。
- * 返回 Response：命中黑名单/限流（429 nginx 页）或伪装反代结果。
+ * 返回 Response：命中黑名单/限流（429 nginx 页）、探测族短路（朴素 404）或伪装反代结果。
  * 返回 null：属于排除路径，应继续由上层内置逻辑处理。
  */
 export async function guardNonBuiltinPath(
@@ -76,12 +83,18 @@ export async function guardNonBuiltinPath(
     // 让 POST /<任意路径> 同时绕过永久黑名单、限流与违规计数，被罚的 IP 换个 method 就继续畅通，
     // 而且请求会被 worker.ts 无配额地转发到兜底域（一条免费的 POST 出口）。
     // 现在 POST 与 GET 走同一套判据；内置路由（/panel、/login 等）在 worker.ts 的 switch 里
-    // 就已分流，根本到不了这里，XHTTP 的 POST 走的是公共伪装字典路径（字典内路径不限流），
+    // 就已分流，XHTTP 的 POST 走的是公共伪装字典路径（字典内路径不限流），
     // 因此这两条正常链路都不受影响。
     const reqURL = new URL(request.url);
     if (reqURL.pathname === '/') return null;
 
     const segments = reqURL.pathname.split('/').filter(Boolean);
+    // ⚠️ 这行**不是死代码**，删之前先读完这段：
+    //   worker.ts 的 switch 用 `pathName.split('/')[1]` 取首段，这里用 `filter(Boolean)[0]` ——
+    //   对 `//login/x`（双前导斜杠）两者给出不同答案（前者 `''` → default 分支，后者 `'login'`）。
+    //   也就是说双斜杠路径确实会绕过 switch 进到本函数，而这行保证它与 `/login/x` **同构**：
+    //   同样落到 handlers.fallback()，而不是被当成「字典外路径」限流 + 违规计数 + 伪装反代。
+    //   回归用例：tools/camouflage-cpu.test.mjs「双斜杠 login 路径与 /login/... 同构」。
     if (segments[0] === 'login') return null;
 
     // 管理路径：面板 subPath（默认 UUID）—— 与 cfnew 的“管理员路径”语义对齐
@@ -116,6 +129,14 @@ export async function guardNonBuiltinPath(
         recordRateLimit(ip);
     }
 
-    // 3. 全路径伪装反代（字典内路径同样伪装；命中限流已在上面拦截）
+    // 3. P1：秘密文件 / 版本控制探测族 → 朴素 404，**不产生任何出站**。
+    //    放在限流之后是刻意的：这些请求照样计入违规计数（喂永久黑名单），
+    //    只是不再被转给伪装域 —— 否则 Cloudflare 会把这次出站也算进「同族探测」，
+    //    后台多出一类「An outbound fetch matched the same probe family」告警。
+    //    本函数只覆盖「非内置路径」；`/panel/.env` 这类带内置路由前缀的请求在
+    //    handlers.fallback 里由同一判据拦截（两个入口互不重叠，见各自注释）。
+    if (isProbePath(reqURL.pathname)) return probeNotFoundResponse(env);
+
+    // 4. 全路径伪装反代（字典内路径同样伪装；命中限流已在上面拦截）
     return await camouflageProxy(request, env);
 }

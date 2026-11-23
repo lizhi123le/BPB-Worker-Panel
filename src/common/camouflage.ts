@@ -24,6 +24,10 @@ import { clientIp } from './client-ip';
  *  - 文本类（text/javascript/json/xml）且 <2MB 时缓冲并重写上游 host，内存缓存 5 分钟。
  *  - 其余内容流式转发，过滤可能泄露服务器信息的响应头与 CF 入站头。
  *  - 任何阶段失败降级：首页根路径重试 → nginx 欢迎页。
+ *  - **P0**：图片目标取图失败（超时/网络）→ 本地 nginx 页 + 30s 负缓存，
+ *    **不再**回落全路径反代（那条路会把请求路径原样转发给伪装域）。
+ *  - **P1**：秘密文件 / 版本控制探测族（`.env`、`.git/HEAD` …）→ 朴素 404，零出站
+ *    （见 isProbePath / probeNotFoundResponse）。
  */
 
 const MASK_HOME_CACHE_TTL = 300000;       // 5 分钟
@@ -499,6 +503,53 @@ export async function cf1101RateLimitedResponse(host: string, accessIP: string):
 }
 
 /**
+ * P1：秘密文件 / 版本控制探测族（`.env`、`.git/HEAD`、`.docker/config.json`、`.pypirc` …）。
+ *
+ * 这是全网扫描器最高频的一族，且它们**既不是内置路由，也不在伪装字典里** —— 按原逻辑会一路
+ * 走到 camouflageProxy，把**同一条路径**转给伪装域。后果三件：
+ *  1. Cloudflare 的 `potentialvulnerabilityscan` 检测把这次出站也算进「同族探测」，
+ *     后台多出一类无法处置的「An outbound fetch matched the same probe family」；
+ *  2. 图片目标形态下这些路径还会拿到 200 壳页 ——「所有路径都 200」是最硬的指纹，
+ *     扫描器会把 `.env` / `.git/config` 记成「存在(200)」；
+ *  3. 每次探测都要付一次出站（图片形态下甚至 5s wall time）。
+ * 直接回朴素 404 与真实站点对 `.env` 的回答一致，且把出站彻底省掉。
+ *
+ * 分隔符约束（`$` / `/` / `.`）不是可有可无的：裸前缀会连 `/.environment`、
+ * `/.gitignore`、`/.awsome` 一起吃掉，那些属于正常页面而不是探测。
+ *
+ * **必须按「段」匹配，不能只锚定首段**：线上样本里出现最多的触发器是 `/panel/.env`
+ * （探测文件名跟在内置路由前缀之后），只锚 `^/\.` 会漏掉它。
+ */
+const PROBE_PATH_RE = /(?:^|\/)\.(?:env|git|svn|hg|ds_store|aws|docker|npmrc|pypirc|htpasswd|ssh|bash_history)(?:$|[/.])/i;
+
+/**
+ * 是否属于「秘密文件 / 版本控制」探测族（任意路径段命中即算）。
+ *
+ * `/.well-known/`（security.txt、acme-challenge）必须继续走伪装反代而不是 404 ——
+ * 这条契约由 `tools/camouflage-cpu.test.mjs` 的负例钉住，**不**在这里加一行
+ * `startsWith` 白名单：正则匹配不到它，那行白名单永远不会被求值为真（死代码），
+ * 而将来若有人往词表里加了 `well` 之类的词，测试会直接失败，比一行没人走的分支更可靠。
+ */
+export function isProbePath(pathname: string): boolean {
+    return PROBE_PATH_RE.test(pathname);
+}
+
+/**
+ * P1 的统一出口：朴素 404（真实站点对 `.env` 的典型回答）。
+ *
+ * 刻意**不**复用 1101 伪装页：那张「Worker threw exception」页会把「这里有个 Worker」
+ * 写在脸上，而这批请求本来就来自扫描器，没必要为它们演戏。
+ */
+export function probeNotFoundResponse(env: any): Response {
+    const headers = new Headers({
+        'Content-Type': 'text/plain; charset=UTF-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff'
+    });
+    return new Response('Not Found', { status: 404, headers: withHsts(headers, env) as Headers });
+}
+
+/**
  * 伪装地址来源（对齐 cfnew，面板 hostSniList 仅用于节点 HOST/SNI，不参与伪装页）：
  * env `homepage`/`HOMEPAGE`/`URL`/`FALLBACK`（支持 `a|b|c` 列表随机）；
  * 特殊值 `nginx` 渲染内建欢迎页。**未设置不会落到 1101 页**（见 resolveMaskTarget 的契约说明）。
@@ -758,8 +809,12 @@ function imageContentEtag(body: ArrayBuffer): string {
 }
 
 /**
- * HTML 页响应（壳页 / data 页）：与图片字节分支用**同一套安全头**（nosniff + HSTS），
- * 避免同一站点两套头策略（评审：壳页原先只有 Content-Type）；HEAD 补 Content-Length。
+ * HTML 页响应（壳页 / data 页 / nginx 兜底页）：与图片字节分支用**同一套安全头**
+ * （nosniff + HSTS + no-store），避免同一站点两套头策略（评审：壳页原先只有 Content-Type）；
+ * HEAD 补 Content-Length、不带正文。
+ *
+ * nginx 兜底页的四处出口（`FALLBACK=nginx` / 目标 URL 解析失败 / 反代彻底失败 / 取图失败）
+ * 全部走这里 —— 它们原先各自手写了一份「Content-Type + HSTS」的 Response 构造。
  */
 function htmlPageResponse(request: Request, html: string, env: any): Response {
     const headers = new Headers({
@@ -874,7 +929,49 @@ function peekImageBytes(maskURL: URL): ImageCacheEntry | null {
 
 type ImageLoad =
     | { kind: 'bytes'; body: ArrayBuffer; status: number; contentType: string; etag: string }
-    | { kind: 'stream'; resp: Response; contentType: string };
+    | { kind: 'stream'; resp: Response; contentType: string }
+    /**
+     * 取图失败（超时 / 网络错误 / 读体失败）。
+     * 调用方**必须**用它短路成本地页，不得回落全路径反代 —— 原因见 failedImageResponse。
+     */
+    | { kind: 'failed' };
+
+/**
+ * 取图出站超时（原 10000ms）。
+ *
+ * 图片目标形态下，**每个**字节未命中的页面请求都会先走这条出站（任意未知路径，例如 `/foo`）：
+ * 让一次冷取图占满 10 秒 wall time 没有收益 —— 失败后的出口已经是本地页
+ * （failedImageResponse），不再依赖这次出站的成败。5s 对冷取图足够。
+ */
+const IMAGE_FETCH_TIMEOUT_MS = 5000;
+
+/**
+ * 取图失败的负缓存（TTL / 条目上限）。
+ *
+ * 图源超时后，30 秒内的后续页面请求直接回本地页、**不再出站** —— 否则扫描器每秒几十条探测
+ * 会各自烧掉一次 5s 出站与一个子请求。取 30s 而不是更长：负缓存期间页面退化成 nginx 页，
+ * 那是**故障态**，图源恢复后要尽快回到正常形态。
+ */
+const IMAGE_FAIL_CACHE_TTL_MS = 30_000;
+const IMAGE_FAIL_CACHE_MAX = 64;
+
+/** url → 失效时刻（毫秒）。有界 FIFO，与图片字节缓存（maskImageCache）分开计账。 */
+const maskImageFailCache = new Map<string, number>();
+
+function isImageFailCached(url: string): boolean {
+    const until = maskImageFailCache.get(url);
+    if (until === undefined) return false;
+    if (Date.now() < until) return true;
+    maskImageFailCache.delete(url);
+    return false;
+}
+
+function cacheImageFail(url: string): void {
+    // 先删再插：同一条失败被再次确认时按「最近失败」重新计时，而不是留在队列原位等淘汰
+    maskImageFailCache.delete(url);
+    evictOldest(maskImageFailCache, IMAGE_FAIL_CACHE_MAX - 1);
+    maskImageFailCache.set(url, Date.now() + IMAGE_FAIL_CACHE_TTL_MS);
+}
 
 /**
  * 冷取图单飞去重：**只存「谁正在取」的标记，不存 Promise**。
@@ -887,7 +984,13 @@ type ImageLoad =
  */
 const maskImageLoading = new Set<string>();
 
-/** 取图（缓存优先、并发合并）；返回 null 表示「不是图片/失败」→ 调用方降级普通反代 */
+/**
+ * 取图（缓存优先、并发合并）。
+ *
+ * 返回 `null` = 上游明确说「这不是图片」（HTML 假阳性）→ 调用方降级普通反代（**原设计**，
+ * 这是「伪装目标填错/图床返回错误页」时的正确行为，不要顺手删掉）；
+ * 返回 `{ kind: 'failed' }` = 取图失败 → 调用方回本地页，**绝不**把请求路径转发出去。
+ */
 async function fetchImageLoad(maskURL: URL, budget: BudgetConfig): Promise<ImageLoad | null> {
     const url = maskURL.href;
     return await crossRequestSingleFlight<ImageLoad>(
@@ -896,16 +999,19 @@ async function fetchImageLoad(maskURL: URL, budget: BudgetConfig): Promise<Image
         // 只把**已入缓存**的字节当作"就绪"：流式结果不可缓存，等待方应该自己取一份
         () => {
             const cached = peekImageBytes(maskURL);
-            return cached
-                ? { kind: 'bytes', body: cached.body, status: cached.status, contentType: cached.contentType, etag: cached.etag }
-                : null;
+            if (cached) {
+                return { kind: 'bytes', body: cached.body, status: cached.status, contentType: cached.contentType, etag: cached.etag };
+            }
+            // P0：失败的负缓存对**等待方**同样生效 —— 否则同一批并发（一个页面 + N 个 <img>）
+            // 会在生产者失败后各自再打一次图源。读函数只读「已落地结论」，符合本函数的契约。
+            return isImageFailCached(url) ? { kind: 'failed' } : null;
         },
         async () => {
             const headers = buildMaskedHeaders(new Headers(), maskURL);
             headers.set('Referer', maskURL.origin + '/');
             headers.set('Accept', 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8');
             try {
-                const resp = await fetchWithTimeout(url, { method: 'GET', headers, cf: {} }, 10000);
+                const resp = await fetchWithTimeout(url, { method: 'GET', headers, cf: {} }, IMAGE_FETCH_TIMEOUT_MS);
                 const contentType = resp.headers.get('content-type') || 'image/jpeg';
                 // 假阳性保护：服务器返回 HTML 说明不是图片，降级普通伪装反代
                 if (contentType.startsWith('text/html')) return null;
@@ -929,7 +1035,8 @@ async function fetchImageLoad(maskURL: URL, budget: BudgetConfig): Promise<Image
                 return { kind: 'stream', resp, contentType };
             } catch (e) {
                 console.error('伪装图片代理失败:', (e as Error)?.message ?? String(e));
-                return null;
+                cacheImageFail(url);
+                return { kind: 'failed' };
             }
         }
     );
@@ -1014,7 +1121,24 @@ function parseSingleRange(
     return { start, end };
 }
 
-/** 图片目标的常规请求：返回壳页（默认）或 data 页（回滚模式）；失败返回 null 交给普通反代 */
+/**
+ * P0：图片目标取图失败的统一出口 —— **本地页，零出站**。
+ *
+ * 为什么不能像以前那样 `return null` 让它继续往下走：那条路会进入全路径伪装反代，把
+ * `reqURL.pathname` 原样拼到伪装域上再出站。于是 `GET /.env.bak` 会变成
+ * `GET https://<伪装域>/.env.bak` —— 这正是 Cloudflare 检测
+ * 「A request matched secret-files scanning patterns. **An outbound fetch matched the same
+ * probe family**」的唯一产生方式，也让一次探测白占 10 秒 wall time + 2 次出站。
+ *
+ * 出口选 nginx 欢迎页（与 camouflageProxy 的三处兜底同一个出口 htmlPageResponse，200 HTML）：
+ *  · 对正常访客：图源挂掉时看到一张「普通的默认页」，比 5xx 更像真实站点；
+ *  · 对扫描器：不会因为「200 + 图片壳页」被记成「秘密文件存在」。
+ */
+async function failedImageResponse(request: Request, env: any): Promise<Response> {
+    return htmlPageResponse(request, await nginxPage(), env);
+}
+
+/** 图片目标的常规请求：返回壳页（默认）或 data 页（回滚模式）；假阳性返回 null 交给普通反代 */
 async function buildImagePageResponse(
     request: Request,
     reqURL: URL,
@@ -1023,7 +1147,10 @@ async function buildImagePageResponse(
     budget: BudgetConfig
 ): Promise<Response | null> {
     const load = await fetchImageLoad(maskURL, budget);
+    // null = 上游明确回 HTML（不是图片）：按原设计降级普通反代
     if (!load) return null;
+    // P0：取图失败**绝不**回落全路径反代（理由见 failedImageResponse）
+    if (load.kind === 'failed') return await failedImageResponse(request, env);
 
     if (load.kind === 'bytes') {
         const mode = String(env?.MASK_IMG_MODE || 'shell').toLowerCase();
@@ -1095,6 +1222,9 @@ async function serveMaskedImage(paramValue: string, request: Request, env: any, 
     // B-28：取图失败也走中性占位图 —— 裸 503（无 Content-Type/nosniff/HSTS）与同文件其它
     // 兜底响应的头策略不一致，而这正是「这台部署有没有在代理图片」的旁路指纹。
     if (!load) return placeholderImageResponse(request, env);
+    // P0：取图失败（超时/网络）同样走中性占位图 —— `<img>` 不能收到 HTML；
+    // 这也让下面的类型收窄只剩 bytes / stream 两支。
+    if (load.kind === 'failed') return placeholderImageResponse(request, env);
 
     if (load.kind === 'stream') return streamImageResponse(load, request, env);
 
@@ -1416,20 +1546,14 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
     // 空 target 会落到下面的 `new URL` 失败分支，回 nginx 欢迎页。
     const { target, isNginx } = resolveMaskTarget();
     if (isNginx) {
-        return new Response(await nginxPage(), {
-            status: 200,
-            headers: withHsts({ 'Content-Type': 'text/html; charset=UTF-8' }, env)
-        });
+        return htmlPageResponse(request, await nginxPage(), env);
     }
 
     let maskURL: URL;
     try {
         maskURL = new URL(target);
     } catch {
-        return new Response(await nginxPage(), {
-            status: 200,
-            headers: withHsts({ 'Content-Type': 'text/html; charset=UTF-8' }, env)
-        });
+        return htmlPageResponse(request, await nginxPage(), env);
     }
 
     const reqURL = new URL(request.url);
@@ -1617,9 +1741,6 @@ export async function camouflageProxy(request: Request, env: any): Promise<Respo
                 console.error('首页根路径降级也失败:', (e2 as Error)?.message ?? String(e2));
             }
         }
-        return new Response(await nginxPage(), {
-            status: 200,
-            headers: withHsts({ 'Content-Type': 'text/html; charset=UTF-8' }, env)
-        });
+        return htmlPageResponse(request, await nginxPage(), env);
     }
 }
